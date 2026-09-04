@@ -2,8 +2,8 @@
 name = "ego-lite-bridge"
 version = "0.1.0"
 edition = "2021"
-autotests = false
 description = "Headless reverse remote exec bridge for ego-browser"
+repository = "https://github.com/imleon/ego-lite-bridge"
 license = "Apache-2.0"
 categories = ["command-line-utilities"]
 include = [

@@ -1,84 +1,116 @@
-# herdr
+# ego-lite-bridge
 
+[English](README.md)
 
-<p align="center">
-  <img src="assets/logo.png" alt="herdr" width="100" />
-</p>
+`ego-lite-bridge` 让 Linux 主机使用运行在 Mac 上的 `ego-browser`。浏览器进程和登录状态保留在 Mac；Linux 获得一个本地命令形态的 `ego-browser`，其参数、stdin、stdout、stderr、信号和退出状态通过持久 SSH 通道转发。
 
-<p align="center">
-  <a href="https://herdr.dev">herdr.dev</a> · <a href="#安装">安装</a> · <a href="https://herdr.dev/zh-cn/docs/quick-start/">快速开始</a> · <a href="https://herdr.dev/zh-cn/docs/">文档</a></p>
+本项目派生自 [Herdr](https://github.com/herdrdev/herdr)，并继续采用 Apache-2.0 许可证。
 
-<p align="center">
-  <a href="README.md">English</a> · 简体中文
-</p>
+## 架构
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-666666?labelColor=333333" alt="Apache 2.0 license" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases"><img src="https://img.shields.io/github/downloads/herdrdev/herdr/total?labelColor=333333&color=666666" alt="total GitHub release downloads" /></a>
-  <a href="https://github.com/herdrdev/herdr/stargazers"><img src="https://img.shields.io/github/stars/herdrdev/herdr?labelColor=333333&color=666666&logo=github" alt="GitHub stars" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases/latest"><img src="https://img.shields.io/github/v/release/herdrdev/herdr?label=release&labelColor=333333&color=666666" alt="latest stable release" /></a>
-  <a href="https://formulae.brew.sh/formula/herdr"><img src="https://img.shields.io/homebrew/v/herdr?label=homebrew&labelColor=333333&color=666666" alt="Homebrew version" /></a>
-  <a href="https://x.com/herdrdev"><img src="https://img.shields.io/badge/follow-%40herdrdev-000000?logo=x&logoColor=white" alt="follow @herdrdev on X" /></a>
-</p>
-
----
-
-https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
-
-**智能体复用器，住在你的终端里。**
-
-- **每个智能体一目了然**——`blocked`、`working`、`done`。真实的终端视图，而不是包装过的转述。
-- **分离后智能体继续运行**——从任意终端重新连接，或通过 ssh。会话在重启后依然保留。
-- **智能体也能使用 herdr**——纯 socket api：智能体可以创建窗格、读取输出、互相等待。[智能体技能 →](https://herdr.dev/zh-cn/docs/agent-skill/)
-- **键盘和鼠标都是一等公民**——tmux 风格的前缀键，*以及*点击、拖动、分割。按当下的场景选择，而不是被工具锁死。
-- **插件**——扩展窗格和工作流。[浏览插件市场 →](https://herdr.dev/plugins/)
-- **单个 rust 二进制，没有 electron**——运行在你已经在用的任何终端里。
-
----
-
-## 安装
-
-```bash
-curl -fsSL https://herdr.dev/install.sh | sh
+```text
+Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-browser
 ```
 
-或者 `brew install herdr` · `mise use -g herdr` · Windows：`powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"` · [受端点保护的 Windows](https://herdr.dev/zh-cn/docs/windows-beta/) · [二进制文件](https://github.com/herdrdev/herdr/releases)
+- macOS 运行 `ego-lite-bridge serve <linux-host>` 并持有通道。
+- Linux 上的私有 broker socket 接收本地 `ego-browser` 调用。
+- 可执行文件名为 `ego-browser` 时进入 shim 模式；真正的二进制只在 Mac 上启动。
+- bridge 不可用时，Linux 命令明确失败，不会回退到本地执行。
 
-然后在工作所在的目录启动它：
+## 快速开始
+
+前置条件：
+
+- macOS 的 `PATH` 中已有真正的 `ego-browser`。
+- Linux 主机可通过非交互 SSH 认证访问。
+- Linux 的 `~/.local/bin/ego-lite-bridge` 已安装。
+- Mac 已安装 `ego-lite-bridge`。
+
+在 Linux 安装二进制并创建 shim：
 
 ```bash
-herdr
+mkdir -p ~/.local/bin
+install -m755 target/release/ego-lite-bridge ~/.local/bin/ego-lite-bridge
+ln -sf ego-lite-bridge ~/.local/bin/ego-browser
 ```
 
-运行你的智能体、分割窗格，然后安心离开。`ctrl+b q` 分离，`herdr` 重新连接。[快速开始 →](https://herdr.dev/zh-cn/docs/quick-start/)
+在 Mac 启动持久 bridge：
 
-## 文档
+```bash
+ego-lite-bridge serve user@linux-host
+```
 
-所有文档都在 [herdr.dev/docs](https://herdr.dev/zh-cn/docs/)：[快速开始](https://herdr.dev/zh-cn/docs/quick-start/) · [核心概念](https://herdr.dev/zh-cn/docs/concepts/) · [受支持的智能体](https://herdr.dev/zh-cn/docs/agents/) · [键盘](https://herdr.dev/zh-cn/docs/keyboard/) · [配置](https://herdr.dev/zh-cn/docs/configuration/) · [会话状态](https://herdr.dev/zh-cn/docs/session-state/) · [远程访问](https://herdr.dev/zh-cn/docs/persistence-remote/) · [集成](https://herdr.dev/zh-cn/docs/integrations/) · [插件](https://herdr.dev/zh-cn/docs/plugins/) · [socket api](https://herdr.dev/zh-cn/docs/socket-api/)
+然后在 Linux 像使用本地命令一样调用：
 
-## 致谢
+```bash
+ego-browser --help
+ego-browser <args...>
+```
 
-<a href="https://terminaltrove.com/"><img src="assets/sponsors/terminal-trove.png" alt="Terminal Trove" width="200" /></a>
+保持 Mac 命令运行。短暂的 SSH 或网络故障后它会自动重连；按 `Ctrl-C` 停止。
 
-[Terminal Trove](https://terminaltrove.com/) 以及 [SPONSORS.md](./SPONSORS.md) 中列出的每一位支持者——谢谢 🐑
+## 从源码构建和安装
 
-企业/合作：hey@herdr.dev
+需要 Rust 和 `just`。
 
-## 智能体须知
+```bash
+git clone https://github.com/imleon/ego-lite-bridge.git
+cd ego-lite-bridge
+just build
+```
 
-如果你是协助本仓库的 AI 智能体：在改动代码前阅读 [`AGENTS.md`](./AGENTS.md)，在创建 issue 或 PR 前阅读 [`CONTRIBUTING.md`](./CONTRIBUTING.md)。
+安装到 macOS：
+
+```bash
+mkdir -p ~/.local/bin
+install -m755 target/release/ego-lite-bridge ~/.local/bin/ego-lite-bridge
+```
+
+安装到 Linux：
+
+```bash
+mkdir -p ~/.local/bin
+install -m755 target/release/ego-lite-bridge ~/.local/bin/ego-lite-bridge
+ln -sf ego-lite-bridge ~/.local/bin/ego-browser
+```
+
+确保 `~/.local/bin` 位于 `PATH`。发行版可用后，`distribution/install.sh` 会执行相同的平台安装步骤。
+
+## 当前限制
+
+- 仅支持 macOS executor 和 Linux caller。
+- 请求带有 ID，但 broker 同一时间只执行一个 `ego-browser` 调用；其余调用排队等待。
+- Linux broker 路径固定为 `~/.local/bin/ego-lite-bridge`。
+- bridge 只转发命令参数和标准流，不映射 Mac 文件系统或环境变量。
+
+## 信任边界
+
+- Mac 与 Linux 之间的信任由 SSH 认证和主机密钥校验决定；启动 bridge 前应完成配置和验证。
+- Linux broker socket 为 `/tmp/ego-lite-bridge-<uid>.sock`，权限为 `0600`，只有对应 Linux 用户可以提交请求。
+- 以该 Linux 用户运行的任何进程都可以要求 Mac 使用任意参数和 stdin 启动固定的 `ego-browser`。只应面向可信的 Linux 账户运行 bridge。
+- 浏览器输出和退出状态来自已连接的 Mac executor。系统不会回退到本地或其他浏览器。
+
+## 故障排查
+
+- **`ego-browser bridge is not connected`**：在 Mac 启动并保持运行 `ego-lite-bridge serve user@linux-host`。
+- **SSH 反复重连**：确认 `ssh user@linux-host true` 无需密码或确认即可成功；bridge 使用 SSH batch mode。
+- **远端二进制缺失**：在 Linux 的 `~/.local/bin/ego-lite-bridge` 安装可执行文件。
+- **Linux 找不到 `ego-browser`**：创建上述软链接，并将 `~/.local/bin` 加入 `PATH`。
+- **Mac 启动进程失败**：确认真正的 `ego-browser` 位于 `ego-lite-bridge` 继承的 `PATH` 中。
+- **Linux socket 残留**：停止 Mac bridge，确认没有 broker 运行后再删除 `/tmp/ego-lite-bridge-$(id -u).sock`，然后重新启动。
+
+Mac bridge 和 Linux broker 都会将生命周期及请求诊断写入 stderr。
 
 ## 开发
 
 ```bash
-git clone https://github.com/herdrdev/herdr
-cd herdr
-cargo build --release
-
-just test        # 单元测试
-just check       # 格式检查、测试和维护性检查
+just test             # Rust 测试
+just installer-test   # Unix 安装器测试
+just check            # 格式、Clippy、Rust 测试和安装器测试
 ```
+
+迭代时运行最小相关测试，提交前运行 `just check`。
 
 ## 许可证
 
-herdr 基于 [Apache License 2.0](LICENSE) 许可证发布。
+本项目采用 [Apache License 2.0](LICENSE)。代码库派生自 Herdr；此归属说明不代表 Herdr 项目为本项目背书。

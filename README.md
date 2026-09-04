@@ -1,84 +1,116 @@
-# herdr
+# ego-lite-bridge
 
+[简体中文](README.zh-CN.md)
 
-<p align="center">
-  <img src="assets/logo.png" alt="herdr" width="100" />
-</p>
+`ego-lite-bridge` lets a Linux host use `ego-browser` running on a Mac. The Mac owns the browser process and login state; Linux gets a local-looking `ego-browser` command with arguments, stdin, stdout, stderr, signals, and exit status forwarded across a persistent SSH-backed channel.
 
-<p align="center">
-  <a href="https://herdr.dev">herdr.dev</a> · <a href="#install">install</a> · <a href="https://herdr.dev/docs/quick-start/">quick start</a> · <a href="https://herdr.dev/docs/">docs</a>
-</p>
+This project is derived from [Herdr](https://github.com/herdrdev/herdr) and retains its Apache-2.0 license.
 
-<p align="center">
-  English · <a href="README.zh-CN.md">简体中文</a>
-</p>
+## Architecture
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-666666?labelColor=333333" alt="Apache 2.0 license" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases"><img src="https://img.shields.io/github/downloads/herdrdev/herdr/total?labelColor=333333&color=666666" alt="total GitHub release downloads" /></a>
-  <a href="https://github.com/herdrdev/herdr/stargazers"><img src="https://img.shields.io/github/stars/herdrdev/herdr?labelColor=333333&color=666666&logo=github" alt="GitHub stars" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases/latest"><img src="https://img.shields.io/github/v/release/herdrdev/herdr?label=release&labelColor=333333&color=666666" alt="latest stable release" /></a>
-  <a href="https://formulae.brew.sh/formula/herdr"><img src="https://img.shields.io/homebrew/v/herdr?label=homebrew&labelColor=333333&color=666666" alt="Homebrew version" /></a>
-  <a href="https://x.com/herdrdev"><img src="https://img.shields.io/badge/follow-%40herdrdev-000000?logo=x&logoColor=white" alt="follow @herdrdev on X" /></a>
-</p>
-
----
-
-https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
-
-**the runtime your coding agents live on.**
-
-- **always running** — herdr is a background server; the terminals live inside it. close the lid, drop the network, or restart the machine; agents keep working and sessions come back. reattach from any terminal, or over ssh.
-- **never hunt for the stuck one** — every pane is marked working, blocked, or idle. when an agent stops and needs an answer, herdr says so.
-- **agent-native** — agents drive herdr through the cli and socket api: they can spawn panes, prompt each other, and wait until another agent is genuinely blocked. [agent skill →](https://herdr.dev/docs/agent-skill/)
-- **runs what you already run** — claude code, codex, cursor, opencode, grok and the rest. herdr doesn't wrap or replace them; it owns their terminals.
-- **keyboard and mouse, both first-class** — tmux-style prefix keys *and* click, drag, split. pick per moment, not per tool.
-- **plugins** — extend panes and workflows. [browse the marketplace →](https://herdr.dev/plugins/)
-- **one rust binary, no electron** — runs in whatever terminal you already use.
-
----
-
-## install
-
-```bash
-curl -fsSL https://herdr.dev/install.sh | sh
+```text
+Linux ego-browser shim -> Linux broker -> SSH channel -> Mac executor -> ego-browser
 ```
 
-or `brew install herdr` · `mise use -g herdr` · windows: `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"` · [endpoint-protected Windows](https://herdr.dev/docs/windows-beta/) · [binaries](https://github.com/herdrdev/herdr/releases)
+- `ego-lite-bridge serve <linux-host>` runs on macOS and owns the channel.
+- A private broker socket on Linux accepts local `ego-browser` invocations.
+- The executable name `ego-browser` selects shim mode; the real binary is only started on the Mac.
+- If the bridge is unavailable, the Linux command fails instead of falling back to local execution.
 
-then start it where the work lives:
+## Quick start
 
-```bash
-herdr
-```
+Prerequisites:
 
-run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches. [quick start →](https://herdr.dev/docs/quick-start/)
+- macOS with the real `ego-browser` available on `PATH`.
+- A Linux host reachable with non-interactive SSH authentication.
+- `ego-lite-bridge` installed at `~/.local/bin/ego-lite-bridge` on Linux.
+- `ego-lite-bridge` installed on the Mac.
 
-## docs
-
-everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
-
-## thanks
-
-every past sponsor and backer is listed in [SPONSORS.md](./SPONSORS.md) — thank you 🐑
-
-enterprise / partnership: hey@herdr.dev
-
-## agent instructions
-
-if you are an ai agent helping with this repository, read [`AGENTS.md`](./AGENTS.md) before making changes and read [`CONTRIBUTING.md`](./CONTRIBUTING.md) before opening issues or PRs.
-
-## development
+On Linux, install the binary and create the shim:
 
 ```bash
-git clone https://github.com/herdrdev/herdr
-cd herdr
-cargo build --release
-
-just test        # unit tests
-just check       # formatting, tests, and maintenance checks
+mkdir -p ~/.local/bin
+install -m755 target/release/ego-lite-bridge ~/.local/bin/ego-lite-bridge
+ln -sf ego-lite-bridge ~/.local/bin/ego-browser
 ```
 
-## license
+On the Mac, start the persistent bridge:
 
-Herdr is licensed under the [Apache License 2.0](LICENSE).
+```bash
+ego-lite-bridge serve user@linux-host
+```
+
+Then, on Linux, use the shim as if `ego-browser` were local:
+
+```bash
+ego-browser --help
+ego-browser <args...>
+```
+
+Keep the Mac command running. It reconnects automatically after transient SSH or network failures; stop it with `Ctrl-C`.
+
+## Build and install from source
+
+Rust and `just` are required.
+
+```bash
+git clone https://github.com/imleon/ego-lite-bridge.git
+cd ego-lite-bridge
+just build
+```
+
+Install on macOS:
+
+```bash
+mkdir -p ~/.local/bin
+install -m755 target/release/ego-lite-bridge ~/.local/bin/ego-lite-bridge
+```
+
+Install on Linux:
+
+```bash
+mkdir -p ~/.local/bin
+install -m755 target/release/ego-lite-bridge ~/.local/bin/ego-lite-bridge
+ln -sf ego-lite-bridge ~/.local/bin/ego-browser
+```
+
+Ensure `~/.local/bin` is on `PATH`. The release installer in `distribution/install.sh` performs the same platform-specific setup when a release is available.
+
+## Current limitations
+
+- Only macOS executors and Linux callers are supported.
+- Requests carry IDs, but the broker executes one `ego-browser` invocation at a time; additional invocations wait in a queue.
+- The Linux broker path is fixed to `~/.local/bin/ego-lite-bridge`.
+- The bridge forwards command arguments and standard streams only; it does not mirror the Mac filesystem or environment.
+
+## Trust boundary
+
+- SSH authentication and host-key verification define trust between the Mac and Linux host. Configure and verify them before starting the bridge.
+- The Linux broker socket is `/tmp/ego-lite-bridge-<uid>.sock` with mode `0600`, so only the owning Linux user can submit requests.
+- Any process running as that Linux user can ask the Mac to run the fixed `ego-browser` executable with arbitrary arguments and stdin. Run the bridge only for a Linux account you trust.
+- Browser output and exit status come from the connected Mac executor. No local or alternate-browser fallback is used.
+
+## Troubleshooting
+
+- **`ego-browser bridge is not connected`**: start `ego-lite-bridge serve user@linux-host` on the Mac and keep it running.
+- **SSH repeatedly reconnects**: verify `ssh user@linux-host true` succeeds without a password or confirmation prompt. The bridge uses SSH batch mode.
+- **Remote binary is missing**: install an executable at `~/.local/bin/ego-lite-bridge` on Linux.
+- **`ego-browser` is not found on Linux**: create the symlink above and add `~/.local/bin` to `PATH`.
+- **Mac spawn failure**: verify the real `ego-browser` is on the `PATH` inherited by `ego-lite-bridge`.
+- **Stale Linux socket**: stop the Mac bridge, remove `/tmp/ego-lite-bridge-$(id -u).sock` only after confirming no broker is running, then start the bridge again.
+
+Both the Mac bridge and Linux broker write lifecycle and request diagnostics to stderr.
+
+## Development
+
+```bash
+just test             # Rust tests
+just installer-test   # Unix installer tests
+just check            # formatting, Clippy, Rust tests, installer tests
+```
+
+Run the narrowest relevant test while iterating and `just check` before committing.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). This codebase is derived from Herdr; attribution does not imply endorsement by the Herdr project.
