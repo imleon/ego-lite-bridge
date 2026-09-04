@@ -9,10 +9,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
-use std::process::Command;
 #[cfg(any(target_os = "macos", test))]
 use std::process::ExitStatus;
+#[cfg(target_os = "macos")]
+use std::process::{Command, Stdio};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -122,9 +122,7 @@ pub(crate) fn install(path: &Path, contents: &str) -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn start(uid: u32, path: &Path) -> io::Result<()> {
-    start_with(uid, path, |args| {
-        Command::new("launchctl").args(args).status()
-    })
+    start_with(uid, path, run_launchctl)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -165,7 +163,16 @@ fn start_with(
 
 #[cfg(target_os = "macos")]
 pub(crate) fn bootout(uid: u32) -> io::Result<()> {
-    bootout_with(uid, |args| Command::new("launchctl").args(args).status())
+    bootout_with(uid, run_launchctl)
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchctl(args: &[OsString]) -> io::Result<ExitStatus> {
+    Command::new("launchctl")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
 }
 
 #[cfg(any(target_os = "macos", test))]
