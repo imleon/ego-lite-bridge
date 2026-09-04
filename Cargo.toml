@@ -1,0 +1,24 @@
+[package]
+name = "ego-lite-bridge"
+version = "0.1.0"
+edition = "2021"
+autotests = false
+description = "Headless reverse remote exec bridge for ego-browser"
+license = "Apache-2.0"
+categories = ["command-line-utilities"]
+include = [
+    "src/main.rs",
+    "src/ego_bridge.rs",
+    "src/framing.rs",
+    "src/ipc.rs",
+    "src/managed_ssh.rs",
+    "src/macos_process.rs",
+    "distribution/install.sh",
+    "LICENSE",
+    "Cargo.toml",
+]
+
+[dependencies]
+bincode = { version = "2", features = ["serde"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
