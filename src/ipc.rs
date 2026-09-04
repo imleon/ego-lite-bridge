@@ -1,10 +1,16 @@
 use std::fs;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(any(target_os = "linux", test))]
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 pub(crate) type LocalListener = UnixListener;
 pub(crate) type LocalStream = UnixStream;
 
@@ -14,10 +20,12 @@ pub(crate) struct SocketFileIdentity {
     ino: u64,
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
     UnixStream::connect(path)
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn prepare_socket_path(
     path: &Path,
     busy_message: impl FnOnce(&Path) -> String,
@@ -48,10 +56,12 @@ pub(crate) fn prepare_socket_path(
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListener> {
     UnixListener::bind(path)
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn set_local_stream_read_timeout(
     stream: &LocalStream,
     timeout: Option<Duration>,
@@ -59,6 +69,7 @@ pub(crate) fn set_local_stream_read_timeout(
     stream.set_read_timeout(timeout)
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn shutdown_local_stream_read(stream: &LocalStream) -> io::Result<()> {
     stream.shutdown(std::net::Shutdown::Read)
 }
@@ -90,6 +101,7 @@ pub(crate) fn remove_socket_file_if_owned(
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn restrict_socket_permissions(path: &Path, mode: u32) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_mode(mode);
