@@ -91,11 +91,24 @@ exec {sha256sum} "$@"
 
         self.fail(f"unknown checksum tool fixture: {tool}")
 
-    def _write_manifest(self, checksum: str | None, os_name: str) -> Path:
+    def _write_manifest(
+        self,
+        checksum: str | None,
+        os_name: str,
+        *,
+        product: str = "ego-lite-bridge",
+        available: bool = True,
+        asset_url: str | None = None,
+    ) -> Path:
         target = f"{os_name}-x86_64"
         manifest: dict[str, object] = {
+            "product": product,
+            "available": available,
             "version": "9.9.9",
-            "assets": {target: f"https://example.invalid/ego-lite-bridge-{target}"},
+            "assets": {
+                target: asset_url
+                or f"https://github.com/imleon/ego-lite-bridge/releases/download/v9.9.9/ego-lite-bridge-{target}"
+            },
         }
         if checksum is not None:
             manifest["sha256"] = {target: checksum}
@@ -108,9 +121,10 @@ exec {sha256sum} "$@"
         checksum: str | None,
         tool: str = "sha256sum",
         os_name: str = "linux",
+        **manifest_options: object,
     ) -> subprocess.CompletedProcess[str]:
         self._select_checksum_tool(tool)
-        manifest = self._write_manifest(checksum, os_name)
+        manifest = self._write_manifest(checksum, os_name, **manifest_options)
         uname = "Linux" if os_name == "linux" else "Darwin"
         self._write_executable(
             "uname",
@@ -128,6 +142,7 @@ esac
             "FAKE_MANIFEST": str(manifest),
             "FAKE_PAYLOAD": str(self.payload),
             "EGO_LITE_BRIDGE_INSTALL_DIR": str(self.install_dir),
+            "EGO_LITE_BRIDGE_MANIFEST_URL": "https://example.invalid/latest.json",
         }
         return subprocess.run(
             ["/bin/sh", str(INSTALLER)],
@@ -161,6 +176,46 @@ esac
             self.payload.read_bytes(),
         )
         self.assertFalse((self.install_dir / "ego-browser").exists())
+
+    def test_unavailable_release_does_not_replace_existing_binary(self) -> None:
+        self.install_dir.mkdir()
+        installed = self.install_dir / "ego-lite-bridge"
+        installed.write_bytes(b"existing-ego-lite-bridge\n")
+
+        result = self._run_installer(self.expected_sha256, available=False)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release is not available yet", result.stderr)
+        self.assertEqual(installed.read_bytes(), b"existing-ego-lite-bridge\n")
+
+    def test_rejects_inherited_herdr_manifest_without_replacing_binary(self) -> None:
+        self.install_dir.mkdir()
+        installed = self.install_dir / "ego-lite-bridge"
+        installed.write_bytes(b"existing-ego-lite-bridge\n")
+
+        result = self._run_installer(
+            self.expected_sha256,
+            product="herdr",
+            asset_url="https://github.com/herdrdev/herdr/releases/download/v0.8.2/herdr-linux-x86_64",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manifest is not for ego-lite-bridge", result.stderr)
+        self.assertEqual(installed.read_bytes(), b"existing-ego-lite-bridge\n")
+
+    def test_rejects_untrusted_asset_url_without_replacing_binary(self) -> None:
+        self.install_dir.mkdir()
+        installed = self.install_dir / "ego-lite-bridge"
+        installed.write_bytes(b"existing-ego-lite-bridge\n")
+
+        result = self._run_installer(
+            self.expected_sha256,
+            asset_url="https://example.invalid/ego-lite-bridge-linux-x86_64",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("untrusted asset URL", result.stderr)
+        self.assertEqual(installed.read_bytes(), b"existing-ego-lite-bridge\n")
 
     def test_checksum_mismatch_does_not_replace_existing_binary(self) -> None:
         self.install_dir.mkdir()

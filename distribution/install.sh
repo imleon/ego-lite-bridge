@@ -2,7 +2,7 @@
 set -eu
 
 BIN="ego-lite-bridge"
-MANIFEST_URL="https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/latest.json"
+MANIFEST_URL="${EGO_LITE_BRIDGE_MANIFEST_URL:-https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/latest.json}"
 INSTALL_DIR="${EGO_LITE_BRIDGE_INSTALL_DIR:-$HOME/.local/bin}"
 
 main() {
@@ -55,11 +55,23 @@ main() {
             exit
         }
     ')"
+    PRODUCT="$(printf '%s\n' "$MANIFEST" | awk -F '"' '/^[[:space:]]*"product"[[:space:]]*:/ { print $4; exit }')"
     VERSION="$(printf '%s\n' "$MANIFEST" | awk -F '"' '/^[[:space:]]*"version"[[:space:]]*:/ { print $4; exit }')"
+    AVAILABLE="$(printf '%s\n' "$MANIFEST" | awk '/^[[:space:]]*"available"[[:space:]]*:/ { gsub(/[ ,]/, "", $2); print $2; exit }')"
 
+    if [ "$PRODUCT" != "ego-lite-bridge" ]; then
+        err "release manifest is not for ego-lite-bridge"
+    fi
+    if [ "$AVAILABLE" != "true" ]; then
+        err "ego-lite-bridge release is not available yet"
+    fi
     if [ -z "$URL" ]; then
         err "release manifest does not include a binary for ${TARGET}"
     fi
+    case "$URL" in
+        https://github.com/imleon/ego-lite-bridge/releases/download/*/ego-lite-bridge-*) ;;
+        *) err "release manifest contains an untrusted asset URL for ${TARGET}" ;;
+    esac
     if [ "${#SHA256}" -ne 64 ]; then
         err "release manifest does not include a valid SHA-256 checksum for ${TARGET}"
     fi
