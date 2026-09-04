@@ -17,7 +17,17 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-const VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 1;
+const CAPABILITY_BINARY_ARGV: u64 = 1 << 0;
+const CAPABILITY_STDIO_STREAMS: u64 = 1 << 1;
+const CAPABILITY_REQUEST_CANCEL: u64 = 1 << 2;
+const CAPABILITY_SIGNAL_EXIT: u64 = 1 << 3;
+const CAPABILITY_BROKER_TAKEOVER: u64 = 1 << 4;
+const PROTOCOL_CAPABILITIES: u64 = CAPABILITY_BINARY_ARGV
+    | CAPABILITY_STDIO_STREAMS
+    | CAPABILITY_REQUEST_CANCEL
+    | CAPABILITY_SIGNAL_EXIT
+    | CAPABILITY_BROKER_TAKEOVER;
 const MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -55,9 +65,11 @@ const REMOTE_BROKER_COMMAND: &str = "test -x \"$HOME/.local/bin/ego-lite-bridge\
 enum EgoBridgeMessage {
     Hello {
         version: u32,
+        capabilities: u64,
     },
     Welcome {
         version: u32,
+        capabilities: u64,
         error: Option<String>,
     },
     Open {
@@ -118,6 +130,64 @@ fn read_message<R: Read>(reader: &mut R) -> io::Result<EgoBridgeMessage> {
 
 fn write_message<W: Write>(writer: &mut W, message: &EgoBridgeMessage) -> io::Result<()> {
     crate::framing::write_message(writer, message)
+}
+
+fn hello() -> EgoBridgeMessage {
+    EgoBridgeMessage::Hello {
+        version: PROTOCOL_VERSION,
+        capabilities: PROTOCOL_CAPABILITIES,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn welcome(error: Option<String>) -> EgoBridgeMessage {
+    EgoBridgeMessage::Welcome {
+        version: PROTOCOL_VERSION,
+        capabilities: PROTOCOL_CAPABILITIES,
+        error,
+    }
+}
+
+fn validate_welcome(message: EgoBridgeMessage) -> io::Result<()> {
+    match message {
+        EgoBridgeMessage::Welcome {
+            version,
+            capabilities,
+            error: None,
+        } if version == PROTOCOL_VERSION && capabilities == PROTOCOL_CAPABILITIES => Ok(()),
+        EgoBridgeMessage::Welcome {
+            error: Some(error), ..
+        } => Err(invalid_handshake(error)),
+        message => Err(invalid_handshake(format!(
+            "invalid executor handshake: {message:?}"
+        ))),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn executor_handshake<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<()> {
+    let message = read_message(input).map_err(|err| {
+        if err.kind() == io::ErrorKind::InvalidData {
+            invalid_handshake(format!("invalid broker handshake frame: {err}"))
+        } else {
+            err
+        }
+    })?;
+    match message {
+        EgoBridgeMessage::Hello {
+            version,
+            capabilities,
+        } if version == PROTOCOL_VERSION && capabilities == PROTOCOL_CAPABILITIES => {
+            write_message(output, &welcome(None))
+        }
+        message => {
+            let error = format!(
+                "broker protocol does not match executor: expected version {PROTOCOL_VERSION} capabilities {PROTOCOL_CAPABILITIES:#x}, received {message:?}"
+            );
+            let _ = write_message(output, &welcome(Some(error.clone())));
+            Err(invalid_handshake(error))
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -193,19 +263,8 @@ pub(crate) fn run_broker() -> io::Result<()> {
             }
         });
         let channel_out = Arc::new(Mutex::new(io::stdout()));
-        write_locked(&channel_out, &EgoBridgeMessage::Hello { version: VERSION })?;
-        match recv_broker_message(&channel_in, None)? {
-            EgoBridgeMessage::Welcome { version, error }
-                if version == VERSION && error.is_none() => {}
-            EgoBridgeMessage::Welcome {
-                error: Some(error), ..
-            } => return Err(io::Error::other(error)),
-            message => {
-                return Err(io::Error::other(format!(
-                    "invalid executor handshake: {message:?}"
-                )))
-            }
-        }
+        write_locked(&channel_out, &hello())?;
+        validate_welcome(recv_broker_message(&channel_in, None)?)?;
 
         listener.set_nonblocking(true)?;
         eprintln!("ego-lite-bridge broker: socket ready at {}", path.display());
@@ -719,7 +778,6 @@ fn connection_was_stable(elapsed: Duration) -> bool {
     elapsed >= STABLE_CONNECTION_TIME
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn invalid_handshake(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
@@ -735,36 +793,9 @@ fn run_serve_child(child: &mut Child, target: &str, connected: impl FnOnce()) ->
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh stdout missing"))?;
 
-    match read_message(&mut channel_in)? {
-        EgoBridgeMessage::Hello { version } if version == VERSION => {}
-        EgoBridgeMessage::Hello { version } => {
-            let error = format!(
-                "broker protocol version {version} does not match executor version {VERSION}"
-            );
-            let mut channel_out = channel_out;
-            let _ = write_message(
-                &mut channel_out,
-                &EgoBridgeMessage::Welcome {
-                    version: VERSION,
-                    error: Some(error.clone()),
-                },
-            );
-            return Err(invalid_handshake(error));
-        }
-        message => {
-            return Err(invalid_handshake(format!(
-                "invalid broker handshake: {message:?}"
-            )))
-        }
-    }
+    let mut channel_out = channel_out;
+    executor_handshake(&mut channel_in, &mut channel_out)?;
     let channel_out = Arc::new(Mutex::new(channel_out));
-    write_locked(
-        &channel_out,
-        &EgoBridgeMessage::Welcome {
-            version: VERSION,
-            error: None,
-        },
-    )?;
     connected();
     eprintln!("ego-lite-bridge: broker ready on {target}");
 
@@ -1057,24 +1088,158 @@ mod tests {
     use std::process::Command;
     use std::time::Instant;
 
-    #[test]
-    fn protocol_roundtrips_version_and_request_id() {
-        let messages = [
-            EgoBridgeMessage::Hello { version: VERSION },
-            EgoBridgeMessage::Welcome {
-                version: VERSION,
-                error: None,
+    fn protocol_v1_messages() -> Vec<EgoBridgeMessage> {
+        vec![
+            hello(),
+            welcome(None),
+            welcome(Some("incompatible protocol".into())),
+            EgoBridgeMessage::Open {
+                request_id: 42,
+                argv: vec![b"open".to_vec(), vec![b'x', 0xff]],
+            },
+            EgoBridgeMessage::Stdin {
+                request_id: 42,
+                data: vec![0, 0xff, b'\n'],
+            },
+            EgoBridgeMessage::StdinEof { request_id: 42 },
+            EgoBridgeMessage::Stdout {
+                request_id: 42,
+                data: vec![0, b'o'],
+            },
+            EgoBridgeMessage::Stderr {
+                request_id: 42,
+                data: vec![0xff, b'e'],
+            },
+            EgoBridgeMessage::Exit {
+                request_id: 42,
+                code: Some(7),
+                signal: None,
+            },
+            EgoBridgeMessage::Exit {
+                request_id: 43,
+                code: None,
+                signal: Some(15),
+            },
+            EgoBridgeMessage::Error {
+                request_id: 42,
+                message: "failed".into(),
             },
             EgoBridgeMessage::Cancel { request_id: 42 },
+            EgoBridgeMessage::BrokerTakeover {
+                magic: BROKER_TAKEOVER_MAGIC.to_vec(),
+            },
+        ]
+    }
+
+    #[test]
+    fn protocol_v1_golden_fixture() {
+        let fixture = include_bytes!("../tests/fixtures/ego_bridge_v1.bin");
+        let mut input = io::Cursor::new(fixture.as_slice());
+
+        for expected in protocol_v1_messages() {
+            let start = input.position() as usize;
+            let decoded = read_message(&mut input).expect("decode fixture message");
+            let end = input.position() as usize;
+            assert_eq!(decoded, expected);
+
+            let mut encoded = Vec::new();
+            write_message(&mut encoded, &decoded).expect("re-encode fixture message");
+            assert_eq!(encoded, fixture[start..end]);
+        }
+        assert_eq!(input.position() as usize, fixture.len());
+    }
+
+    #[test]
+    fn exact_handshake_succeeds() {
+        let mut input = Vec::new();
+        write_message(&mut input, &hello()).expect("write hello");
+        let mut output = Vec::new();
+
+        executor_handshake(&mut input.as_slice(), &mut output).expect("handshake");
+
+        validate_welcome(read_message(&mut output.as_slice()).expect("welcome"))
+            .expect("validate welcome");
+    }
+
+    #[test]
+    fn handshake_rejects_version_capabilities_and_business_messages() {
+        let invalid = [
+            EgoBridgeMessage::Hello {
+                version: PROTOCOL_VERSION + 1,
+                capabilities: PROTOCOL_CAPABILITIES,
+            },
+            EgoBridgeMessage::Hello {
+                version: PROTOCOL_VERSION,
+                capabilities: PROTOCOL_CAPABILITIES & !CAPABILITY_BINARY_ARGV,
+            },
+            EgoBridgeMessage::Hello {
+                version: PROTOCOL_VERSION,
+                capabilities: PROTOCOL_CAPABILITIES | (1 << 63),
+            },
+            EgoBridgeMessage::Open {
+                request_id: 1,
+                argv: Vec::new(),
+            },
         ];
-        for message in messages {
-            let mut bytes = Vec::new();
-            write_message(&mut bytes, &message).expect("write frame");
+
+        for message in invalid {
+            let mut input = Vec::new();
+            write_message(&mut input, &message).expect("write invalid handshake");
+            let mut output = Vec::new();
+            let error = executor_handshake(&mut input.as_slice(), &mut output)
+                .expect_err("reject invalid handshake");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(matches!(
+                read_message(&mut output.as_slice()).expect("rejection"),
+                EgoBridgeMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    capabilities: PROTOCOL_CAPABILITIES,
+                    error: Some(_),
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn broker_rejects_incompatible_welcome() {
+        for message in [
+            EgoBridgeMessage::Welcome {
+                version: PROTOCOL_VERSION + 1,
+                capabilities: PROTOCOL_CAPABILITIES,
+                error: None,
+            },
+            EgoBridgeMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                capabilities: PROTOCOL_CAPABILITIES ^ CAPABILITY_BINARY_ARGV,
+                error: None,
+            },
+            welcome(Some("rejected".into())),
+            EgoBridgeMessage::Open {
+                request_id: 1,
+                argv: Vec::new(),
+            },
+        ] {
             assert_eq!(
-                read_message(&mut bytes.as_slice()).expect("read frame"),
-                message
+                validate_welcome(message)
+                    .expect_err("reject welcome")
+                    .kind(),
+                io::ErrorKind::InvalidInput
             );
         }
+    }
+
+    #[test]
+    fn malformed_handshake_is_not_retryable_but_truncation_is() {
+        let mut malformed = Vec::new();
+        malformed.extend_from_slice(&1_u32.to_le_bytes());
+        malformed.push(0xff);
+        let error = executor_handshake(&mut malformed.as_slice(), &mut Vec::new())
+            .expect_err("reject malformed handshake");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let error = executor_handshake(&mut [1_u8, 0].as_slice(), &mut Vec::new())
+            .expect_err("report truncated handshake");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -1156,6 +1321,59 @@ mod tests {
             (code, stdout, stderr),
             (7, b"out".to_vec(), b"err".to_vec())
         );
+    }
+
+    #[test]
+    fn shim_rejects_wrong_response_request_id() {
+        let (client, mut broker) = UnixStream::pair().expect("socket pair");
+        let broker_thread = thread::spawn(move || {
+            assert!(matches!(
+                read_message(&mut broker).expect("open"),
+                EgoBridgeMessage::Open { request_id: 20, .. }
+            ));
+            assert_eq!(
+                read_message(&mut broker).expect("eof"),
+                EgoBridgeMessage::StdinEof { request_id: 20 }
+            );
+            write_message(
+                &mut broker,
+                &EgoBridgeMessage::Stdout {
+                    request_id: 21,
+                    data: Vec::new(),
+                },
+            )
+            .expect("wrong response");
+        });
+
+        let error = run_shim_stream(client, 20, Vec::new(), io::empty(), io::sink(), io::sink())
+            .expect_err("reject wrong response id");
+        broker_thread.join().expect("broker thread");
+        assert!(error.to_string().contains("request id mismatch"));
+    }
+
+    #[test]
+    fn active_request_rejects_duplicate_open() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(EgoBridgeMessage::Open {
+                request_id: 30,
+                argv: Vec::new(),
+            }))
+            .expect("duplicate open");
+        let output = Arc::new(Mutex::new(Vec::new()));
+
+        let error = execute_request(
+            OsStr::new("/bin/sh"),
+            30,
+            &["-c".into(), "exec sleep 30".into()],
+            &receiver,
+            &output,
+        )
+        .expect_err("reject duplicate active request");
+
+        assert!(error
+            .to_string()
+            .contains("unexpected message during request"));
     }
 
     #[cfg(target_os = "linux")]
