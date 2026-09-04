@@ -23,6 +23,14 @@ const MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 #[cfg(target_os = "linux")]
 const CLIENT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const BROKER_TAKEOVER_MAGIC: &[u8] = b"ego-bridge-takeover-v1";
+#[cfg(all(target_os = "linux", not(test)))]
+const BROKER_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(all(target_os = "linux", test))]
+const BROKER_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const BROKER_TAKEOVER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(all(target_os = "linux", not(test)))]
 const BROKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(all(target_os = "linux", test))]
@@ -83,12 +91,15 @@ enum EgoBridgeMessage {
     Cancel {
         request_id: u64,
     },
+    BrokerTakeover {
+        magic: Vec<u8>,
+    },
 }
 
 impl EgoBridgeMessage {
     fn request_id(&self) -> Option<u64> {
         match self {
-            Self::Hello { .. } | Self::Welcome { .. } => None,
+            Self::Hello { .. } | Self::Welcome { .. } | Self::BrokerTakeover { .. } => None,
             Self::Open { request_id, .. }
             | Self::Stdin { request_id, .. }
             | Self::StdinEof { request_id }
@@ -119,14 +130,48 @@ pub(crate) fn broker_socket_path() -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
+fn prepare_broker_socket_path(path: &std::path::Path) -> io::Result<()> {
+    match crate::ipc::connect_local_stream(path) {
+        Ok(mut broker) => {
+            write_message(
+                &mut broker,
+                &EgoBridgeMessage::BrokerTakeover {
+                    magic: BROKER_TAKEOVER_MAGIC.to_vec(),
+                },
+            )?;
+            let deadline = std::time::Instant::now() + BROKER_TAKEOVER_TIMEOUT;
+            while path.exists() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out taking over ego-browser broker at {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                thread::sleep(BROKER_TAKEOVER_POLL_INTERVAL);
+            }
+            Ok(())
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::NotFound
+                    | io::ErrorKind::TimedOut
+            ) =>
+        {
+            crate::ipc::prepare_socket_path(path, |_| String::new())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn run_broker() -> io::Result<()> {
     let path = broker_socket_path();
-    crate::ipc::prepare_socket_path(&path, |path| {
-        format!(
-            "ego-browser broker is already listening at {}",
-            path.display()
-        )
-    })?;
+    prepare_broker_socket_path(&path)?;
     let listener = crate::ipc::bind_private_local_listener(&path)?;
     let identity = crate::ipc::socket_file_identity(&path)?;
     if let Err(err) = crate::ipc::restrict_socket_permissions(&path, SOCKET_PERMISSION_MODE) {
@@ -164,10 +209,25 @@ pub(crate) fn run_broker() -> io::Result<()> {
 
         listener.set_nonblocking(true)?;
         eprintln!("ego-lite-bridge broker: socket ready at {}", path.display());
+        let mut pending_clients = std::collections::VecDeque::new();
         loop {
             eprintln!("ego-lite-bridge broker: waiting for ego-browser invocation");
-            let client = wait_for_broker_client(&listener, &channel_in)?;
-            match handle_broker_client(client, &channel_in, Arc::clone(&channel_out)) {
+            let client = match pending_clients.pop_front() {
+                Some(client) => Some(client),
+                None => wait_for_broker_client(&listener, &channel_in)?,
+            };
+            let Some((client, open)) = client else {
+                eprintln!("ego-lite-bridge broker: replaced by a new Mac channel");
+                return Ok(());
+            };
+            match handle_broker_client(
+                client,
+                open,
+                &listener,
+                &mut pending_clients,
+                &channel_in,
+                Arc::clone(&channel_out),
+            ) {
                 Ok(()) => {}
                 Err(BrokerClientError::Client(err)) => {
                     eprintln!("ego-lite-bridge broker: local invocation disconnected: {err}");
@@ -175,6 +235,10 @@ pub(crate) fn run_broker() -> io::Result<()> {
                 Err(BrokerClientError::Channel(err)) => {
                     eprintln!("ego-lite-bridge broker: Mac executor disconnected: {err}");
                     return Err(err);
+                }
+                Err(BrokerClientError::Takeover) => {
+                    eprintln!("ego-lite-bridge broker: replaced by a new Mac channel");
+                    return Ok(());
                 }
             }
         }
@@ -187,12 +251,16 @@ pub(crate) fn run_broker() -> io::Result<()> {
 fn wait_for_broker_client(
     listener: &crate::ipc::LocalListener,
     channel_in: &mpsc::Receiver<io::Result<EgoBridgeMessage>>,
-) -> io::Result<crate::ipc::LocalStream> {
+) -> io::Result<Option<(crate::ipc::LocalStream, EgoBridgeMessage)>> {
     loop {
-        match listener.accept() {
-            Ok((client, _)) => return Ok(client),
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-            Err(err) => return Err(err),
+        match accept_broker_client(listener)? {
+            Some((_, EgoBridgeMessage::BrokerTakeover { magic }))
+                if magic.as_slice() == BROKER_TAKEOVER_MAGIC =>
+            {
+                return Ok(None);
+            }
+            Some(client) => return Ok(Some(client)),
+            None => {}
         }
         match channel_in.recv_timeout(Duration::from_millis(100)) {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -212,6 +280,21 @@ fn wait_for_broker_client(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn accept_broker_client(
+    listener: &crate::ipc::LocalListener,
+) -> io::Result<Option<(crate::ipc::LocalStream, EgoBridgeMessage)>> {
+    let (mut client, _) = match listener.accept() {
+        Ok(client) => client,
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    crate::ipc::set_local_stream_read_timeout(&client, Some(CLIENT_OPEN_TIMEOUT))?;
+    let first = read_message(&mut client)?;
+    crate::ipc::set_local_stream_read_timeout(&client, None)?;
+    Ok(Some((client, first)))
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn run_broker() -> io::Result<()> {
     Err(io::Error::other(
@@ -223,18 +306,18 @@ pub(crate) fn run_broker() -> io::Result<()> {
 enum BrokerClientError {
     Client(io::Error),
     Channel(io::Error),
+    Takeover,
 }
 
 #[cfg(target_os = "linux")]
 fn handle_broker_client<W: Write + Send + 'static>(
     mut client: crate::ipc::LocalStream,
+    open: EgoBridgeMessage,
+    listener: &crate::ipc::LocalListener,
+    pending_clients: &mut std::collections::VecDeque<(crate::ipc::LocalStream, EgoBridgeMessage)>,
     channel_in: &mpsc::Receiver<io::Result<EgoBridgeMessage>>,
     channel_out: Arc<Mutex<W>>,
 ) -> Result<(), BrokerClientError> {
-    crate::ipc::set_local_stream_read_timeout(&client, Some(CLIENT_OPEN_TIMEOUT))
-        .map_err(BrokerClientError::Client)?;
-    let open = read_message(&mut client).map_err(BrokerClientError::Client)?;
-    crate::ipc::set_local_stream_read_timeout(&client, None).map_err(BrokerClientError::Client)?;
     let request_id = match &open {
         EgoBridgeMessage::Open { request_id, .. } => *request_id,
         message => {
@@ -256,11 +339,32 @@ fn handle_broker_client<W: Write + Send + 'static>(
 
     let mut client_error = None;
     let response = loop {
+        match accept_broker_client(listener).map_err(BrokerClientError::Client)? {
+            Some((takeover_client, EgoBridgeMessage::BrokerTakeover { magic }))
+                if magic.as_slice() == BROKER_TAKEOVER_MAGIC =>
+            {
+                drop(takeover_client);
+                send_cancel_once(request_id, &channel_out, &cancel_sent);
+                break Err(BrokerClientError::Takeover);
+            }
+            Some(client) => pending_clients.push_back(client),
+            None => {}
+        }
         let message = recv_broker_message(
             channel_in,
-            client_error.as_ref().map(|_| BROKER_DRAIN_TIMEOUT),
-        )
-        .map_err(BrokerClientError::Channel)?;
+            Some(
+                client_error
+                    .as_ref()
+                    .map_or(BROKER_TAKEOVER_POLL_INTERVAL, |_| BROKER_DRAIN_TIMEOUT),
+            ),
+        );
+        let message = match message {
+            Ok(message) => message,
+            Err(err) if err.kind() == io::ErrorKind::TimedOut && client_error.is_none() => {
+                continue;
+            }
+            Err(err) => return Err(BrokerClientError::Channel(err)),
+        };
         if message.request_id() != Some(request_id) {
             return Err(BrokerClientError::Channel(io::Error::other(format!(
                 "response request id mismatch: expected {request_id}, got {:?}",
@@ -949,7 +1053,7 @@ fn exit_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::process::Command;
     use std::time::Instant;
 
@@ -1056,18 +1160,73 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn live_broker_takeover_releases_socket_for_new_listener() {
+        let dir = std::env::temp_dir().join(format!(
+            "ego-lite-broker-takeover-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let path = dir.join("broker.sock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("create test dir");
+        let listener = crate::ipc::bind_private_local_listener(&path).expect("bind old broker");
+        let identity = crate::ipc::socket_file_identity(&path).expect("identify old socket");
+        listener.set_nonblocking(true).expect("set nonblocking");
+        let (_channel_sender, channel_in) = mpsc::channel();
+        let old_path = path.clone();
+        let old_broker = thread::spawn(move || {
+            assert!(wait_for_broker_client(&listener, &channel_in)
+                .expect("wait for takeover")
+                .is_none());
+            crate::ipc::remove_socket_file_if_owned(&old_path, &identity)
+                .expect("remove old socket");
+        });
+
+        prepare_broker_socket_path(&path).expect("take over old broker");
+        let replacement = crate::ipc::bind_private_local_listener(&path).expect("bind replacement");
+
+        old_broker.join().expect("old broker");
+        drop(replacement);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_open_is_not_a_takeover() {
+        let dir = std::env::temp_dir().join(format!(
+            "ego-lite-broker-open-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let path = dir.join("broker.sock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("create test dir");
+        let listener = crate::ipc::bind_private_local_listener(&path).expect("bind broker");
+        listener.set_nonblocking(true).expect("set nonblocking");
+        let (_channel_sender, channel_in) = mpsc::channel();
+        let mut client = crate::ipc::connect_local_stream(&path).expect("connect client");
+        let open = EgoBridgeMessage::Open {
+            request_id: 42,
+            argv: vec![b"open".to_vec()],
+        };
+        write_message(&mut client, &open).expect("write open");
+
+        let (_, first) = wait_for_broker_client(&listener, &channel_in)
+            .expect("wait for client")
+            .expect("ordinary client");
+        assert_eq!(first, open);
+
+        drop(client);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn broker_drains_disconnected_request_without_consuming_next_response() {
         use std::net::Shutdown;
 
         let (client, mut shim) = UnixStream::pair().expect("socket pair");
-        write_message(
-            &mut shim,
-            &EgoBridgeMessage::Open {
-                request_id: 10,
-                argv: vec![],
-            },
-        )
-        .expect("open");
         write_message(&mut shim, &EgoBridgeMessage::StdinEof { request_id: 10 }).expect("eof");
         shim.shutdown(Shutdown::Read).expect("disconnect output");
 
@@ -1094,9 +1253,28 @@ mod tests {
             sender.send(Ok(message)).expect("channel response");
         }
         let channel_out = Arc::new(Mutex::new(Vec::new()));
+        let listener_path = std::env::temp_dir().join(format!(
+            "ego-lite-drain-{}-{:?}.sock",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&listener_path);
+        let listener = UnixListener::bind(&listener_path).expect("bind listener");
+        listener.set_nonblocking(true).expect("set nonblocking");
+        let mut pending = std::collections::VecDeque::new();
 
         assert!(matches!(
-            handle_broker_client(client, &channel_in, Arc::clone(&channel_out)),
+            handle_broker_client(
+                client,
+                EgoBridgeMessage::Open {
+                    request_id: 10,
+                    argv: vec![],
+                },
+                &listener,
+                &mut pending,
+                &channel_in,
+                Arc::clone(&channel_out),
+            ),
             Err(BrokerClientError::Client(_))
         ));
         assert!(matches!(
@@ -1121,14 +1299,6 @@ mod tests {
         use std::net::Shutdown;
 
         let (client, mut shim) = UnixStream::pair().expect("socket pair");
-        write_message(
-            &mut shim,
-            &EgoBridgeMessage::Open {
-                request_id: 12,
-                argv: vec![],
-            },
-        )
-        .expect("open");
         write_message(&mut shim, &EgoBridgeMessage::StdinEof { request_id: 12 }).expect("eof");
         shim.shutdown(Shutdown::Read).expect("disconnect output");
         let (sender, channel_in) = mpsc::channel();
@@ -1139,10 +1309,29 @@ mod tests {
             }))
             .expect("channel response");
         let channel_out = Arc::new(Mutex::new(Vec::new()));
+        let listener_path = std::env::temp_dir().join(format!(
+            "ego-lite-timeout-{}-{:?}.sock",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&listener_path);
+        let listener = UnixListener::bind(&listener_path).expect("bind listener");
+        listener.set_nonblocking(true).expect("set nonblocking");
+        let mut pending = std::collections::VecDeque::new();
         let started = Instant::now();
 
         assert!(matches!(
-            handle_broker_client(client, &channel_in, channel_out),
+            handle_broker_client(
+                client,
+                EgoBridgeMessage::Open {
+                    request_id: 12,
+                    argv: vec![],
+                },
+                &listener,
+                &mut pending,
+                &channel_in,
+                channel_out,
+            ),
             Err(BrokerClientError::Channel(err)) if err.kind() == io::ErrorKind::TimedOut
         ));
         assert!(started.elapsed() >= BROKER_DRAIN_TIMEOUT);
