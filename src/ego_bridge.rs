@@ -49,7 +49,7 @@ const CLIENT_OPEN_TIMEOUT: Duration = Duration::from_millis(100);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(all(target_os = "linux", test))]
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const BROKER_TAKEOVER_MAGIC: &[u8] = b"ego-bridge-takeover-v1";
 #[cfg(all(target_os = "linux", not(test)))]
 const BROKER_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(12);
@@ -121,6 +121,7 @@ enum EgoBridgeMessage {
 }
 
 impl EgoBridgeMessage {
+    #[cfg(any(target_os = "linux", test))]
     fn request_id(&self) -> Option<u64> {
         match self {
             Self::Hello { .. } | Self::Welcome { .. } | Self::BrokerTakeover { .. } => None,
@@ -144,6 +145,7 @@ fn write_message<W: Write>(writer: &mut W, message: &EgoBridgeMessage) -> io::Re
     crate::framing::write_message(writer, message)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn hello() -> EgoBridgeMessage {
     EgoBridgeMessage::Hello {
         version: PROTOCOL_VERSION,
@@ -160,6 +162,7 @@ fn welcome(error: Option<String>) -> EgoBridgeMessage {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn validate_welcome(message: EgoBridgeMessage) -> io::Result<()> {
     match message {
         EgoBridgeMessage::Welcome {
@@ -1364,7 +1367,9 @@ fn exit_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::net::{UnixListener, UnixStream};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::time::Instant;
 
