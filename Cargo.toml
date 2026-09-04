@@ -8,9 +8,13 @@ license = "Apache-2.0"
 categories = ["command-line-utilities"]
 include = [
     "src/main.rs",
+    "src/config.rs",
+    "src/control.rs",
+    "src/daemon.rs",
     "src/ego_bridge.rs",
     "src/framing.rs",
     "src/ipc.rs",
+    "src/launchd.rs",
     "src/managed_ssh.rs",
     "src/macos_process.rs",
     "tests/fixtures/ego_bridge_v1.bin",
@@ -23,3 +27,4 @@ include = [
 bincode = { version = "2", features = ["serde"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
