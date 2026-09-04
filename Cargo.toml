@@ -13,6 +13,7 @@ include = [
     "src/ipc.rs",
     "src/managed_ssh.rs",
     "src/macos_process.rs",
+    "tests/fixtures/ego_bridge_v1.bin",
     "distribution/install.sh",
     "LICENSE",
     "Cargo.toml",
