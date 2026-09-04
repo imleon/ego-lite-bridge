@@ -2,15 +2,12 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-
-const CONTROL_SOCKET_NAME: &str = "ctl";
+use std::process::Command;
 
 pub(crate) struct ManagedSsh {
     target: String,
     dir: PathBuf,
     config_path: PathBuf,
-    control_path: PathBuf,
 }
 
 impl ManagedSsh {
@@ -18,7 +15,6 @@ impl ManagedSsh {
         validate_target(target)?;
         let dir = create_private_dir()?;
         let config_path = dir.join("config");
-        let control_path = dir.join(CONTROL_SOCKET_NAME);
         let result = write_config(&config_path);
         if let Err(err) = result {
             let _ = fs::remove_dir_all(&dir);
@@ -28,7 +24,6 @@ impl ManagedSsh {
             target: target.to_owned(),
             dir,
             config_path,
-            control_path,
         })
     }
 
@@ -39,33 +34,21 @@ impl ManagedSsh {
     }
 
     fn base_command(&self) -> Command {
-        let mut command = Command::new("ssh");
-        command
-            .arg("-F")
-            .arg(&self.config_path)
-            .arg("-S")
-            .arg(&self.control_path)
-            .arg("-o")
-            .arg("ControlMaster=auto")
-            .arg("-o")
-            .arg("ControlPersist=yes");
+        let mut command = crate::macos_process::command("ssh".as_ref());
+        command.arg("-F").arg(&self.config_path).args([
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "ControlPersist=no",
+        ]);
         command
     }
 }
 
 impl Drop for ManagedSsh {
     fn drop(&mut self) {
-        let _ = self
-            .base_command()
-            .arg("-O")
-            .arg("exit")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg(&self.target)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -92,14 +75,9 @@ fn create_private_dir() -> io::Result<PathBuf> {
         bases.push(PathBuf::from("/tmp"));
     }
     let mut last_error = None;
-    let mut path_fits = false;
     for base in bases {
         for attempt in 0..100 {
             let dir = base.join(format!("ego-lite-ssh-{}-{attempt}", std::process::id()));
-            if dir.join(CONTROL_SOCKET_NAME).as_os_str().len() > 103 {
-                continue;
-            }
-            path_fits = true;
             match fs::DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => return Ok(dir),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -112,11 +90,7 @@ fn create_private_dir() -> io::Result<PathBuf> {
     }
     Err(last_error.unwrap_or_else(|| {
         io::Error::new(
-            if path_fits {
-                io::ErrorKind::AlreadyExists
-            } else {
-                io::ErrorKind::InvalidInput
-            },
+            io::ErrorKind::AlreadyExists,
             "failed to create private SSH config directory",
         )
     }))
@@ -135,7 +109,8 @@ fn write_config(path: &Path) -> io::Result<()> {
     if system_config.is_file() {
         contents.push_str(&format!("Include {}\n", ssh_config_path(system_config)));
     }
-    contents.push_str("Host *\n  ServerAliveInterval 15\n  ServerAliveCountMax 4\n");
+    contents
+        .push_str("Host *\n  BatchMode yes\n  ServerAliveInterval 15\n  ServerAliveCountMax 4\n");
 
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -152,6 +127,29 @@ fn ssh_config_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_config_disables_interactive_authentication() {
+        let dir = create_private_dir().expect("private dir");
+        let path = dir.join("config");
+        write_config(&path).expect("write config");
+        let contents = fs::read_to_string(path).expect("read config");
+        assert!(contents.contains("\n  BatchMode yes\n"));
+        fs::remove_dir_all(dir).expect("remove private dir");
+    }
+
+    #[test]
+    fn command_disables_connection_sharing() {
+        let managed = ManagedSsh::new("example.test").expect("managed ssh");
+        let args = managed
+            .command()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for option in ["ControlMaster=no", "ControlPath=none", "ControlPersist=no"] {
+            assert!(args.iter().any(|arg| arg == option), "missing {option}");
+        }
+    }
 
     #[test]
     fn rejects_option_like_target() {
