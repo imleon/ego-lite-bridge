@@ -12,18 +12,18 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "distribution" / "install.sh"
-REQUIRED_COMMANDS = ("awk", "cat", "chmod", "cp", "mkdir", "mktemp", "mv", "rm")
+REQUIRED_COMMANDS = ("awk", "cat", "chmod", "cp", "ln", "mkdir", "mktemp", "mv", "rm")
 
 
 class UnixInstallerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory(prefix="herdr-installer-test-")
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="ego-lite-bridge-installer-test-")
         self.root = Path(self.temp_dir.name)
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
         self.install_dir = self.root / "install"
         self.payload = self.root / "payload"
-        self.payload.write_bytes(b"fake-herdr-binary\n")
+        self.payload.write_bytes(b"fake-ego-lite-bridge-binary\n")
         self.expected_sha256 = hashlib.sha256(self.payload.read_bytes()).hexdigest()
 
         for command in REQUIRED_COMMANDS:
@@ -32,16 +32,6 @@ class UnixInstallerTests(unittest.TestCase):
                 self.fail(f"test host is missing required command: {command}")
             (self.bin_dir / command).symlink_to(path)
 
-        self._write_executable(
-            "uname",
-            """#!/bin/sh
-case "$1" in
-  -s) echo Linux ;;
-  -m) echo x86_64 ;;
-  *) exit 1 ;;
-esac
-""",
-        )
         self._write_executable(
             "curl",
             """#!/bin/sh
@@ -101,28 +91,43 @@ exec {sha256sum} "$@"
 
         self.fail(f"unknown checksum tool fixture: {tool}")
 
-    def _write_manifest(self, checksum: str | None) -> Path:
+    def _write_manifest(self, checksum: str | None, os_name: str) -> Path:
+        target = f"{os_name}-x86_64"
         manifest: dict[str, object] = {
             "version": "9.9.9",
-            "assets": {
-                "linux-x86_64": "https://example.invalid/herdr-linux-x86_64"
-            },
+            "assets": {target: f"https://example.invalid/ego-lite-bridge-{target}"},
         }
         if checksum is not None:
-            manifest["sha256"] = {"linux-x86_64": checksum}
+            manifest["sha256"] = {target: checksum}
         path = self.root / "latest.json"
         path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         return path
 
-    def _run_installer(self, checksum: str | None, tool: str = "sha256sum") -> subprocess.CompletedProcess[str]:
+    def _run_installer(
+        self,
+        checksum: str | None,
+        tool: str = "sha256sum",
+        os_name: str = "linux",
+    ) -> subprocess.CompletedProcess[str]:
         self._select_checksum_tool(tool)
-        manifest = self._write_manifest(checksum)
+        manifest = self._write_manifest(checksum, os_name)
+        uname = "Linux" if os_name == "linux" else "Darwin"
+        self._write_executable(
+            "uname",
+            f'''#!/bin/sh
+case "$1" in
+  -s) echo {uname} ;;
+  -m) echo x86_64 ;;
+  *) exit 1 ;;
+esac
+''',
+        )
         env = {
             **os.environ,
             "PATH": str(self.bin_dir),
             "FAKE_MANIFEST": str(manifest),
             "FAKE_PAYLOAD": str(self.payload),
-            "HERDR_INSTALL_DIR": str(self.install_dir),
+            "EGO_LITE_BRIDGE_INSTALL_DIR": str(self.install_dir),
         }
         return subprocess.run(
             ["/bin/sh", str(INSTALLER)],
@@ -142,29 +147,42 @@ exec {sha256sum} "$@"
                 result = self._run_installer(self.expected_sha256.upper(), tool)
 
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual((self.install_dir / "herdr").read_bytes(), self.payload.read_bytes())
+                installed = self.install_dir / "ego-lite-bridge"
+                self.assertEqual(installed.read_bytes(), self.payload.read_bytes())
+                self.assertFalse(installed.is_symlink())
+                self.assertEqual(os.readlink(self.install_dir / "ego-browser"), "ego-lite-bridge")
+
+    def test_macos_installs_no_shim(self) -> None:
+        result = self._run_installer(self.expected_sha256, os_name="macos")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.install_dir / "ego-lite-bridge").read_bytes(),
+            self.payload.read_bytes(),
+        )
+        self.assertFalse((self.install_dir / "ego-browser").exists())
 
     def test_checksum_mismatch_does_not_replace_existing_binary(self) -> None:
         self.install_dir.mkdir()
-        installed = self.install_dir / "herdr"
-        installed.write_bytes(b"existing-herdr\n")
+        installed = self.install_dir / "ego-lite-bridge"
+        installed.write_bytes(b"existing-ego-lite-bridge\n")
 
         result = self._run_installer("0" * 64)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("checksum did not match", result.stderr)
-        self.assertEqual(installed.read_bytes(), b"existing-herdr\n")
+        self.assertEqual(installed.read_bytes(), b"existing-ego-lite-bridge\n")
 
     def test_missing_checksum_fails_without_replacing_existing_binary(self) -> None:
         self.install_dir.mkdir()
-        installed = self.install_dir / "herdr"
-        installed.write_bytes(b"existing-herdr\n")
+        installed = self.install_dir / "ego-lite-bridge"
+        installed.write_bytes(b"existing-ego-lite-bridge\n")
 
         result = self._run_installer(None)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("valid SHA-256 checksum", result.stderr)
-        self.assertEqual(installed.read_bytes(), b"existing-herdr\n")
+        self.assertEqual(installed.read_bytes(), b"existing-ego-lite-bridge\n")
 
 
 if __name__ == "__main__":
