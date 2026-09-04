@@ -8,7 +8,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(any(target_os = "macos", test))]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -24,6 +24,7 @@ use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 pub(crate) type LocalListener = UnixListener;
+#[cfg(any(target_os = "linux", test))]
 pub(crate) type LocalStream = UnixStream;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +53,7 @@ impl SecureDirectory {
         &self.path
     }
 
+    #[cfg(test)]
     pub(crate) fn metadata(&self) -> io::Result<fs::Metadata> {
         self.file.metadata()
     }
@@ -274,6 +276,7 @@ fn unlink_at(directory_fd: RawFd, name: &CString) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn identity(metadata: &fs::Metadata) -> SocketFileIdentity {
     SocketFileIdentity {
         dev: metadata.dev() as libc::dev_t,
@@ -351,11 +354,13 @@ pub(crate) fn shutdown_local_stream_read(stream: &LocalStream) -> io::Result<()>
     stream.shutdown(std::net::Shutdown::Read)
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn socket_file_identity(path: &Path) -> io::Result<SocketFileIdentity> {
     let metadata = fs::symlink_metadata(path)?;
     Ok(identity(&metadata))
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn remove_socket_file_if_owned(
     path: &Path,
     expected: &SocketFileIdentity,
@@ -395,8 +400,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock")
                 .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("ego-lite-ipc-test-{}-{suffix}", std::process::id()));
+            let path = Path::new("/tmp").join(format!("elb-ipc-{}-{suffix}", std::process::id()));
             Self(path)
         }
     }
