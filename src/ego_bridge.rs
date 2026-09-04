@@ -3,6 +3,7 @@
 #[cfg(any(target_os = "macos", test))]
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 #[cfg(any(target_os = "macos", test))]
 use std::process::Stdio;
@@ -18,12 +19,13 @@ use serde::{Deserialize, Serialize};
 
 const VERSION: u32 = 1;
 const MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 #[cfg(target_os = "linux")]
 const CLIENT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(target_os = "macos", test))]
 const EXEC_POLL_INTERVAL: Duration = Duration::from_millis(20);
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 const REMOTE_BROKER_BINARY: &str = "$HOME/.local/bin/ego-lite-bridge";
 #[cfg(any(target_os = "macos", test))]
 const REMOTE_BROKER_COMMAND: &str = "exec \"$HOME/.local/bin/ego-lite-bridge\" ego-browser-broker";
@@ -101,11 +103,6 @@ pub(crate) fn broker_socket_path() -> PathBuf {
         // SAFETY: geteuid has no preconditions and cannot fail.
         unsafe { libc::geteuid() }
     ))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn broker_socket_path() -> PathBuf {
-    std::env::temp_dir().join("ego-lite-bridge.sock")
 }
 
 #[cfg(target_os = "linux")]
@@ -313,6 +310,7 @@ pub(crate) fn run_shim(_argv: &[std::ffi::OsString]) -> io::Result<i32> {
     ))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn run_shim_stream<S, I, O, E>(
     mut stream: S,
     request_id: u64,
@@ -405,12 +403,14 @@ where
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 trait TryCloneStream {
     fn try_clone_stream(&self) -> io::Result<Self>
     where
         Self: Sized;
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl TryCloneStream for crate::ipc::LocalStream {
     fn try_clone_stream(&self) -> io::Result<Self> {
         self.try_clone()

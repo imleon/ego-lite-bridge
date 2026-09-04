@@ -4,6 +4,7 @@ use std::path::Path;
 
 mod ego_bridge;
 mod framing;
+#[cfg(any(target_os = "linux", test))]
 mod ipc;
 #[cfg(any(target_os = "macos", test))]
 mod macos_process;
