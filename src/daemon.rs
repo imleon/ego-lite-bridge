@@ -5,21 +5,30 @@ use std::ffi::CString;
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(test)]
 const PROCESS_LIMIT: usize = 8;
+#[cfg(test)]
 const PAYLOAD_LIMIT: usize = 8 * 1024 * 1024;
+#[cfg(test)]
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
 pub(crate) const SHUTDOWN_TOTAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub(crate) struct ApplicationPaths {
     pub(crate) directory: PathBuf,
+    #[cfg(test)]
     pub(crate) config: PathBuf,
     pub(crate) control_socket: PathBuf,
+    #[cfg(test)]
     pub(crate) lock: PathBuf,
 }
 
@@ -32,8 +41,10 @@ pub(crate) fn application_paths(home: &Path) -> io::Result<ApplicationPaths> {
     }
     let directory = home.join("Library/Application Support/ego-lite-bridge");
     Ok(ApplicationPaths {
+        #[cfg(test)]
         config: directory.join("config.json"),
         control_socket: directory.join("control.sock"),
+        #[cfg(test)]
         lock: directory.join("daemon.lock"),
         directory,
     })
@@ -217,6 +228,7 @@ impl DaemonLock {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ShutdownPhase {
     Graceful,
@@ -224,9 +236,11 @@ pub(crate) enum ShutdownPhase {
     Expired,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ShutdownCoordinator;
 
+#[cfg(test)]
 impl ShutdownCoordinator {
     pub(crate) fn phase(elapsed: Duration) -> ShutdownPhase {
         if elapsed < SHUTDOWN_GRACE {
@@ -239,15 +253,18 @@ impl ShutdownCoordinator {
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct Usage {
     processes: usize,
     payload_bytes: usize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Default)]
 pub(crate) struct ResourceBudget(Arc<Mutex<Usage>>);
 
+#[cfg(test)]
 impl ResourceBudget {
     pub(crate) fn reserve(
         &self,
@@ -289,12 +306,14 @@ impl ResourceBudget {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct Reservation {
     budget: ResourceBudget,
     processes: usize,
     payload_bytes: usize,
 }
 
+#[cfg(test)]
 impl Drop for Reservation {
     fn drop(&mut self) {
         if let Ok(mut usage) = self.budget.0.lock() {

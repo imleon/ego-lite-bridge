@@ -251,10 +251,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock")
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "ego-lite-control-test-{}-{suffix}",
-            std::process::id()
-        ));
+        let directory =
+            Path::new("/tmp").join(format!("elb-control-{}-{suffix}", std::process::id()));
         fs::create_dir(&directory).expect("create test directory");
         let path = directory.join("control.sock");
         let listener = UnixListener::bind(&path).expect("bind socket");
