@@ -9,9 +9,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 #[cfg(any(target_os = "macos", test))]
 use std::process::{Child, ExitStatus};
-#[cfg(any(target_os = "macos", test))]
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -23,12 +21,25 @@ const MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 #[cfg(target_os = "linux")]
 const CLIENT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(all(target_os = "linux", not(test)))]
+const BROKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(all(target_os = "linux", test))]
+const BROKER_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(any(target_os = "macos", test))]
 const EXEC_POLL_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(any(target_os = "macos", test))]
+const RECONNECT_DELAYS: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+];
+#[cfg(any(target_os = "macos", test))]
+const STABLE_CONNECTION_TIME: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const REMOTE_BROKER_BINARY: &str = "$HOME/.local/bin/ego-lite-bridge";
 #[cfg(any(target_os = "macos", test))]
-const REMOTE_BROKER_COMMAND: &str = "exec \"$HOME/.local/bin/ego-lite-bridge\" ego-browser-broker";
+const REMOTE_BROKER_COMMAND: &str = "test -x \"$HOME/.local/bin/ego-lite-bridge\" || exit 127; exec \"$HOME/.local/bin/ego-lite-bridge\" ego-browser-broker";
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum EgoBridgeMessage {
@@ -122,11 +133,21 @@ pub(crate) fn run_broker() -> io::Result<()> {
     }
 
     let result = (|| {
-        let stdin = io::stdin();
-        let mut channel_in = stdin.lock();
+        let (channel_sender, channel_in) = mpsc::channel();
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut stdin = stdin.lock();
+            loop {
+                let message = read_message(&mut stdin);
+                let done = message.is_err();
+                if channel_sender.send(message).is_err() || done {
+                    return;
+                }
+            }
+        });
         let channel_out = Arc::new(Mutex::new(io::stdout()));
         write_locked(&channel_out, &EgoBridgeMessage::Hello { version: VERSION })?;
-        match read_message(&mut channel_in)? {
+        match recv_broker_message(&channel_in, None)? {
             EgoBridgeMessage::Welcome { version, error }
                 if version == VERSION && error.is_none() => {}
             EgoBridgeMessage::Welcome {
@@ -143,7 +164,7 @@ pub(crate) fn run_broker() -> io::Result<()> {
         loop {
             eprintln!("ego-lite-bridge broker: waiting for ego-browser invocation");
             let (client, _) = listener.accept()?;
-            match handle_broker_client(client, &mut channel_in, Arc::clone(&channel_out)) {
+            match handle_broker_client(client, &channel_in, Arc::clone(&channel_out)) {
                 Ok(()) => {}
                 Err(BrokerClientError::Client(err)) => {
                     eprintln!("ego-lite-bridge broker: local invocation disconnected: {err}");
@@ -173,9 +194,9 @@ enum BrokerClientError {
 }
 
 #[cfg(target_os = "linux")]
-fn handle_broker_client<R: Read, W: Write + Send + 'static>(
+fn handle_broker_client<W: Write + Send + 'static>(
     mut client: crate::ipc::LocalStream,
-    channel_in: &mut R,
+    channel_in: &mpsc::Receiver<io::Result<EgoBridgeMessage>>,
     channel_out: Arc<Mutex<W>>,
 ) -> Result<(), BrokerClientError> {
     crate::ipc::set_local_stream_read_timeout(&client, Some(CLIENT_OPEN_TIMEOUT))
@@ -197,8 +218,13 @@ fn handle_broker_client<R: Read, W: Write + Send + 'static>(
     let upload_out = Arc::clone(&channel_out);
     let uploader = thread::spawn(move || broker_upload(request_id, &mut upload, &upload_out));
 
+    let mut client_error = None;
     let response = loop {
-        let message = read_message(channel_in).map_err(BrokerClientError::Channel)?;
+        let message = recv_broker_message(
+            channel_in,
+            client_error.as_ref().map(|_| BROKER_DRAIN_TIMEOUT),
+        )
+        .map_err(BrokerClientError::Channel)?;
         if message.request_id() != Some(request_id) {
             return Err(BrokerClientError::Channel(io::Error::other(format!(
                 "response request id mismatch: expected {request_id}, got {:?}",
@@ -209,9 +235,11 @@ fn handle_broker_client<R: Read, W: Write + Send + 'static>(
             message,
             EgoBridgeMessage::Exit { .. } | EgoBridgeMessage::Error { .. }
         );
-        if let Err(err) = write_message(&mut client, &message) {
-            let _ = write_locked(&channel_out, &EgoBridgeMessage::Cancel { request_id });
-            break Err(BrokerClientError::Client(err));
+        if client_error.is_none() {
+            if let Err(err) = write_message(&mut client, &message) {
+                client_error = Some(err);
+                let _ = write_locked(&channel_out, &EgoBridgeMessage::Cancel { request_id });
+            }
         }
         if done {
             if let EgoBridgeMessage::Exit { code, signal, .. } = message {
@@ -221,12 +249,36 @@ fn handle_broker_client<R: Read, W: Write + Send + 'static>(
             } else {
                 eprintln!("ego-lite-bridge broker: request {request_id} finished with error");
             }
-            break Ok(());
+            break match client_error {
+                Some(err) => Err(BrokerClientError::Client(err)),
+                None => Ok(()),
+            };
         }
     };
     let _ = crate::ipc::shutdown_local_stream_read(&client);
     let _ = uploader.join();
     response
+}
+
+#[cfg(target_os = "linux")]
+fn recv_broker_message(
+    receiver: &mpsc::Receiver<io::Result<EgoBridgeMessage>>,
+    timeout: Option<Duration>,
+) -> io::Result<EgoBridgeMessage> {
+    match timeout {
+        Some(timeout) => receiver.recv_timeout(timeout).map_err(|err| match err {
+            mpsc::RecvTimeoutError::Timeout => io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out draining cancelled request",
+            ),
+            mpsc::RecvTimeoutError::Disconnected => {
+                io::Error::new(io::ErrorKind::BrokenPipe, "executor channel reader stopped")
+            }
+        })?,
+        None => receiver.recv().map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "executor channel reader stopped")
+        })?,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -419,27 +471,112 @@ impl TryCloneStream for crate::ipc::LocalStream {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn run_serve(target: &str) -> io::Result<()> {
-    eprintln!("ego-lite-bridge: connecting to {target}");
-    let remote = crate::managed_ssh::ManagedSsh::new(target)?;
-    let mut ssh = remote.command();
-    ssh.arg(REMOTE_BROKER_COMMAND)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    let mut child = ssh.spawn().map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("failed to start ssh for {target}: {err}"),
-        )
-    })?;
-    let result = run_serve_child(&mut child, target);
-    let _ = child.kill();
-    let _ = child.wait();
-    result
+    crate::macos_process::install_stop_handlers()?;
+    let mut failures = 0;
+    loop {
+        if crate::macos_process::stopped() {
+            eprintln!("ego-lite-bridge: stopping");
+            return Ok(());
+        }
+        eprintln!("ego-lite-bridge: connecting to {target}");
+        let remote = crate::managed_ssh::ManagedSsh::new(target)?;
+        let mut ssh = remote.command();
+        ssh.arg(REMOTE_BROKER_COMMAND)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        let mut child = match ssh.spawn() {
+            Ok(child) => child,
+            Err(err) if ssh_spawn_error_is_permanent(err.kind()) => return Err(err),
+            Err(err) => {
+                eprintln!("ego-lite-bridge: failed to start ssh for {target}: {err}");
+                wait_to_reconnect(target, &mut failures);
+                continue;
+            }
+        };
+        if let Err(err) = crate::macos_process::track_ssh(&child) {
+            let _ = crate::macos_process::stop_ssh(&mut child);
+            return Err(err);
+        }
+        let mut connected_at = None;
+        let result = run_serve_child(&mut child, target, || {
+            connected_at = Some(std::time::Instant::now())
+        });
+        let remote_broker_missing =
+            crate::macos_process::stop_ssh(&mut child).is_some_and(remote_broker_is_missing);
+        drop(remote);
+        if remote_broker_missing {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("ego-lite-bridge is not installed or executable on {target}"),
+            ));
+        }
+        if connected_at.is_some_and(|connected_at| connection_was_stable(connected_at.elapsed())) {
+            failures = 0;
+        }
+
+        if crate::macos_process::stopped() {
+            eprintln!("ego-lite-bridge: stopped");
+            return Ok(());
+        }
+        if let Err(err) = result {
+            if err.kind() == io::ErrorKind::InvalidInput {
+                return Err(err);
+            }
+            eprintln!("ego-lite-bridge: disconnected from {target}: {err}");
+        }
+        wait_to_reconnect(target, &mut failures);
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn run_serve_child(child: &mut Child, target: &str) -> io::Result<()> {
+fn wait_to_reconnect(target: &str, failures: &mut usize) {
+    let delay = reconnect_delay(*failures);
+    *failures = failures.saturating_add(1);
+    eprintln!(
+        "ego-lite-bridge: reconnecting to {target} in {}ms",
+        delay.as_millis()
+    );
+    let deadline = std::time::Instant::now() + delay;
+    while !crate::macos_process::stopped() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        thread::sleep(remaining.min(EXEC_POLL_INTERVAL));
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn remote_broker_is_missing(status: ExitStatus) -> bool {
+    status.code() == Some(127)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ssh_spawn_error_is_permanent(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn reconnect_delay(failures: usize) -> Duration {
+    RECONNECT_DELAYS[failures.min(RECONNECT_DELAYS.len() - 1)]
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn connection_was_stable(elapsed: Duration) -> bool {
+    elapsed >= STABLE_CONNECTION_TIME
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn invalid_handshake(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+#[cfg(target_os = "macos")]
+fn run_serve_child(child: &mut Child, target: &str, connected: impl FnOnce()) -> io::Result<()> {
     let channel_out = child
         .stdin
         .take()
@@ -463,10 +600,10 @@ fn run_serve_child(child: &mut Child, target: &str) -> io::Result<()> {
                     error: Some(error.clone()),
                 },
             );
-            return Err(io::Error::other(error));
+            return Err(invalid_handshake(error));
         }
         message => {
-            return Err(io::Error::other(format!(
+            return Err(invalid_handshake(format!(
                 "invalid broker handshake: {message:?}"
             )))
         }
@@ -479,6 +616,7 @@ fn run_serve_child(child: &mut Child, target: &str) -> io::Result<()> {
             error: None,
         },
     )?;
+    connected();
     eprintln!("ego-lite-bridge: broker ready on {target}");
 
     let (sender, receiver) = mpsc::channel();
@@ -767,6 +905,7 @@ fn exit_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+    use std::process::Command;
     use std::time::Instant;
 
     #[test]
@@ -870,6 +1009,101 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broker_drains_disconnected_request_without_consuming_next_response() {
+        use std::net::Shutdown;
+
+        let (client, mut shim) = UnixStream::pair().expect("socket pair");
+        write_message(
+            &mut shim,
+            &EgoBridgeMessage::Open {
+                request_id: 10,
+                argv: vec![],
+            },
+        )
+        .expect("open");
+        write_message(&mut shim, &EgoBridgeMessage::StdinEof { request_id: 10 }).expect("eof");
+        shim.shutdown(Shutdown::Read).expect("disconnect output");
+
+        let (sender, channel_in) = mpsc::channel();
+        for message in [
+            EgoBridgeMessage::Stdout {
+                request_id: 10,
+                data: b"partial".to_vec(),
+            },
+            EgoBridgeMessage::Stderr {
+                request_id: 10,
+                data: b"ignored".to_vec(),
+            },
+            EgoBridgeMessage::Exit {
+                request_id: 10,
+                code: None,
+                signal: Some(15),
+            },
+            EgoBridgeMessage::Stdout {
+                request_id: 11,
+                data: b"next".to_vec(),
+            },
+        ] {
+            sender.send(Ok(message)).expect("channel response");
+        }
+        let channel_out = Arc::new(Mutex::new(Vec::new()));
+
+        assert!(matches!(
+            handle_broker_client(client, &channel_in, Arc::clone(&channel_out)),
+            Err(BrokerClientError::Client(_))
+        ));
+        assert!(matches!(
+            channel_in.try_recv(),
+            Ok(Ok(EgoBridgeMessage::Stdout {
+                request_id: 11,
+                data,
+            })) if data == b"next"
+        ));
+        assert_eq!(
+            decode_messages(&channel_out)
+                .iter()
+                .filter(|message| matches!(message, EgoBridgeMessage::Cancel { request_id: 10 }))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broker_times_out_when_cancel_has_no_terminal_response() {
+        use std::net::Shutdown;
+
+        let (client, mut shim) = UnixStream::pair().expect("socket pair");
+        write_message(
+            &mut shim,
+            &EgoBridgeMessage::Open {
+                request_id: 12,
+                argv: vec![],
+            },
+        )
+        .expect("open");
+        write_message(&mut shim, &EgoBridgeMessage::StdinEof { request_id: 12 }).expect("eof");
+        shim.shutdown(Shutdown::Read).expect("disconnect output");
+        let (sender, channel_in) = mpsc::channel();
+        sender
+            .send(Ok(EgoBridgeMessage::Stdout {
+                request_id: 12,
+                data: b"trigger".to_vec(),
+            }))
+            .expect("channel response");
+        let channel_out = Arc::new(Mutex::new(Vec::new()));
+        let started = Instant::now();
+
+        assert!(matches!(
+            handle_broker_client(client, &channel_in, channel_out),
+            Err(BrokerClientError::Channel(err)) if err.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() >= BROKER_DRAIN_TIMEOUT);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn child_exit_does_not_wait_for_stdin_eof() {
         let (_sender, receiver) = mpsc::channel();
@@ -943,11 +1177,64 @@ mod tests {
     }
 
     #[test]
+    fn permanent_ssh_spawn_errors_are_not_retried() {
+        assert!(ssh_spawn_error_is_permanent(io::ErrorKind::NotFound));
+        assert!(ssh_spawn_error_is_permanent(
+            io::ErrorKind::PermissionDenied
+        ));
+        assert!(ssh_spawn_error_is_permanent(io::ErrorKind::InvalidInput));
+        assert!(!ssh_spawn_error_is_permanent(io::ErrorKind::ResourceBusy));
+    }
+
+    #[test]
+    fn only_remote_command_not_found_is_fatal() {
+        let missing = Command::new("/bin/sh")
+            .args(["-c", "exit 127"])
+            .status()
+            .expect("exit 127");
+        let network_failure = Command::new("/bin/sh")
+            .args(["-c", "exit 255"])
+            .status()
+            .expect("exit 255");
+        assert!(remote_broker_is_missing(missing));
+        assert!(!remote_broker_is_missing(network_failure));
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_and_caps() {
+        assert_eq!(
+            (0..6).map(reconnect_delay).collect::<Vec<_>>(),
+            vec![
+                Duration::from_millis(250),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_only_after_stable_connection() {
+        assert!(!connection_was_stable(Duration::from_secs(9)));
+        assert!(connection_was_stable(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn invalid_handshake_is_not_retryable() {
+        assert_eq!(
+            invalid_handshake("bad broker").kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn remote_broker_command_uses_installed_product_name() {
         assert_eq!(REMOTE_BROKER_BINARY, "$HOME/.local/bin/ego-lite-bridge");
         assert_eq!(
             REMOTE_BROKER_COMMAND,
-            "exec \"$HOME/.local/bin/ego-lite-bridge\" ego-browser-broker"
+            "test -x \"$HOME/.local/bin/ego-lite-bridge\" || exit 127; exec \"$HOME/.local/bin/ego-lite-bridge\" ego-browser-broker"
         );
     }
 
