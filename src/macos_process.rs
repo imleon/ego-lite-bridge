@@ -42,7 +42,7 @@ extern "C" fn stop_handler(_signal: libc::c_int) {
 pub(crate) fn install_stop_handlers() -> io::Result<()> {
     STOP.store(false, Ordering::Relaxed);
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = stop_handler as usize;
+    action.sa_sigaction = stop_handler as *const () as usize;
     action.sa_flags = 0;
     // SAFETY: action is initialized, its handler has the required ABI, and the signal set is valid.
     unsafe {
