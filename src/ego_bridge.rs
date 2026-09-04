@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 #[cfg(any(target_os = "macos", test))]
 use std::process::{Child, ExitStatus};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -216,7 +218,11 @@ fn handle_broker_client<W: Write + Send + 'static>(
 
     let mut upload = client.try_clone().map_err(BrokerClientError::Client)?;
     let upload_out = Arc::clone(&channel_out);
-    let uploader = thread::spawn(move || broker_upload(request_id, &mut upload, &upload_out));
+    let cancel_sent = Arc::new(AtomicBool::new(false));
+    let upload_cancel_sent = Arc::clone(&cancel_sent);
+    let uploader = thread::spawn(move || {
+        broker_upload(request_id, &mut upload, &upload_out, &upload_cancel_sent)
+    });
 
     let mut client_error = None;
     let response = loop {
@@ -238,7 +244,7 @@ fn handle_broker_client<W: Write + Send + 'static>(
         if client_error.is_none() {
             if let Err(err) = write_message(&mut client, &message) {
                 client_error = Some(err);
-                let _ = write_locked(&channel_out, &EgoBridgeMessage::Cancel { request_id });
+                send_cancel_once(request_id, &channel_out, &cancel_sent);
             }
         }
         if done {
@@ -286,6 +292,7 @@ fn broker_upload<W: Write>(
     request_id: u64,
     client: &mut crate::ipc::LocalStream,
     channel_out: &Arc<Mutex<W>>,
+    cancel_sent: &AtomicBool,
 ) -> io::Result<()> {
     loop {
         match read_message(client) {
@@ -298,26 +305,34 @@ fn broker_upload<W: Write>(
                             | EgoBridgeMessage::Cancel { .. }
                     ) =>
             {
-                let done = matches!(
-                    message,
-                    EgoBridgeMessage::StdinEof { .. } | EgoBridgeMessage::Cancel { .. }
-                );
+                let cancelled = matches!(message, EgoBridgeMessage::Cancel { .. });
                 write_locked(channel_out, &message)?;
-                if done {
+                if cancelled {
                     return Ok(());
                 }
             }
             Ok(message) => {
-                write_locked(channel_out, &EgoBridgeMessage::Cancel { request_id })?;
+                send_cancel_once(request_id, channel_out, cancel_sent);
                 return Err(io::Error::other(format!(
                     "invalid shim message for request {request_id}: {message:?}"
                 )));
             }
             Err(err) => {
-                write_locked(channel_out, &EgoBridgeMessage::Cancel { request_id })?;
+                send_cancel_once(request_id, channel_out, cancel_sent);
                 return Err(err);
             }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_cancel_once<W: Write>(
+    request_id: u64,
+    channel_out: &Arc<Mutex<W>>,
+    cancel_sent: &AtomicBool,
+) {
+    if !cancel_sent.swap(true, Ordering::AcqRel) {
+        let _ = write_locked(channel_out, &EgoBridgeMessage::Cancel { request_id });
     }
 }
 
