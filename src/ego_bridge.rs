@@ -162,10 +162,11 @@ pub(crate) fn run_broker() -> io::Result<()> {
             }
         }
 
+        listener.set_nonblocking(true)?;
         eprintln!("ego-lite-bridge broker: socket ready at {}", path.display());
         loop {
             eprintln!("ego-lite-bridge broker: waiting for ego-browser invocation");
-            let (client, _) = listener.accept()?;
+            let client = wait_for_broker_client(&listener, &channel_in)?;
             match handle_broker_client(client, &channel_in, Arc::clone(&channel_out)) {
                 Ok(()) => {}
                 Err(BrokerClientError::Client(err)) => {
@@ -180,6 +181,35 @@ pub(crate) fn run_broker() -> io::Result<()> {
     })();
     let _ = crate::ipc::remove_socket_file_if_owned(&path, &identity);
     result
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_broker_client(
+    listener: &crate::ipc::LocalListener,
+    channel_in: &mpsc::Receiver<io::Result<EgoBridgeMessage>>,
+) -> io::Result<crate::ipc::LocalStream> {
+    loop {
+        match listener.accept() {
+            Ok((client, _)) => return Ok(client),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err),
+        }
+        match channel_in.recv_timeout(Duration::from_millis(100)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Mac executor channel reader stopped",
+                ));
+            }
+            Ok(Err(err)) => return Err(err),
+            Ok(Ok(message)) => {
+                return Err(io::Error::other(format!(
+                    "unexpected executor message while idle: {message:?}"
+                )));
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
