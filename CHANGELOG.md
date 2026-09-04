@@ -7,7 +7,8 @@
 - Added the macOS `ego-lite-bridge serve <linux-host>` command, which maintains an SSH-backed execution channel to Linux and reconnects after transient failures.
 - Added the Linux `ego-browser` shim and private per-user broker socket.
 - Added binary-safe forwarding for arguments, stdin, stdout, stderr, exit codes, signals, cancellation, and spawn errors.
-- Added queued one-at-a-time request handling and broker takeover when a newer Mac channel connects.
+- Added up to 8 concurrent requests, immediate capacity rejection, per-request input/output/backpressure isolation, and broker takeover when a newer Mac channel connects.
+- Added exact protocol capability negotiation; peers with missing or unknown capabilities are rejected.
 - Added source and release installation support for macOS and Linux.
 
 ### Security

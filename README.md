@@ -79,7 +79,7 @@ Ensure `~/.local/bin` is on `PATH`. The release installer in `distribution/insta
 ## Current limitations
 
 - Only macOS executors and Linux callers are supported.
-- Requests carry IDs, but the broker executes one `ego-browser` invocation at a time; additional invocations wait in a queue.
+- Up to 8 `ego-browser` invocations run concurrently. Additional invocations are rejected immediately at capacity; a blocked or disconnected request does not block the others.
 - The Linux broker path is fixed to `~/.local/bin/ego-lite-bridge`.
 - The bridge forwards command arguments and standard streams only; it does not mirror the Mac filesystem or environment.
 

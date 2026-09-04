@@ -18,7 +18,7 @@ Linux ego-browser shim -> Linux broker -> SSH channel -> Mac executor -> ego-bro
 - The Mac is the executor and channel owner.
 - The Linux broker exposes a private per-user socket and routes local shim requests over the existing channel.
 - The fixed Mac-side target is `ego-browser`; do not introduce arbitrary shell execution.
-- The broker currently executes one request at a time and queues additional clients. Preserve request IDs so multiplexing can be added without changing the protocol shape.
+- The bridge runs up to 8 requests concurrently and rejects additional requests at capacity. Keep request input, output, cancellation, errors, and backpressure isolated by request ID.
 
 ## Protocol
 

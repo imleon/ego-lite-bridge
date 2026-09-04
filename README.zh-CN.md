@@ -79,7 +79,7 @@ ln -sf ego-lite-bridge ~/.local/bin/ego-browser
 ## 当前限制
 
 - 仅支持 macOS executor 和 Linux caller。
-- 请求带有 ID，但 broker 同一时间只执行一个 `ego-browser` 调用；其余调用排队等待。
+- 最多可并发执行 8 个 `ego-browser` 调用；达到容量后新增调用会立即被拒绝，阻塞或断开的请求不会阻塞其他请求。
 - Linux broker 路径固定为 `~/.local/bin/ego-lite-bridge`。
 - bridge 只转发命令参数和标准流，不映射 Mac 文件系统或环境变量。
 
