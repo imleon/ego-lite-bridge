@@ -2,14 +2,29 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) fn write_message<W: Write, M: Serialize>(writer: &mut W, message: &M) -> io::Result<()> {
+pub(crate) fn encode_message<M: Serialize>(message: &M, max_size: usize) -> io::Result<Vec<u8>> {
     let payload = bincode::serde::encode_to_vec(message, bincode::config::standard())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if payload.len() > max_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "encoded frame size {} exceeds maximum {max_size}",
+                payload.len()
+            ),
+        ));
+    }
     let len = u32::try_from(payload.len()).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidData, "message exceeds u32 frame size")
     })?;
-    writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(&payload)?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+pub(crate) fn write_message<W: Write, M: Serialize>(writer: &mut W, message: &M) -> io::Result<()> {
+    writer.write_all(&encode_message(message, u32::MAX as usize)?)?;
     writer.flush()
 }
 
@@ -90,6 +105,12 @@ mod tests {
         let bytes = 9_u32.to_le_bytes();
         let mut frame = bytes.as_slice();
         let error = read_message::<_, u8>(&mut frame, 8).expect_err("reject oversized frame");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn encode_rejects_payload_over_bridge_limit() {
+        let error = encode_message(&vec![0_u8; 9], 8).expect_err("reject oversized payload");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }
