@@ -1,6 +1,8 @@
-use crate::ipc::{self, SecureDirectory};
+#[cfg(any(target_os = "macos", test))]
+use crate::config;
 #[cfg(target_os = "macos")]
-use crate::{config, control};
+use crate::control;
+use crate::ipc::{self, SecureDirectory};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io;
@@ -77,6 +79,17 @@ pub(crate) fn clear_stop_intent(home: &Path, ego_browser: &Path) -> io::Result<(
     });
     value.ego_browser_path = browser.to_owned();
     value.daemon_stopping = false;
+    store.save(&value).map_err(io::Error::other)
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn persist_stop_intent(home: &Path) -> io::Result<()> {
+    let directory = open_application_directory(home)?;
+    let store = config::ConfigStore::open(directory.path())?;
+    let Some(mut value) = store.load()? else {
+        return Ok(());
+    };
+    value.daemon_stopping = true;
     store.save(&value).map_err(io::Error::other)
 }
 
@@ -174,6 +187,12 @@ pub(crate) fn validate_ego_browser(path: &Path) -> io::Result<PathBuf> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "ego-browser must be owned by the current user or root",
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "ego-browser must not be writable by group or others",
         ));
     }
     Ok(canonical)
@@ -393,9 +412,40 @@ mod tests {
             validate_ego_browser(&executable).expect("validate executable"),
             executable.canonicalize().expect("canonical path")
         );
+        for mode in [0o720, 0o702] {
+            fs::set_permissions(&executable, fs::Permissions::from_mode(mode))
+                .expect("set writable mode");
+            assert_eq!(
+                validate_ego_browser(&executable)
+                    .expect_err("reject writable executable")
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o600))
             .expect("clear executable mode");
         assert!(validate_ego_browser(&executable).is_err());
+    }
+
+    #[test]
+    fn stop_intent_preserves_existing_config_and_ignores_missing_config() {
+        let home = TestDir::new();
+        persist_stop_intent(&home.0).expect("missing config is already stopped");
+        let directory = open_application_directory(&home.0).expect("open application directory");
+        let store = config::ConfigStore::open(directory.path()).expect("open config store");
+        let expected = config::Config {
+            schema_version: config::SCHEMA_VERSION,
+            ego_browser_path: "/configured/ego-browser".into(),
+            daemon_stopping: false,
+            remotes: Vec::new(),
+        };
+        store.save(&expected).expect("save config");
+
+        persist_stop_intent(&home.0).expect("persist stop intent");
+        let actual = store.load().expect("load config").expect("config exists");
+        assert_eq!(actual.ego_browser_path, expected.ego_browser_path);
+        assert!(actual.daemon_stopping);
+        assert_eq!(actual.remotes, expected.remotes);
     }
 
     #[test]
