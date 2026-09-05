@@ -12,7 +12,7 @@ pub(crate) struct ManagedSsh {
 
 impl ManagedSsh {
     pub(crate) fn new(target: &str) -> io::Result<Self> {
-        validate_target(target)?;
+        crate::config::validate_remote_target(target)?;
         let dir = create_private_dir()?;
         let config_path = dir.join("config");
         let result = write_config(&config_path);
@@ -51,22 +51,6 @@ impl Drop for ManagedSsh {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
-}
-
-fn validate_target(target: &str) -> io::Result<()> {
-    if target.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "missing Linux host",
-        ));
-    }
-    if target.starts_with('-') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Linux host must not start with '-'",
-        ));
-    }
-    Ok(())
 }
 
 fn create_private_dir() -> io::Result<PathBuf> {
@@ -152,10 +136,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_option_like_target() {
-        assert_eq!(
-            validate_target("-oProxyCommand=bad").unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
+    fn rejects_invalid_target() {
+        for target in ["-oProxyCommand=bad", "two hosts", "host\narg"] {
+            assert!(matches!(
+                ManagedSsh::new(target),
+                Err(ref error) if error.kind() == io::ErrorKind::InvalidInput
+            ));
+        }
     }
 }

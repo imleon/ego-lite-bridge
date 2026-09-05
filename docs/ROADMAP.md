@@ -72,7 +72,9 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 
 边界：ownership只fence Linux新请求入口；不承诺瞬时终止网络分区另一侧已运行的Mac child。
 
-### M6 — Remote CRUD与RemoteWorker接入
+### M6 — Remote CRUD与RemoteWorker接入（已实现，待真实E2E验收）
+
+状态：代码与本地自动化已实现；真实Mac/Linux RemoteWorker E2E验收尚未完成，因此本阶段不标记为已完成。
 
 目标：以M4持久状态和M5 claim协议交付完整可用的多remote产品。
 

@@ -6,7 +6,9 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Read, Write};
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 #[cfg(any(target_os = "macos", test))]
 use std::process::Stdio;
@@ -58,6 +60,8 @@ const BROKER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const BROKER_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(target_os = "macos")]
 const BROKER_READY_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(target_os = "macos")]
+const IDENTITY_APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
 const BROKER_ACQUISITION_RETRY: Duration = Duration::from_millis(250);
 #[cfg(all(target_os = "linux", not(test)))]
@@ -280,18 +284,87 @@ const INBOUND_REQUEST_BYTES_TOTAL: usize =
     MAX_CONCURRENT_REQUESTS * INBOUND_REQUEST_BYTES_PER_REQUEST;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 const WRITER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const PROCESS_LIMIT: usize = 8;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const PAYLOAD_LIMIT: usize = 8 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const BUDGET_EXHAUSTED: &str = "daemon global resource budget exhausted";
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[derive(Default)]
+struct ResourceUsage {
+    processes: usize,
+    payload_bytes: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[derive(Clone, Default)]
+pub(crate) struct ResourceBudget(Arc<Mutex<ResourceUsage>>);
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+impl ResourceBudget {
+    fn reserve(&self, processes: usize, payload_bytes: usize) -> io::Result<Reservation> {
+        let mut usage = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("resource budget poisoned"))?;
+        let next_processes = usage
+            .processes
+            .checked_add(processes)
+            .ok_or_else(|| io::Error::other("process budget overflow"))?;
+        let next_payload = usage
+            .payload_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| io::Error::other("payload budget overflow"))?;
+        if next_processes > PROCESS_LIMIT || next_payload > PAYLOAD_LIMIT {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, BUDGET_EXHAUSTED));
+        }
+        usage.processes = next_processes;
+        usage.payload_bytes = next_payload;
+        Ok(Reservation {
+            budget: self.clone(),
+            processes,
+            payload_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn usage(&self) -> (usize, usize) {
+        let usage = self.0.lock().expect("budget lock");
+        (usage.processes, usage.payload_bytes)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+struct Reservation {
+    budget: ResourceBudget,
+    processes: usize,
+    payload_bytes: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if let Ok(mut usage) = self.budget.0.lock() {
+            usage.processes -= self.processes;
+            usage.payload_bytes -= self.payload_bytes;
+        }
+    }
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 struct InboundEvent {
     #[cfg(target_os = "linux")]
     received_at: Instant,
     message: EgoBridgeMessage,
+    payload: Option<Reservation>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 enum InboundItem {
     Message(InboundEvent),
-    Overload(u64),
+    Overload(u64, bool),
     Transport(io::Error),
 }
 
@@ -305,6 +378,7 @@ struct InboundRequestQueue {
     open_pending: bool,
     overloaded: bool,
     overload_delivered: bool,
+    budget_exhausted: bool,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -322,15 +396,22 @@ struct InboundState {
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 struct InboundScheduler {
     broker_side: bool,
+    budget: Option<ResourceBudget>,
     state: Mutex<InboundState>,
     ready: Condvar,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl InboundScheduler {
+    #[cfg(any(target_os = "linux", test))]
     fn new(broker_side: bool) -> Arc<Self> {
+        Self::with_budget(broker_side, None)
+    }
+
+    fn with_budget(broker_side: bool, budget: Option<ResourceBudget>) -> Arc<Self> {
         Arc::new(Self {
             broker_side,
+            budget,
             state: Mutex::new(InboundState::default()),
             ready: Condvar::new(),
         })
@@ -352,10 +433,11 @@ impl InboundScheduler {
                 return false;
             }
         };
-        let event = InboundEvent {
+        let mut event = InboundEvent {
             #[cfg(target_os = "linux")]
             received_at: Instant::now(),
             message,
+            payload: None,
         };
         if self.is_control(&event.message) {
             if state.control.len() == INBOUND_CONTROL_CAPACITY {
@@ -389,7 +471,22 @@ impl InboundScheduler {
             return false;
         }
         let ordinary_bytes = inbound_ordinary_bytes(&event.message);
-        let total_overflow = state.ordinary_frames == INBOUND_REQUEST_FRAMES_TOTAL
+        let payload_bytes = queued_payload_bytes(&event.message);
+        let budget_overflow = payload_bytes > 0
+            && match self
+                .budget
+                .as_ref()
+                .map(|budget| budget.reserve(0, payload_bytes))
+            {
+                Some(Ok(reservation)) => {
+                    event.payload = Some(reservation);
+                    false
+                }
+                Some(Err(_)) => true,
+                None => false,
+            };
+        let total_overflow = budget_overflow
+            || state.ordinary_frames == INBOUND_REQUEST_FRAMES_TOTAL
             || state.ordinary_bytes.saturating_add(ordinary_bytes) > INBOUND_REQUEST_BYTES_TOTAL;
         let queue = state.requests.entry(request_id).or_default();
         let request_overflow = queue.ordinary_frames == INBOUND_REQUEST_FRAMES_PER_REQUEST
@@ -398,6 +495,7 @@ impl InboundScheduler {
         if queue.overloaded || total_overflow || request_overflow {
             let newly_overloaded = !queue.overloaded;
             queue.overloaded = true;
+            queue.budget_exhausted |= budget_overflow;
             let retain = if self.broker_side {
                 queue.retained.is_empty()
                     && matches!(
@@ -552,6 +650,14 @@ fn inbound_ordinary_bytes(message: &EgoBridgeMessage) -> usize {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn queued_payload_bytes(message: &EgoBridgeMessage) -> usize {
+    match message {
+        EgoBridgeMessage::Open { argv, .. } => argv.iter().map(Vec::len).sum(),
+        _ => inbound_ordinary_bytes(message),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn inbound_drained(state: &InboundState) -> bool {
     state.control.is_empty()
         && state.ready.is_empty()
@@ -571,6 +677,10 @@ fn pop_inbound(state: &mut InboundState) -> Option<InboundItem> {
             .is_none_or(|queue| queue.events.is_empty())
     }) {
         let request_id = state.overload.remove(index)?;
+        let budget_exhausted = state
+            .requests
+            .get(&request_id)
+            .is_some_and(|queue| queue.budget_exhausted);
         let remove = if let Some(queue) = state.requests.get_mut(&request_id) {
             queue.overload_delivered = true;
             if !queue.retained.is_empty() {
@@ -583,7 +693,7 @@ fn pop_inbound(state: &mut InboundState) -> Option<InboundItem> {
         if remove {
             state.requests.remove(&request_id);
         }
-        return Some(InboundItem::Overload(request_id));
+        return Some(InboundItem::Overload(request_id, budget_exhausted));
     }
     if let Some(request_id) = state.ready.pop_front() {
         let queue = state.requests.get_mut(&request_id)?;
@@ -631,6 +741,7 @@ struct OutboundFrame {
     bytes: Vec<u8>,
     committed: Option<mpsc::SyncSender<io::Result<()>>>,
     reserved: bool,
+    payload: Option<Reservation>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -660,6 +771,7 @@ struct WriterShared {
     state: Mutex<WriterState>,
     ready: std::sync::Condvar,
     failed: mpsc::SyncSender<()>,
+    budget: Option<ResourceBudget>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -763,7 +875,18 @@ impl ChannelWriter {
             message,
             EgoBridgeMessage::Exit { .. } | EgoBridgeMessage::Error { .. }
         );
-        let frame = encode_outbound(message, committed, reserved)?;
+        let payload_bytes = queued_payload_bytes(&message);
+        let payload = if payload_bytes == 0 {
+            None
+        } else {
+            self.shared
+                .budget
+                .as_ref()
+                .map(|budget| budget.reserve(0, payload_bytes))
+                .transpose()?
+        };
+        let mut frame = encode_outbound(message, committed, reserved)?;
+        frame.payload = payload;
         let mut state = self.lock_state()?;
         check_writer_state(&state)?;
         let queue = state.queues.entry(request_id).or_default();
@@ -875,6 +998,7 @@ fn encode_outbound(
         bytes: crate::framing::encode_message(&message, MAX_MESSAGE_SIZE)?,
         committed,
         reserved,
+        payload: None,
     })
 }
 
@@ -902,9 +1026,17 @@ fn fail_writer(shared: &WriterShared, error: &io::Error) {
     let _ = shared.failed.try_send(());
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", test))]
 fn start_channel_writer(
     output: std::os::fd::OwnedFd,
+) -> io::Result<(ChannelWriter, mpsc::Receiver<()>)> {
+    start_channel_writer_with_budget(output, None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn start_channel_writer_with_budget(
+    output: std::os::fd::OwnedFd,
+    budget: Option<ResourceBudget>,
 ) -> io::Result<(ChannelWriter, mpsc::Receiver<()>)> {
     set_nonblocking(&output)?;
     let (failed, failure_in) = mpsc::sync_channel(1);
@@ -915,6 +1047,7 @@ fn start_channel_writer(
         }),
         ready: std::sync::Condvar::new(),
         failed,
+        budget,
     });
     let writer = ChannelWriter {
         shared: Arc::clone(&shared),
@@ -971,8 +1104,9 @@ fn pop_outbound(state: &mut WriterState) -> io::Result<Option<OutboundFrame>> {
         .queues
         .get_mut(&request_id)
         .ok_or_else(|| io::Error::other("writer ready queue is inconsistent"))?;
-    let frame = queue.frames.pop_front();
-    if let Some(frame) = &frame {
+    let mut frame = queue.frames.pop_front();
+    if let Some(frame) = &mut frame {
+        frame.payload.take();
         if frame.reserved {
             queue.reserved -= 1;
         } else {
@@ -1159,11 +1293,15 @@ fn validate_welcome(message: EgoBridgeMessage) -> io::Result<OwnerId> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn executor_handshake<R: Read, W: Write>(
-    input: &mut R,
-    output: &mut W,
-    owner_id: OwnerId,
-) -> io::Result<EndpointId> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteIdentity {
+    pub(crate) endpoint_id: [u8; 16],
+    pub(crate) protocol: u32,
+    pub(crate) capabilities: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn read_remote_identity<R: Read>(input: &mut R) -> io::Result<RemoteIdentity> {
     let message = read_message(input).map_err(|err| {
         if err.kind() == io::ErrorKind::InvalidData {
             invalid_handshake(format!("invalid broker handshake frame: {err}"))
@@ -1177,14 +1315,51 @@ fn executor_handshake<R: Read, W: Write>(
             capabilities,
             endpoint_id,
         } if version == PROTOCOL_VERSION && capabilities == PROTOCOL_CAPABILITIES => {
-            write_message(output, &welcome(owner_id, None))?;
-            Ok(endpoint_id)
+            Ok(RemoteIdentity {
+                endpoint_id: endpoint_id.0,
+                protocol: version,
+                capabilities,
+            })
         }
-        message => {
-            let error = format!(
-                "broker protocol does not match executor: expected version {PROTOCOL_VERSION} capabilities {PROTOCOL_CAPABILITIES:#x}, received {}",
-                message.metadata()
-            );
+        message => Err(invalid_handshake(format!(
+            "broker protocol does not match executor: expected version {PROTOCOL_VERSION} capabilities {PROTOCOL_CAPABILITIES:#x}, received {}",
+            message.metadata()
+        ))),
+    }
+}
+
+#[cfg(test)]
+fn executor_handshake<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    owner_id: OwnerId,
+) -> io::Result<EndpointId> {
+    match read_remote_identity(input) {
+        Ok(identity) => {
+            write_message(output, &welcome(owner_id, None))?;
+            Ok(EndpointId(identity.endpoint_id))
+        }
+        Err(error) => {
+            let _ = write_message(output, &welcome(owner_id, Some(error.to_string())));
+            Err(error)
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn approve_remote_identity<W: Write>(
+    output: &mut W,
+    owner_id: OwnerId,
+    identity: RemoteIdentity,
+    expected_endpoint: Option<[u8; 16]>,
+    approve: impl FnOnce(RemoteIdentity) -> io::Result<RemoteApproval>,
+) -> io::Result<()> {
+    if expected_endpoint.is_some_and(|expected| expected != identity.endpoint_id) {
+        return Err(invalid_handshake("Linux endpoint identity changed"));
+    }
+    match approve(identity)? {
+        RemoteApproval::Proceed => write_message(output, &welcome(owner_id, None)),
+        RemoteApproval::Reject(error) => {
             let _ = write_message(output, &welcome(owner_id, Some(error.clone())));
             Err(invalid_handshake(error))
         }
@@ -1718,7 +1893,8 @@ fn broker_route(
                 }
                 return Err(BrokerRouteError::Channel(err));
             }
-            InboundItem::Overload(request_id) => {
+            InboundItem::Overload(request_id, budget_exhausted) => {
+                let _ = budget_exhausted;
                 if let Some(route) = routes.get_mut(&request_id) {
                     send_cancel_once(request_id, &channel_out, &route.cancel_sent);
                     set_request_error(
@@ -1731,6 +1907,7 @@ fn broker_route(
             InboundItem::Message(InboundEvent {
                 received_at,
                 message,
+                ..
             }) => {
                 if let EgoBridgeMessage::OwnerProbeAck { nonce } = message {
                     if pending_claim
@@ -2002,7 +2179,7 @@ pub(crate) fn run_shim(argv: &[std::ffi::OsString]) -> io::Result<i32> {
     let stream = crate::ipc::connect_local_stream(&broker_socket_path()).map_err(|err| {
         io::Error::new(
             err.kind(),
-            format!("ego-browser bridge is not connected; start `ego-lite-bridge serve <linux-host>` on the Mac: {err}"),
+            format!("ego-browser bridge is not connected; start the Mac daemon and add this remote: {err}"),
         )
     })?;
     run_shim_stream(
@@ -2167,16 +2344,161 @@ impl TryCloneStream for crate::ipc::LocalStream {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn run_serve(target: &str) -> io::Result<()> {
-    crate::macos_process::install_stop_handlers()?;
-    let owner_id = OwnerId(random_id()?);
-    let mut failures = 0;
+#[derive(Debug)]
+pub(crate) enum RemoteWorkerEvent {
+    Identity(RemoteIdentity),
+    Ready(RemoteIdentity),
+    Retrying { error: String, delay: Duration },
+    PermanentFailure(String),
+    Stopped,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+pub(crate) enum RemoteApproval {
+    Proceed,
+    Reject(String),
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct RemoteWorker {
+    approval: mpsc::SyncSender<RemoteApproval>,
+    cancelled: Arc<AtomicBool>,
+    ssh_group: crate::macos_process::ProcessGroup,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "macos")]
+impl RemoteWorker {
+    pub(crate) fn spawn(
+        target: String,
+        expected_endpoint: Option<[u8; 16]>,
+        ego_browser: PathBuf,
+        budget: ResourceBudget,
+    ) -> io::Result<(Self, mpsc::Receiver<RemoteWorkerEvent>)> {
+        let owner_id = OwnerId(random_id()?);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let ssh_group = crate::macos_process::ProcessGroup::default();
+        let (events, event_rx) = mpsc::channel();
+        let (approval, approvals) = mpsc::sync_channel(1);
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_group = ssh_group.clone();
+        let thread = thread::spawn(move || {
+            let result = remote_worker_loop(
+                &target,
+                expected_endpoint,
+                &ego_browser,
+                owner_id,
+                &worker_cancelled,
+                &worker_group,
+                &budget,
+                |identity| {
+                    events
+                        .send(RemoteWorkerEvent::Identity(identity))
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::Interrupted, "worker actor stopped")
+                        })?;
+                    wait_for_remote_approval(
+                        &approvals,
+                        &worker_cancelled,
+                        IDENTITY_APPROVAL_TIMEOUT,
+                    )
+                },
+                |event| {
+                    let _ = events.send(event);
+                },
+            );
+            if let Err(error) = result {
+                if !worker_cancelled.load(Ordering::Acquire) {
+                    let _ = events.send(RemoteWorkerEvent::PermanentFailure(error.to_string()));
+                }
+            }
+            let _ = events.send(RemoteWorkerEvent::Stopped);
+        });
+        Ok((
+            Self {
+                approval,
+                cancelled,
+                ssh_group,
+                thread: Some(thread),
+            },
+            event_rx,
+        ))
+    }
+
+    pub(crate) fn approve(&self, approval: RemoteApproval) -> io::Result<()> {
+        self.approval
+            .send(approval)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "remote worker stopped"))
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.ssh_group.terminate();
+    }
+
+    pub(crate) fn force(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.ssh_group.kill();
+    }
+
+    pub(crate) fn join(mut self) -> io::Result<()> {
+        self.thread
+            .take()
+            .expect("remote worker thread exists")
+            .join()
+            .map_err(|_| io::Error::other("remote worker panicked"))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn wait_for_remote_approval(
+    approvals: &mpsc::Receiver<RemoteApproval>,
+    cancelled: &AtomicBool,
+    timeout: Duration,
+) -> io::Result<RemoteApproval> {
+    let deadline = Instant::now() + timeout;
     loop {
-        if crate::macos_process::stopped() {
-            eprintln!("ego-lite-bridge: stopping");
-            return Ok(());
+        if cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "remote worker cancelled",
+            ));
         }
-        eprintln!("ego-lite-bridge: connecting to {target}");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for remote identity approval",
+            ));
+        }
+        match approvals.recv_timeout(remaining.min(EXEC_POLL_INTERVAL)) {
+            Ok(approval) => return Ok(approval),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "worker approval channel stopped",
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remote_worker_loop(
+    target: &str,
+    expected_endpoint: Option<[u8; 16]>,
+    ego_browser: &Path,
+    owner_id: OwnerId,
+    cancelled: &AtomicBool,
+    ssh_group: &crate::macos_process::ProcessGroup,
+    budget: &ResourceBudget,
+    mut approve: impl FnMut(RemoteIdentity) -> io::Result<RemoteApproval>,
+    mut event: impl FnMut(RemoteWorkerEvent),
+) -> io::Result<()> {
+    let mut failures = 0;
+    while !cancelled.load(Ordering::Acquire) && !crate::macos_process::stopped() {
         let remote = crate::managed_ssh::ManagedSsh::new(target)?;
         let mut ssh = remote.command();
         ssh.arg(REMOTE_BROKER_COMMAND)
@@ -2187,23 +2509,27 @@ pub(crate) fn run_serve(target: &str) -> io::Result<()> {
             Ok(child) => child,
             Err(err) if ssh_spawn_error_is_permanent(err.kind()) => return Err(err),
             Err(err) => {
-                eprintln!("ego-lite-bridge: failed to start ssh for {target}: {err}");
-                wait_to_reconnect(target, &mut failures);
+                wait_to_reconnect(cancelled, &mut failures, err.to_string(), &mut event);
                 continue;
             }
         };
-        if let Err(err) = crate::macos_process::track_ssh(&child) {
-            let _ = crate::macos_process::stop_ssh(&mut child);
-            return Err(err);
-        }
+        ssh_group.track(&child)?;
         let mut connected_at = None;
-        let result = run_serve_child(&mut child, target, owner_id, || {
-            connected_at = Some(std::time::Instant::now())
-        });
-        let remote_broker_missing =
-            crate::macos_process::stop_ssh(&mut child).is_some_and(remote_broker_is_missing);
-        drop(remote);
-        if remote_broker_missing {
+        let result = run_serve_child(
+            &mut child,
+            owner_id,
+            expected_endpoint,
+            ego_browser,
+            cancelled,
+            budget,
+            &mut approve,
+            |identity| {
+                connected_at = Some(Instant::now());
+                event(RemoteWorkerEvent::Ready(identity));
+            },
+        );
+        let status = ssh_group.stop_and_wait(&mut child);
+        if status.is_some_and(remote_broker_is_missing) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("ego-lite-bridge is not installed or executable on {target}"),
@@ -2212,35 +2538,42 @@ pub(crate) fn run_serve(target: &str) -> io::Result<()> {
         if connected_at.is_some_and(|connected_at| connection_was_stable(connected_at.elapsed())) {
             failures = 0;
         }
-
-        if crate::macos_process::stopped() {
-            eprintln!("ego-lite-bridge: stopped");
+        if cancelled.load(Ordering::Acquire) || crate::macos_process::stopped() {
             return Ok(());
         }
-        if let Err(err) = result {
+        if let Err(error) = result {
             if matches!(
-                err.kind(),
+                error.kind(),
                 io::ErrorKind::InvalidInput | io::ErrorKind::AddrInUse
             ) {
-                return Err(err);
+                return Err(error);
             }
-            eprintln!("ego-lite-bridge: disconnected from {target}: {err}");
+            wait_to_reconnect(cancelled, &mut failures, error.to_string(), &mut event);
+        } else {
+            wait_to_reconnect(
+                cancelled,
+                &mut failures,
+                "bridge channel closed".into(),
+                &mut event,
+            );
         }
-        wait_to_reconnect(target, &mut failures);
     }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn wait_to_reconnect(target: &str, failures: &mut usize) {
+fn wait_to_reconnect(
+    cancelled: &AtomicBool,
+    failures: &mut usize,
+    error: String,
+    event: &mut impl FnMut(RemoteWorkerEvent),
+) {
     let delay = reconnect_delay(*failures);
     *failures = failures.saturating_add(1);
-    eprintln!(
-        "ego-lite-bridge: reconnecting to {target} in {}ms",
-        delay.as_millis()
-    );
-    let deadline = std::time::Instant::now() + delay;
-    while !crate::macos_process::stopped() {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    event(RemoteWorkerEvent::Retrying { error, delay });
+    let deadline = Instant::now() + delay;
+    while !cancelled.load(Ordering::Acquire) && !crate::macos_process::stopped() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return;
         }
@@ -2278,9 +2611,13 @@ fn invalid_handshake(message: impl Into<String>) -> io::Error {
 #[cfg(target_os = "macos")]
 fn run_serve_child(
     child: &mut Child,
-    target: &str,
     owner_id: OwnerId,
-    connected: impl FnOnce(),
+    expected_endpoint: Option<[u8; 16]>,
+    ego_browser: &Path,
+    cancelled: &AtomicBool,
+    budget: &ResourceBudget,
+    approve: &mut impl FnMut(RemoteIdentity) -> io::Result<RemoteApproval>,
+    connected: impl FnOnce(RemoteIdentity),
 ) -> io::Result<()> {
     let channel_out = child
         .stdin
@@ -2292,9 +2629,34 @@ fn run_serve_child(
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh stdout missing"))?;
 
     let mut channel_out = channel_out;
-    let _endpoint_id = executor_handshake(&mut channel_in, &mut channel_out, owner_id)?;
-    let inbound = InboundScheduler::new(false);
+    if cancelled.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "remote worker cancelled",
+        ));
+    }
+    let identity = read_remote_identity(&mut channel_in)?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "remote worker cancelled",
+        ));
+    }
+    approve_remote_identity(
+        &mut channel_out,
+        owner_id,
+        identity,
+        expected_endpoint,
+        approve,
+    )?;
+    let inbound = InboundScheduler::with_budget(false, Some(budget.clone()));
     start_inbound_reader(channel_in, Arc::clone(&inbound));
+    if cancelled.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "remote worker cancelled",
+        ));
+    }
     let ready = inbound
         .recv_control_timeout(BROKER_READY_TIMEOUT)
         .map_err(|error| {
@@ -2326,34 +2688,25 @@ fn run_serve_child(
     use std::os::fd::{FromRawFd as _, IntoRawFd as _};
     // ChildStdin is moved into the writer actor; it becomes the sole descriptor owner.
     let channel_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(channel_out.into_raw_fd()) };
-    let (channel_out, writer_failed) = start_channel_writer(channel_fd)?;
-    connected();
-    eprintln!("ego-lite-bridge: broker ready on {target}");
+    let (channel_out, writer_failed) =
+        start_channel_writer_with_budget(channel_fd, Some(budget.clone()))?;
+    connected(identity);
 
     let result = serve_requests(
         &inbound,
         &channel_out,
         &writer_failed,
-        OsStr::new("ego-browser"),
+        ego_browser.as_os_str(),
+        Some(cancelled),
+        budget,
     );
     let shutdown = channel_out.shutdown();
-    let result = result.and(shutdown);
-    if let Err(err) = &result {
-        eprintln!("ego-lite-bridge: disconnected from {target}: {err}");
-    }
-    result
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn run_serve(_target: &str) -> io::Result<()> {
-    Err(io::Error::other(
-        "ego-lite-bridge serve is only supported on macOS",
-    ))
+    result.and(shutdown)
 }
 
 #[cfg(any(target_os = "macos", test))]
 enum RequestInput {
-    Stdin(Vec<u8>),
+    Stdin(Vec<u8>, Option<Reservation>),
     StdinEof,
 }
 
@@ -2373,11 +2726,16 @@ fn serve_requests(
     channel_out: &ChannelWriter,
     writer_failed: &mpsc::Receiver<()>,
     program: &OsStr,
+    cancelled: Option<&AtomicBool>,
+    budget: &ResourceBudget,
 ) -> io::Result<()> {
     let (completed_sender, completed) = mpsc::channel();
     let mut routes = HashMap::<u64, ExecutorRoute>::new();
     let mut next_generation = 0_u64;
     let result = (|| loop {
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            return Ok(());
+        }
         if writer_failed.try_recv().is_ok() {
             return Err(channel_out.channel_error());
         }
@@ -2386,14 +2744,15 @@ fn serve_requests(
         let Some(incoming) = inbound.pop_timeout(EXEC_POLL_INTERVAL)? else {
             continue;
         };
-        let message = match incoming {
-            InboundItem::Message(event) => event.message,
-            InboundItem::Overload(request_id) => {
+        let (message, payload) = match incoming {
+            InboundItem::Message(event) => (event.message, event.payload),
+            InboundItem::Overload(request_id, budget_exhausted) => {
+                let message = inbound_overload_error(request_id, budget_exhausted);
                 if let Some(route) = routes.get_mut(&request_id) {
                     route.retiring.store(true, Ordering::Release);
                     if let Ok(mut error) = route.error.lock() {
                         if error.is_none() {
-                            *error = Some(format!("request {request_id} inbound queue overloaded"));
+                            *error = Some(message.clone());
                         }
                     }
                     route.cancelled.store(true, Ordering::Release);
@@ -2401,7 +2760,7 @@ fn serve_requests(
                 } else {
                     channel_out.terminal(EgoBridgeMessage::Error {
                         request_id,
-                        message: format!("request {request_id} inbound queue overloaded"),
+                        message,
                     })?;
                 }
                 continue;
@@ -2450,6 +2809,7 @@ fn serve_requests(
                 let worker_error = Arc::clone(&error);
                 let worker_output = channel_out.clone();
                 let worker_completed = completed_sender.clone();
+                let worker_budget = budget.clone();
                 let program = program.to_owned();
                 let argv = decode_argv(argv);
                 let worker = thread::spawn(move || {
@@ -2462,6 +2822,7 @@ fn serve_requests(
                         &worker_retiring,
                         &worker_error,
                         &worker_output,
+                        &worker_budget,
                     );
                     worker_retiring.store(true, Ordering::Release);
                     let _ = worker_completed.send((request_id, generation, result));
@@ -2496,7 +2857,7 @@ fn serve_requests(
                     unreachable!()
                 };
                 if let Some(route) = routes.get_mut(&request_id) {
-                    route_input(request_id, route, RequestInput::Stdin(data));
+                    route_input(request_id, route, RequestInput::Stdin(data, payload));
                 }
             }
             EgoBridgeMessage::StdinEof { request_id } => {
@@ -2527,6 +2888,15 @@ fn serve_requests(
         let _ = route.worker.join();
     }
     result
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn inbound_overload_error(request_id: u64, budget_exhausted: bool) -> String {
+    if budget_exhausted {
+        BUDGET_EXHAUSTED.to_owned()
+    } else {
+        format!("request {request_id} inbound queue overloaded")
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2619,6 +2989,7 @@ fn execute_request(
     retiring: &Arc<AtomicBool>,
     request_error: &Arc<Mutex<Option<String>>>,
     channel_out: &ChannelWriter,
+    budget: &ResourceBudget,
 ) -> io::Result<()> {
     let result = execute_request_inner(
         program,
@@ -2629,6 +3000,7 @@ fn execute_request(
         retiring,
         request_error,
         channel_out,
+        budget,
     );
     let terminal = if let Some(error) = request_error
         .lock()
@@ -2666,6 +3038,7 @@ fn execute_request_inner(
     retiring: &Arc<AtomicBool>,
     request_error: &Arc<Mutex<Option<String>>>,
     channel_out: &ChannelWriter,
+    budget: &ResourceBudget,
 ) -> Result<(), RequestExecutionError> {
     let mut command = crate::macos_process::command(program);
     command
@@ -2673,6 +3046,7 @@ fn execute_request_inner(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let _process = budget.reserve(1, 0).map_err(RequestExecutionError::Local)?;
     let mut child = command.spawn().map_err(|err| {
         RequestExecutionError::Local(io::Error::new(
             err.kind(),
@@ -2788,7 +3162,7 @@ fn forward_input(
 ) -> io::Result<()> {
     while !done.load(Ordering::Acquire) && !cancelled.load(Ordering::Acquire) {
         match receiver.recv_timeout(EXEC_POLL_INTERVAL) {
-            Ok(RequestInput::Stdin(data)) => {
+            Ok(RequestInput::Stdin(data, _payload)) => {
                 if let Err(err) = child_stdin
                     .write_all(&data)
                     .and_then(|()| child_stdin.flush())
@@ -2870,13 +3244,22 @@ fn forward_output<R: Read>(
             if err.kind() == io::ErrorKind::WouldBlock {
                 if let Ok(mut error) = request_error.lock() {
                     if error.is_none() {
-                        *error = Some(format!("request {request_id} output queue saturated"));
+                        *error = Some(output_queue_error(request_id, &err));
                     }
                 }
                 return Ok(());
             }
             return Err(err);
         }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn output_queue_error(request_id: u64, error: &io::Error) -> String {
+    if error.to_string() == BUDGET_EXHAUSTED {
+        BUDGET_EXHAUSTED.to_owned()
+    } else {
+        format!("request {request_id} output queue saturated")
     }
 }
 
@@ -2997,6 +3380,7 @@ mod tests {
                     bytes: vec![0; 128 * 1024],
                     committed: Some(committed),
                     reserved: false,
+                    payload: None,
                 });
                 receipts.push(receipt);
             }
@@ -3025,6 +3409,7 @@ mod tests {
             bytes: vec![byte],
             committed: None,
             reserved,
+            payload: None,
         };
         let mut state = WriterState::default();
         state.control.push_back(frame(0, false));
@@ -3287,6 +3672,80 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn identity_gate_precedes_welcome_and_reject_does_not_claim() {
+        let identity = RemoteIdentity {
+            endpoint_id: TEST_ENDPOINT_ID.0,
+            protocol: PROTOCOL_VERSION,
+            capabilities: PROTOCOL_CAPABILITIES,
+        };
+        let mut output = Vec::new();
+        let mut approved = false;
+        approve_remote_identity(&mut output, TEST_OWNER_ID, identity, None, |reported| {
+            assert_eq!(reported, identity);
+            approved = true;
+            Ok(RemoteApproval::Proceed)
+        })
+        .expect("approve identity");
+        assert!(approved);
+        assert!(matches!(
+            read_message(&mut output.as_slice()).expect("welcome"),
+            EgoBridgeMessage::Welcome { error: None, .. }
+        ));
+
+        output.clear();
+        let error = approve_remote_identity(&mut output, TEST_OWNER_ID, identity, None, |_| {
+            Ok(RemoteApproval::Reject("duplicate endpoint".into()))
+        })
+        .expect_err("reject identity");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(
+            read_message(&mut output.as_slice()).expect("rejection"),
+            EgoBridgeMessage::Welcome { error: Some(_), .. }
+        ));
+    }
+
+    #[test]
+    fn identity_approval_succeeds_and_actor_silence_is_bounded() {
+        let (approval, approvals) = mpsc::sync_channel(1);
+        approval
+            .send(RemoteApproval::Proceed)
+            .expect("send approval");
+        assert!(matches!(
+            wait_for_remote_approval(&approvals, &AtomicBool::new(false), Duration::from_secs(1))
+                .expect("receive approval"),
+            RemoteApproval::Proceed
+        ));
+
+        let (_approval, approvals) = mpsc::sync_channel(1);
+        let started = Instant::now();
+        let error = wait_for_remote_approval(
+            &approvals,
+            &AtomicBool::new(false),
+            Duration::from_millis(40),
+        )
+        .expect_err("actor silence must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn expected_endpoint_is_checked_before_approval_and_welcome() {
+        let identity = RemoteIdentity {
+            endpoint_id: TEST_ENDPOINT_ID.0,
+            protocol: PROTOCOL_VERSION,
+            capabilities: PROTOCOL_CAPABILITIES,
+        };
+        let mut output = Vec::new();
+        let error =
+            approve_remote_identity(&mut output, TEST_OWNER_ID, identity, Some([9; 16]), |_| {
+                panic!("endpoint mismatch reached actor approval")
+            })
+            .expect_err("reject endpoint mismatch");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(output.is_empty(), "endpoint mismatch sent Welcome");
     }
 
     #[test]
@@ -3633,7 +4092,7 @@ mod tests {
             kinds.push(
                 match scheduler.pop_timeout(Duration::ZERO).unwrap().unwrap() {
                     InboundItem::Message(event) => event.message.kind(),
-                    InboundItem::Overload(_) => "overload",
+                    InboundItem::Overload(_, _) => "overload",
                     InboundItem::Transport(_) => "transport",
                 },
             );
@@ -3703,7 +4162,7 @@ mod tests {
         ));
         let mut overloads = 0;
         while let Some(item) = scheduler.pop_timeout(Duration::ZERO).unwrap() {
-            overloads += usize::from(matches!(item, InboundItem::Overload(1)));
+            overloads += usize::from(matches!(item, InboundItem::Overload(1, _)));
         }
         assert_eq!(overloads, 1);
     }
@@ -3751,7 +4210,7 @@ mod tests {
         let mut saw_terminal = false;
         while let Some(item) = scheduler.pop_timeout(Duration::ZERO).unwrap() {
             match item {
-                InboundItem::Overload(7) => saw_overload = true,
+                InboundItem::Overload(7, _) => saw_overload = true,
                 InboundItem::Message(InboundEvent {
                     message: EgoBridgeMessage::Exit { request_id: 7, .. },
                     ..
@@ -3798,7 +4257,7 @@ mod tests {
         let mut kinds = Vec::new();
         while let Some(item) = scheduler.pop_timeout(Duration::ZERO).unwrap() {
             kinds.push(match item {
-                InboundItem::Overload(8) => "overload",
+                InboundItem::Overload(8, _) => "overload",
                 InboundItem::Message(event) => event.message.kind(),
                 _ => "other",
             });
@@ -4338,9 +4797,108 @@ mod tests {
                 &worker_output,
                 &writer_failed,
                 OsStr::new("/bin/sh"),
+                None,
+                &ResourceBudget::default(),
             )
         });
         (TestExecutorSender(inbound), output, worker)
+    }
+
+    #[test]
+    fn daemon_budget_is_shared_across_workers_and_released_on_drop() {
+        let budget = ResourceBudget::default();
+        let first = InboundScheduler::with_budget(false, Some(budget.clone()));
+        let second = InboundScheduler::with_budget(false, Some(budget.clone()));
+        let half = 4 * 1024 * 1024;
+        for request_id in 0..8 {
+            assert!(first.enqueue(Ok(EgoBridgeMessage::Stdin {
+                request_id,
+                data: vec![0; 512 * 1024],
+            })));
+            assert!(second.enqueue(Ok(EgoBridgeMessage::Stdin {
+                request_id: request_id + 8,
+                data: vec![0; 512 * 1024],
+            })));
+        }
+        assert_eq!(budget.usage(), (0, 8 * 1024 * 1024));
+        assert!(first.enqueue(Ok(EgoBridgeMessage::Open {
+            request_id: 20,
+            argv: vec![vec![0]],
+        })));
+        assert!(second.enqueue(Ok(EgoBridgeMessage::Stdin {
+            request_id: 21,
+            data: vec![0],
+        })));
+        assert!(first.enqueue(Ok(EgoBridgeMessage::Stdin {
+            request_id: 3,
+            data: vec![0],
+        })));
+        let mut exhausted = Vec::new();
+        for scheduler in [&first, &second] {
+            for _ in 0..10 {
+                if let Ok(Some(InboundItem::Overload(request_id, budget_exhausted))) =
+                    scheduler.pop_timeout(Duration::ZERO)
+                {
+                    exhausted.push((request_id, budget_exhausted));
+                }
+            }
+        }
+        assert!(
+            exhausted.contains(&(20, true)),
+            "Open reports global budget"
+        );
+        assert!(
+            exhausted.contains(&(21, true)),
+            "stdin reports global budget"
+        );
+        assert_eq!(
+            inbound_overload_error(20, true),
+            BUDGET_EXHAUSTED,
+            "terminal error preserves the global-budget cause"
+        );
+        assert_eq!(
+            inbound_overload_error(20, false),
+            "request 20 inbound queue overloaded"
+        );
+        drop(first);
+        assert!(budget.usage().1 <= half);
+        drop(second);
+        assert_eq!(budget.usage(), (0, 0));
+    }
+
+    #[test]
+    fn outbound_budget_exhaustion_is_explicit_across_workers() {
+        let budget = ResourceBudget::default();
+        let reservation = budget
+            .reserve(0, PAYLOAD_LIMIT)
+            .expect("fill payload budget from another worker");
+        let exhausted = match budget.reserve(0, 1) {
+            Err(error) => error,
+            Ok(_) => panic!("global budget exhausted"),
+        };
+        assert_eq!(output_queue_error(30, &exhausted), BUDGET_EXHAUSTED);
+        let queue_full =
+            io::Error::new(io::ErrorKind::WouldBlock, "bridge request data queue full");
+        assert_eq!(
+            output_queue_error(30, &queue_full),
+            "request 30 output queue saturated"
+        );
+        drop(reservation);
+        assert_eq!(budget.usage(), (0, 0));
+    }
+
+    #[test]
+    fn process_budget_is_shared_and_released_on_cancelled_work() {
+        let budget = ResourceBudget::default();
+        let permits = (0..8)
+            .map(|_| budget.reserve(1, 0).expect("reserve process"))
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(budget.reserve(1, 0), Err(ref error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        drop(permits);
+        assert_eq!(budget.usage(), (0, 0));
+        budget.reserve(1, 0).expect("capacity restored");
     }
 
     #[test]
@@ -4381,6 +4939,7 @@ mod tests {
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(None)),
             &output,
+            &ResourceBudget::default(),
         )
         .expect_err("preserve channel write failure");
 
@@ -4500,6 +5059,8 @@ mod tests {
                 &worker_output,
                 &writer_failed,
                 OsStr::new("/bin/sh"),
+                None,
+                &ResourceBudget::default(),
             )
         });
 
@@ -4709,6 +5270,7 @@ mod tests {
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(None)),
             &channel_out,
+            &ResourceBudget::default(),
         )
         .expect("execute child");
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -4736,11 +5298,12 @@ mod tests {
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(None)),
             &channel_out,
+            &ResourceBudget::default(),
         )
         .expect("cancel child");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(matches!(
-            decode_messages(&output).as_slice(),
+            wait_for_messages(&output, 1).as_slice(),
             [EgoBridgeMessage::Exit { request_id: 4, .. }]
         ));
     }
@@ -4758,6 +5321,7 @@ mod tests {
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(None)),
             &channel_out,
+            &ResourceBudget::default(),
         )
         .expect("report spawn error");
         assert!(matches!(

@@ -23,9 +23,13 @@ mod macos_process;
 #[cfg(target_os = "macos")]
 mod managed_ssh;
 
-const USAGE: &str = "ego-lite-bridge — headless reverse remote exec bridge for ego-browser\n\nUsage:\n  ego-lite-bridge start\n  ego-lite-bridge stop\n  ego-lite-bridge status\n  ego-lite-bridge serve <linux-host>\n  ego-lite-bridge --help\n  ego-lite-bridge --version";
+const USAGE: &str = "ego-lite-bridge — headless reverse remote exec bridge for ego-browser\n\nUsage:\n  ego-lite-bridge start\n  ego-lite-bridge stop\n  ego-lite-bridge status\n  ego-lite-bridge remote add <name> <target>\n  ego-lite-bridge remote list\n  ego-lite-bridge remote status <name-or-config-id>\n  ego-lite-bridge remote retry <name-or-config-id>\n  ego-lite-bridge remote remove <name-or-config-id>\n  ego-lite-bridge --help\n  ego-lite-bridge --version";
 #[cfg(target_os = "macos")]
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "macos")]
+const ADD_TIMEOUT: Duration = Duration::from_secs(32);
+#[cfg(target_os = "macos")]
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(12);
 #[cfg(target_os = "macos")]
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -49,14 +53,9 @@ fn run(args: &[OsString]) -> io::Result<i32> {
         Some(command) if command == "start" && args.len() == 2 => run_start(),
         Some(command) if command == "stop" && args.len() == 2 => run_stop(),
         Some(command) if command == "status" && args.len() == 2 => run_status(),
+        Some(command) if command == "remote" => run_remote(&args[2..]),
         Some(command) if command == "daemon" && args.len() == 4 && args[2] == "--ego-browser" => {
             run_daemon(Path::new(&args[3]))
-        }
-        Some(command) if command == "serve" && args.len() == 3 => {
-            let target = args[2].to_str().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "linux host is not valid UTF-8")
-            })?;
-            ego_bridge::run_serve(target).map(|()| 0)
         }
         Some(command) if command == "ego-browser-broker" && args.len() == 2 => {
             ego_bridge::run_broker().map(|()| 0)
@@ -82,9 +81,18 @@ fn run_start() -> io::Result<i32> {
     let paths = daemon::application_paths(&home)?;
     let directory = daemon::open_application_directory(&home)?;
     let _lifecycle_lock = daemon::DaemonLock::acquire_lifecycle(&directory)?;
-    if running(&paths.control_socket) {
-        println!("ego-lite-bridge is running");
-        return Ok(0);
+    match control::probe(&paths.control_socket, CONTROL_TIMEOUT) {
+        Ok(control::Response::Status {
+            state: control::DaemonState::Running,
+            ..
+        }) => {
+            println!("ego-lite-bridge is running");
+            return Ok(0);
+        }
+        Err(control::ControlError::VersionMismatch { .. }) => {
+            launchd::bootout(unsafe { libc::geteuid() })?;
+        }
+        Ok(_) | Err(_) => {}
     }
     let browser = resolve_ego_browser()?;
     daemon::clear_stop_intent(&home, &browser)?;
@@ -113,7 +121,10 @@ fn run_stop() -> io::Result<i32> {
     let directory = daemon::open_application_directory(&home)?;
     let _lifecycle_lock = daemon::DaemonLock::acquire_lifecycle(&directory)?;
     let socket = paths.control_socket;
-    if !running(&socket) {
+    if matches!(
+        control::probe(&socket, CONTROL_TIMEOUT),
+        Err(control::ControlError::VersionMismatch { .. })
+    ) {
         let uid = unsafe { libc::geteuid() };
         stop_unresponsive(
             || daemon::persist_stop_intent(&home),
@@ -122,27 +133,39 @@ fn run_stop() -> io::Result<i32> {
         println!("ego-lite-bridge is stopped");
         return Ok(0);
     }
-    let shutdown = std::os::unix::net::UnixStream::connect(&socket)
+    if !running(&socket)? {
+        let uid = unsafe { libc::geteuid() };
+        stop_unresponsive(
+            || daemon::persist_stop_intent(&home),
+            || launchd::bootout(uid),
+        )?;
+        println!("ego-lite-bridge is stopped");
+        return Ok(0);
+    }
+    let response = std::os::unix::net::UnixStream::connect(&socket)
         .map_err(control::ControlError::Transport)
         .and_then(|mut stream| {
-            control::request(&mut stream, CONTROL_TIMEOUT, control::Request::Shutdown)
+            control::request(&mut stream, CLEANUP_TIMEOUT, control::Request::Shutdown)
         })
-        .and_then(|response| match response {
-            control::Response::ShutdownAccepted => Ok(()),
-            response => Err(control::ControlError::Protocol(format!(
+        .map_err(|error| control_io_error(&error))?;
+    let cleanup_confirmed = match response {
+        control::Response::ShutdownAccepted { cleanup_confirmed } => cleanup_confirmed,
+        response => {
+            return Err(io::Error::other(format!(
                 "unexpected shutdown response: {response:?}"
-            ))),
-        });
-    let stopped = shutdown
-        .as_ref()
-        .map_err(|error| io::Error::other(error.to_string()))
-        .and_then(|()| poll_until(LIFECYCLE_TIMEOUT, || !running(&socket)));
+            )))
+        }
+    };
+    poll_until(LIFECYCLE_TIMEOUT, || running(&socket).map(|value| !value))?;
     let uid = unsafe { libc::geteuid() };
-    let bootout = launchd::bootout(uid);
-    stopped?;
-    bootout?;
-    println!("ego-lite-bridge stopped");
-    Ok(0)
+    launchd::bootout(uid)?;
+    if cleanup_confirmed {
+        println!("ego-lite-bridge stopped");
+        Ok(0)
+    } else {
+        eprintln!("ego-lite-bridge stopped, but worker cleanup was not confirmed");
+        Ok(1)
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -174,6 +197,10 @@ fn run_status() -> io::Result<i32> {
             eprintln!("unhealthy: unexpected response: {response:?}");
             Ok(1)
         }
+        Err(error @ control::ControlError::VersionMismatch { .. }) => {
+            eprintln!("unhealthy: {error}");
+            Ok(1)
+        }
         Err(error) => {
             eprintln!("stopped or unhealthy: {error}");
             Ok(1)
@@ -184,6 +211,122 @@ fn run_status() -> io::Result<i32> {
 #[cfg(not(target_os = "macos"))]
 fn run_status() -> io::Result<i32> {
     unsupported("status")
+}
+
+#[cfg(target_os = "macos")]
+fn control_io_error(error: &control::ControlError) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn run_remote(args: &[OsString]) -> io::Result<i32> {
+    let (request, timeout) = match args {
+        [command, name, target] if command == "add" => {
+            let name = remote_argument(name, "remote name")?;
+            let target = remote_argument(target, "remote target")?;
+            if let Err(error) = config::validate_remote_name(name)
+                .and_then(|()| config::validate_remote_target(target))
+            {
+                eprintln!("ego-lite-bridge: {error}");
+                return Ok(2);
+            }
+            (
+                control::Request::RemoteAdd {
+                    name: name.into(),
+                    target: target.into(),
+                },
+                ADD_TIMEOUT,
+            )
+        }
+        [command] if command == "list" => (control::Request::RemoteList, CONTROL_TIMEOUT),
+        [command, selector] if command == "status" => (
+            control::Request::RemoteStatus {
+                selector: remote_argument(selector, "remote selector")?.into(),
+            },
+            CONTROL_TIMEOUT,
+        ),
+        [command, selector] if command == "retry" => (
+            control::Request::RemoteRetry {
+                selector: remote_argument(selector, "remote selector")?.into(),
+            },
+            CONTROL_TIMEOUT,
+        ),
+        [command, selector] if command == "remove" => (
+            control::Request::RemoteRemove {
+                selector: remote_argument(selector, "remote selector")?.into(),
+            },
+            CLEANUP_TIMEOUT,
+        ),
+        _ => {
+            eprintln!("{USAGE}");
+            return Ok(2);
+        }
+    };
+    let socket = daemon::application_paths(&home_directory()?)?.control_socket;
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    let response = control::request(&mut stream, timeout, request)
+        .map_err(|error| control_io_error(&error))?;
+    match response {
+        control::Response::RemoteAdded(remote)
+        | control::Response::RemoteStatus(remote)
+        | control::Response::RemoteRetryAccepted(remote) => {
+            print_remote(&remote);
+            Ok(0)
+        }
+        control::Response::RemoteList(remotes) => {
+            for remote in &remotes {
+                print_remote(remote);
+            }
+            Ok(0)
+        }
+        control::Response::RemoteRemoved {
+            config_id,
+            cleanup_confirmed: true,
+        } => {
+            println!("removed {config_id}");
+            Ok(0)
+        }
+        control::Response::RemoteRemoved {
+            config_id,
+            cleanup_confirmed: false,
+        } => {
+            eprintln!("cleanup was not confirmed for {config_id}");
+            Ok(1)
+        }
+        control::Response::Error { code, message } => {
+            eprintln!("{code}: {message}");
+            Ok(1)
+        }
+        response => Err(io::Error::other(format!(
+            "unexpected remote response: {response:?}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remote_argument<'a>(value: &'a OsStr, description: &str) -> io::Result<&'a str> {
+    value.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} is not valid UTF-8"),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn print_remote(remote: &control::RemoteDto) {
+    println!(
+        "{}\t{}\t{}\t{:?}/{:?}",
+        remote.config_id, remote.name, remote.target, remote.lifecycle, remote.observed_state
+    );
+    if let Some(error) = &remote.last_error {
+        println!("  error: {error}");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_remote(_args: &[OsString]) -> io::Result<i32> {
+    unsupported("remote")
 }
 
 #[cfg(target_os = "macos")]
@@ -248,21 +391,22 @@ fn resolve_ego_browser() -> io::Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn running(socket: &Path) -> bool {
-    matches!(
-        control::probe(socket, CONTROL_TIMEOUT),
+fn running(socket: &Path) -> io::Result<bool> {
+    match control::probe(socket, CONTROL_TIMEOUT) {
         Ok(control::Response::Status {
             state: control::DaemonState::Running,
             ..
-        })
-    )
+        }) => Ok(true),
+        Err(error @ control::ControlError::VersionMismatch { .. }) => Err(control_io_error(&error)),
+        Ok(_) | Err(_) => Ok(false),
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn poll_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> io::Result<()> {
+fn poll_until(timeout: Duration, mut ready: impl FnMut() -> io::Result<bool>) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        if ready() {
+        if ready()? {
             return Ok(());
         }
         if Instant::now() >= deadline {
