@@ -346,7 +346,10 @@ impl Drop for Reservation {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir(PathBuf);
 
@@ -356,8 +359,9 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock")
                 .as_nanos();
+            let nonce = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "ego-lite-daemon-test-{}-{suffix}",
+                "ego-lite-daemon-test-{}-{suffix}-{nonce}",
                 std::process::id()
             ));
             fs::create_dir(&path).expect("create test directory");

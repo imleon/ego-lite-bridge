@@ -830,8 +830,11 @@ pub(crate) fn shutdown_local_stream_read(stream: &LocalStream) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir(PathBuf);
 
@@ -841,7 +844,9 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock")
                 .as_nanos();
-            let path = Path::new("/tmp").join(format!("elb-ipc-{}-{suffix}", std::process::id()));
+            let nonce = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path =
+                Path::new("/tmp").join(format!("elb-ipc-{}-{suffix}-{nonce}", std::process::id()));
             Self(path)
         }
     }
