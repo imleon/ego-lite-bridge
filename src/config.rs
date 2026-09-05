@@ -54,9 +54,14 @@ impl Config {
                 ));
             }
             if let Some(endpoint_id) = &remote.endpoint_id {
-                if endpoint_id.is_empty() || !endpoint_ids.insert(endpoint_id) {
+                if endpoint_id.len() != 32
+                    || !endpoint_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    || !endpoint_ids.insert(endpoint_id)
+                {
                     return Err(invalid_data(
-                        "remote endpoint_id must be non-empty and unique when present",
+                        "remote endpoint_id must be unique 32-character lowercase hexadecimal",
                     ));
                 }
             }
@@ -280,7 +285,10 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir(PathBuf);
 
@@ -290,8 +298,9 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock")
                 .as_nanos();
+            let nonce = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "ego-lite-bridge-config-test-{}-{suffix}",
+                "ego-lite-bridge-config-test-{}-{suffix}-{nonce}",
                 std::process::id()
             ));
             fs::create_dir(&path).expect("create test directory");
@@ -315,7 +324,7 @@ mod tests {
             config_id: config_id.into(),
             name: name.into(),
             target: format!("{name}.example"),
-            endpoint_id: Some(format!("endpoint-{name}")),
+            endpoint_id: Some(format!("{:032x}", name.len())),
             lifecycle,
             observed_state,
             state_changed_unix_ms: 123,

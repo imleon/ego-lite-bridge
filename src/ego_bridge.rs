@@ -2390,6 +2390,7 @@ fn serve_requests(
             InboundItem::Message(event) => event.message,
             InboundItem::Overload(request_id) => {
                 if let Some(route) = routes.get_mut(&request_id) {
+                    route.retiring.store(true, Ordering::Release);
                     if let Ok(mut error) = route.error.lock() {
                         if error.is_none() {
                             *error = Some(format!("request {request_id} inbound queue overloaded"));
@@ -2413,16 +2414,13 @@ fn serve_requests(
             }
             EgoBridgeMessage::Open { request_id, argv } => {
                 drain_executor_completions(&completed, &mut routes)?;
-                if routes
-                    .get(&request_id)
-                    .is_some_and(|route| route.retiring.load(Ordering::Acquire))
-                {
-                    while routes.contains_key(&request_id) {
-                        let (completed_id, generation, result) = completed
-                            .recv()
-                            .map_err(|_| io::Error::other("executor completion queue stopped"))?;
-                        reap_executor_completion(completed_id, generation, result, &mut routes)?;
-                    }
+                if let Some(generation) = routes.get(&request_id).and_then(|route| {
+                    route
+                        .retiring
+                        .load(Ordering::Acquire)
+                        .then_some(route.generation)
+                }) {
+                    wait_for_executor_completion(request_id, generation, &completed, &mut routes)?;
                     drain_executor_completions(&completed, &mut routes)?;
                 }
                 if routes.contains_key(&request_id) {
@@ -2540,6 +2538,24 @@ fn drain_executor_completions(
         reap_executor_completion(request_id, generation, result, routes)?;
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn wait_for_executor_completion(
+    request_id: u64,
+    generation: u64,
+    completed: &mpsc::Receiver<(u64, u64, io::Result<()>)>,
+    routes: &mut HashMap<u64, ExecutorRoute>,
+) -> io::Result<()> {
+    loop {
+        let (completed_id, completed_generation, result) = completed
+            .recv()
+            .map_err(|_| io::Error::other("executor completion queue stopped"))?;
+        reap_executor_completion(completed_id, completed_generation, result, routes)?;
+        if completed_id == request_id && completed_generation == generation {
+            return Ok(());
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -4449,6 +4465,59 @@ mod tests {
     }
 
     #[test]
+    fn executor_waits_for_overloaded_generation_before_reusing_request_id() {
+        let inbound = InboundScheduler::new(false);
+        let request_id = 59;
+        assert!(inbound.enqueue(Ok(EgoBridgeMessage::Open {
+            request_id,
+            argv: vec![b"-c".to_vec(), b"exec sleep 30".to_vec()],
+        })));
+        for _ in 0..INBOUND_REQUEST_FRAMES_PER_REQUEST {
+            assert!(inbound.enqueue(Ok(EgoBridgeMessage::Stdin {
+                request_id,
+                data: Vec::new(),
+            })));
+        }
+        assert!(inbound.enqueue(Ok(EgoBridgeMessage::StdinEof { request_id })));
+        assert!(inbound.enqueue(Ok(EgoBridgeMessage::Open {
+            request_id,
+            argv: vec![
+                b"-c".to_vec(),
+                b"read value; printf '%s' \"$value\"".to_vec(),
+            ],
+        })));
+        assert!(inbound.enqueue(Ok(EgoBridgeMessage::Stdin {
+            request_id,
+            data: b"reused\n".to_vec(),
+        })));
+        assert!(inbound.enqueue(Ok(EgoBridgeMessage::StdinEof { request_id })));
+
+        let (worker_output, writer_failed, output) = start_captured_writer();
+        let worker_inbound = Arc::clone(&inbound);
+        let worker = thread::spawn(move || {
+            serve_requests(
+                &worker_inbound,
+                &worker_output,
+                &writer_failed,
+                OsStr::new("/bin/sh"),
+            )
+        });
+
+        let messages = wait_for_messages(&output, 3);
+        assert!(messages.iter().any(
+            |message| matches!(message, EgoBridgeMessage::Stdout { request_id: 59, data } if data == b"reused")
+        ));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, EgoBridgeMessage::Error { request_id: 59, .. })));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, EgoBridgeMessage::Exit { request_id: 59, .. })));
+        assert!(!inbound.enqueue(Err(io::Error::new(io::ErrorKind::BrokenPipe, "test EOF",))));
+        assert!(worker.join().expect("executor worker").is_err());
+    }
+
+    #[test]
     fn executor_reuses_completed_request_id_and_routes_new_stdin() {
         let (sender, output, worker) = start_test_executor();
         sender
@@ -4564,7 +4633,13 @@ mod tests {
         assert_eq!(
             messages
                 .iter()
-                .filter(|message| matches!(message, EgoBridgeMessage::Error { request_id: 0, .. }))
+                .filter(|message| matches!(
+                    message,
+                    EgoBridgeMessage::Error {
+                        request_id: 0,
+                        message
+                    } if message == "request 0 is already active"
+                ))
                 .count(),
             1
         );
