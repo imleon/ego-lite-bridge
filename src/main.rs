@@ -115,7 +115,10 @@ fn run_stop() -> io::Result<i32> {
     let socket = paths.control_socket;
     if !running(&socket) {
         let uid = unsafe { libc::geteuid() };
-        launchd::bootout(uid)?;
+        stop_unresponsive(
+            || daemon::persist_stop_intent(&home),
+            || launchd::bootout(uid),
+        )?;
         println!("ego-lite-bridge is stopped");
         return Ok(0);
     }
@@ -140,6 +143,15 @@ fn run_stop() -> io::Result<i32> {
     bootout?;
     println!("ego-lite-bridge stopped");
     Ok(0)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn stop_unresponsive(
+    persist: impl FnOnce() -> io::Result<()>,
+    bootout: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    persist()?;
+    bootout()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -293,5 +305,23 @@ mod tests {
             run(&["ego-lite-bridge".into(), "unknown".into()]).expect("dispatch"),
             2
         );
+    }
+
+    #[test]
+    fn unresponsive_stop_persists_before_bootout_and_propagates_failure() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let error = stop_unresponsive(
+            || {
+                calls.borrow_mut().push("persist");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("bootout");
+                Err(io::Error::other("still loaded"))
+            },
+        )
+        .expect_err("bootout failure must fail stop");
+        assert_eq!(*calls.borrow(), ["persist", "bootout"]);
+        assert_eq!(error.to_string(), "still loaded");
     }
 }
