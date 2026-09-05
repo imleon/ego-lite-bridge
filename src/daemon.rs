@@ -1237,6 +1237,10 @@ fn parse_id(value: &str) -> io::Result<[u8; 16]> {
 }
 
 pub(crate) fn validate_ego_browser(path: &Path) -> io::Result<PathBuf> {
+    validate_ego_browser_with(path, admin_group_id()?)
+}
+
+fn validate_ego_browser_with(path: &Path, admin_gid: Option<libc::gid_t>) -> io::Result<PathBuf> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1264,13 +1268,40 @@ pub(crate) fn validate_ego_browser(path: &Path) -> io::Result<PathBuf> {
             "ego-browser must be owned by the current user or root",
         ));
     }
-    if metadata.mode() & 0o022 != 0 {
+    if metadata.mode() & 0o002 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "ego-browser must not be writable by group or others",
+            "ego-browser must not be writable by others",
+        ));
+    }
+    if metadata.mode() & 0o020 != 0 && (metadata.uid() != euid || admin_gid != Some(metadata.gid()))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "group-writable ego-browser must be owned by the current user and group admin",
         ));
     }
     Ok(canonical)
+}
+
+#[cfg(target_os = "macos")]
+fn admin_group_id() -> io::Result<Option<libc::gid_t>> {
+    let name = c"admin";
+    // SAFETY: getgrnam reads the static NUL-terminated group name and returns either null or a
+    // process-global group record, from which we copy only the numeric gid immediately.
+    let group = unsafe { libc::getgrnam(name.as_ptr()) };
+    if group.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "macOS admin group was not found",
+        ));
+    }
+    Ok(Some(unsafe { (*group).gr_gid }))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn admin_group_id() -> io::Result<Option<libc::gid_t>> {
+    Ok(None)
 }
 
 pub(crate) struct DaemonLock(File);
@@ -1421,16 +1452,35 @@ mod tests {
             validate_ego_browser(&executable).expect("validate executable"),
             executable.canonicalize().expect("canonical path")
         );
-        for mode in [0o720, 0o702] {
-            fs::set_permissions(&executable, fs::Permissions::from_mode(mode))
-                .expect("set writable mode");
-            assert_eq!(
-                validate_ego_browser(&executable)
-                    .expect_err("reject writable executable")
-                    .kind(),
-                io::ErrorKind::PermissionDenied
-            );
-        }
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o720))
+            .expect("set group-writable mode");
+        let gid = fs::metadata(&executable).expect("metadata").gid();
+        assert_eq!(
+            validate_ego_browser_with(&executable, Some(gid))
+                .expect("accept current-user admin-group executable"),
+            executable.canonicalize().expect("canonical path")
+        );
+        assert_eq!(
+            validate_ego_browser_with(&executable, Some(gid.wrapping_add(1)))
+                .expect_err("reject non-admin group-writable executable")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            validate_ego_browser_with(&executable, None)
+                .expect_err("reject group-writable executable without admin group")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o702))
+            .expect("set other-writable mode");
+        assert_eq!(
+            validate_ego_browser(&executable)
+                .expect_err("reject other-writable executable")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o600))
             .expect("clear executable mode");
         assert!(validate_ego_browser(&executable).is_err());
