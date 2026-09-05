@@ -6,8 +6,43 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const MAX_FRAME_SIZE: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ErrorCode {
+    InvalidArgument,
+    SelectorNotFound,
+    NameConflict,
+    EndpointExists,
+    EndpointAliasConflict,
+    InvalidState,
+    PermanentRemoteError,
+    AddTimeout,
+    CleanupTimeout,
+    DaemonStopping,
+    PersistStopFailed,
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = match self {
+            Self::InvalidArgument => "invalid_argument",
+            Self::SelectorNotFound => "selector_not_found",
+            Self::NameConflict => "name_conflict",
+            Self::EndpointExists => "endpoint_exists",
+            Self::EndpointAliasConflict => "endpoint_alias_conflict",
+            Self::InvalidState => "invalid_state",
+            Self::PermanentRemoteError => "permanent_remote_error",
+            Self::AddTimeout => "add_timeout",
+            Self::CleanupTimeout => "cleanup_timeout",
+            Self::DaemonStopping => "daemon_stopping",
+            Self::PersistStopFailed => "persist_stop_failed",
+        };
+        formatter.write_str(code)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum DaemonState {
@@ -16,9 +51,55 @@ pub(crate) enum DaemonState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RemoteDto {
+    pub(crate) config_id: String,
+    pub(crate) name: String,
+    pub(crate) target: String,
+    pub(crate) endpoint_id: Option<String>,
+    pub(crate) lifecycle: crate::config::Lifecycle,
+    pub(crate) observed_state: crate::config::ObservedState,
+    pub(crate) state_changed_unix_ms: u64,
+    pub(crate) last_error: Option<String>,
+    pub(crate) protocol_version: Option<u32>,
+    pub(crate) capabilities: Option<u64>,
+    pub(crate) active_requests: Option<u32>,
+    pub(crate) request_capacity: Option<u32>,
+    pub(crate) reconnect_attempt: Option<u32>,
+    pub(crate) reconnect_at_unix_ms: Option<u64>,
+}
+
+impl RemoteDto {
+    // Production-only until daemon control handling is compiled on non-macOS hosts.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn persisted(record: &crate::config::RemoteRecord) -> Self {
+        Self {
+            config_id: record.config_id.clone(),
+            name: record.name.clone(),
+            target: record.target.clone(),
+            endpoint_id: record.endpoint_id.clone(),
+            lifecycle: record.lifecycle,
+            observed_state: record.observed_state,
+            state_changed_unix_ms: record.state_changed_unix_ms,
+            last_error: record.last_error.clone(),
+            protocol_version: None,
+            capabilities: None,
+            active_requests: None,
+            request_capacity: None,
+            reconnect_attempt: None,
+            reconnect_at_unix_ms: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Request {
     Status,
     Shutdown,
+    RemoteAdd { name: String, target: String },
+    RemoteList,
+    RemoteStatus { selector: String },
+    RemoteRetry { selector: String },
+    RemoteRemove { selector: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -27,9 +108,19 @@ pub(crate) enum Response {
         state: DaemonState,
         remote_count: u32,
     },
-    ShutdownAccepted,
+    ShutdownAccepted {
+        cleanup_confirmed: bool,
+    },
+    RemoteAdded(RemoteDto),
+    RemoteList(Vec<RemoteDto>),
+    RemoteStatus(RemoteDto),
+    RemoteRetryAccepted(RemoteDto),
+    RemoteRemoved {
+        config_id: String,
+        cleanup_confirmed: bool,
+    },
     Error {
-        code: String,
+        code: ErrorCode,
         message: String,
     },
 }
@@ -48,7 +139,7 @@ impl fmt::Display for ControlError {
             Self::Protocol(message) => write!(formatter, "control protocol error: {message}"),
             Self::VersionMismatch { expected, received } => write!(
                 formatter,
-                "control protocol version mismatch: expected {expected}, received {received}"
+                "control protocol version mismatch: expected {expected}, received {received}; daemon upgrade or restart required"
             ),
         }
     }
@@ -161,12 +252,32 @@ fn unexpected(expected: &str, received: Message) -> ControlError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Lifecycle, ObservedState};
     use std::fs;
     use std::os::unix::net::UnixListener;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TIMEOUT: Duration = Duration::from_secs(1);
+
+    fn remote() -> RemoteDto {
+        RemoteDto {
+            config_id: "0123456789abcdef0123456789abcdef".into(),
+            name: "dev".into(),
+            target: "user@host".into(),
+            endpoint_id: Some("fedcba9876543210fedcba9876543210".into()),
+            lifecycle: Lifecycle::Active,
+            observed_state: ObservedState::Connected,
+            state_changed_unix_ms: 42,
+            last_error: None,
+            protocol_version: Some(2),
+            capabilities: Some(7),
+            active_requests: Some(1),
+            request_capacity: Some(8),
+            reconnect_attempt: None,
+            reconnect_at_unix_ms: None,
+        }
+    }
 
     fn round_trip(request_message: Request, response: Response) -> Response {
         let (mut client, mut server) = UnixStream::pair().expect("create socket pair");
@@ -187,16 +298,57 @@ mod tests {
     }
 
     #[test]
-    fn exact_handshake_status_and_shutdown() {
-        let status = Response::Status {
-            state: DaemonState::Running,
-            remote_count: 3,
-        };
-        assert_eq!(round_trip(Request::Status, status.clone()), status);
-        assert_eq!(
-            round_trip(Request::Shutdown, Response::ShutdownAccepted),
-            Response::ShutdownAccepted
-        );
+    fn all_v2_requests_and_responses_round_trip() {
+        let remote = remote();
+        for (request_message, response) in [
+            (
+                Request::Status,
+                Response::Status {
+                    state: DaemonState::Running,
+                    remote_count: 1,
+                },
+            ),
+            (
+                Request::Shutdown,
+                Response::ShutdownAccepted {
+                    cleanup_confirmed: true,
+                },
+            ),
+            (
+                Request::RemoteAdd {
+                    name: "dev".into(),
+                    target: "user@host".into(),
+                },
+                Response::RemoteAdded(remote.clone()),
+            ),
+            (
+                Request::RemoteList,
+                Response::RemoteList(vec![remote.clone()]),
+            ),
+            (
+                Request::RemoteStatus {
+                    selector: "dev".into(),
+                },
+                Response::RemoteStatus(remote.clone()),
+            ),
+            (
+                Request::RemoteRetry {
+                    selector: "dev".into(),
+                },
+                Response::RemoteRetryAccepted(remote.clone()),
+            ),
+            (
+                Request::RemoteRemove {
+                    selector: "dev".into(),
+                },
+                Response::RemoteRemoved {
+                    config_id: remote.config_id.clone(),
+                    cleanup_confirmed: true,
+                },
+            ),
+        ] {
+            assert_eq!(round_trip(request_message, response.clone()), response);
+        }
     }
 
     #[test]
@@ -209,16 +361,16 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(ControlError::VersionMismatch {
-                    expected: 1,
-                    received: 2
+                    expected: 2,
+                    received: 1
                 })
             ));
         });
 
-        write(&mut client, &Message::ClientHello { version: 2 }).expect("write hello");
+        write(&mut client, &Message::ClientHello { version: 1 }).expect("write hello");
         assert!(matches!(
             read(&mut client).expect("read server hello"),
-            Message::ServerHello { version: 1 }
+            Message::ServerHello { version: 2 }
         ));
         drop(client);
         server.join().expect("server thread");
@@ -228,7 +380,7 @@ mod tests {
     fn oversized_and_trailing_frames_are_rejected() {
         for bytes in [(MAX_FRAME_SIZE as u32 + 1).to_le_bytes().to_vec(), {
             let mut frame = Vec::new();
-            crate::framing::write_message(&mut frame, &Message::ClientHello { version: 1 })
+            crate::framing::write_message(&mut frame, &Message::ClientHello { version: 2 })
                 .expect("encode hello");
             let length = u32::from_le_bytes(frame[..4].try_into().expect("frame prefix")) + 1;
             frame[..4].copy_from_slice(&length.to_le_bytes());
@@ -239,7 +391,7 @@ mod tests {
             use std::io::Write;
             client.write_all(&bytes).expect("write invalid frame");
             assert!(matches!(
-                serve_connection(&mut server, TIMEOUT, |_| Response::ShutdownAccepted),
+                serve_connection(&mut server, TIMEOUT, |_| Response::ShutdownAccepted { cleanup_confirmed: true }),
                 Err(ControlError::Transport(ref error)) if error.kind() == io::ErrorKind::InvalidData
             ));
         }

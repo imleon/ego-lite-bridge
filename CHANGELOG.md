@@ -4,8 +4,9 @@
 
 ### Added
 
-- Added the macOS `ego-lite-bridge serve <linux-host>` command, which maintains an SSH-backed execution channel to Linux and reconnects after transient failures.
-- Added the Linux `ego-browser` shim and private per-user broker socket.
+- Added the macOS per-user daemon with `start`, `status`, and `stop` lifecycle commands.
+- Added daemon-managed Remote CRUD with `remote add/list/status/retry/remove`, persistent configuration, endpoint deduplication, and automatic reconnection.
+- Added the Linux `ego-browser` shim and private per-user broker and ownership sockets.
 - Added binary-safe forwarding for arguments, stdin, stdout, stderr, exit codes, signals, cancellation, and spawn errors.
 - Added up to 8 concurrent requests, immediate capacity rejection, per-request input/output/backpressure isolation, and broker takeover when a newer Mac channel connects.
 - Added exact protocol capability negotiation; peers with missing or unknown capabilities are rejected.

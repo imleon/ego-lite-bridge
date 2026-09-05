@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,16 +43,14 @@ impl Config {
                     "remote config_id must be non-empty and unique across selectors",
                 ));
             }
-            if !valid_remote_name(&remote.name) || !selectors.insert(&remote.name) {
+            validate_remote_name(&remote.name).map_err(|error| invalid_data(error.to_string()))?;
+            if !selectors.insert(&remote.name) {
                 return Err(invalid_data(
-                    "remote name is invalid, reserved, or not unique across selectors",
+                    "remote name must be unique across name and config_id selectors",
                 ));
             }
-            if remote.target.is_empty() || remote.target.starts_with('-') {
-                return Err(invalid_data(
-                    "remote target must be non-empty and must not start with '-'",
-                ));
-            }
+            validate_remote_target(&remote.target)
+                .map_err(|error| invalid_data(error.to_string()))?;
             if let Some(endpoint_id) = &remote.endpoint_id {
                 if endpoint_id.len() != 32
                     || !endpoint_id
@@ -65,12 +63,8 @@ impl Config {
                     ));
                 }
             }
-            if matches!(remote.lifecycle, Lifecycle::Active | Lifecycle::Removing)
-                && remote.endpoint_id.is_none()
-            {
-                return Err(invalid_data(
-                    "active and removing remotes must have an endpoint_id",
-                ));
+            if remote.lifecycle == Lifecycle::Active && remote.endpoint_id.is_none() {
+                return Err(invalid_data("active remotes must have an endpoint_id"));
             }
             if (remote.lifecycle == Lifecycle::Removing)
                 != (remote.observed_state == ObservedState::Removing)
@@ -83,6 +77,7 @@ impl Config {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn recovery_actions(&self) -> Vec<RecoveryAction<'_>> {
         self.remotes
             .iter()
@@ -98,16 +93,78 @@ impl Config {
             })
             .collect()
     }
+
+    pub(crate) fn remote_by_selector(&self, selector: &str) -> Option<&RemoteRecord> {
+        self.remotes
+            .iter()
+            .find(|remote| remote.name == selector || remote.config_id == selector)
+    }
+
+    // Used by the M6 actor when a pending worker reports its endpoint identity.
+    #[allow(dead_code)]
+    pub fn remote_by_endpoint_excluding(
+        &self,
+        endpoint_id: &str,
+        excluded_config_id: &str,
+    ) -> Option<&RemoteRecord> {
+        self.remotes.iter().find(|remote| {
+            remote.config_id != excluded_config_id
+                && remote.endpoint_id.as_deref() == Some(endpoint_id)
+        })
+    }
 }
 
-fn valid_remote_name(name: &str) -> bool {
-    (1..=64).contains(&name.len())
-        && !name.starts_with('.')
-        && name != "all"
-        && name != "default"
-        && name
+pub(crate) fn validate_remote_name(name: &str) -> io::Result<()> {
+    if !(1..=64).contains(&name.len())
+        || name.starts_with('.')
+        || matches!(name, "all" | "default")
+        || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote name must be 1-64 ASCII letters, digits, '-', '_' or '.', must not start with '.', and must not be reserved",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_remote_target(target: &str) -> io::Result<()> {
+    if target.is_empty()
+        || target.starts_with('-')
+        || target.chars().any(char::is_whitespace)
+        || target.chars().any(char::is_control)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote target must be one non-empty OpenSSH destination operand without leading '-' or whitespace/control characters",
+        ));
+    }
+    Ok(())
+}
+
+// Generated-ID shape check for the M6 actor; schema v1 still accepts legacy nonempty IDs.
+#[allow(dead_code)]
+pub(crate) fn valid_config_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+// Used by the M6 actor before persisting a pending remote.
+#[allow(dead_code)]
+pub fn generate_config_id() -> io::Result<String> {
+    let mut random = [0_u8; 16];
+    fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let mut id = String::with_capacity(32);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in random {
+        id.push(HEX[(byte >> 4) as usize] as char);
+        id.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    Ok(id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +198,7 @@ pub enum ObservedState {
     Removing,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryAction<'a> {
     Reconnect(&'a RemoteRecord),
@@ -338,7 +396,7 @@ mod tests {
             ego_browser_path: "/Applications/Ego.app/Contents/MacOS/ego-browser".into(),
             daemon_stopping: false,
             remotes: vec![remote(
-                "id-one",
+                "00000000000000000000000000000001",
                 "one",
                 Lifecycle::Active,
                 ObservedState::Connected,
@@ -388,8 +446,8 @@ mod tests {
     fn validation_rejects_invalid_remote_fields_and_state() {
         let mut value = config();
         value.remotes.push(remote(
-            "id-two",
-            "id-one",
+            "00000000000000000000000000000002",
+            "00000000000000000000000000000001",
             Lifecycle::Active,
             ObservedState::Connected,
         ));
@@ -420,24 +478,94 @@ mod tests {
     }
 
     #[test]
+    fn strict_name_target_id_and_lookup_helpers() {
+        for name in ["dev", "dev.linux_1-2", "A"] {
+            validate_remote_name(name).expect("valid name");
+        }
+        for name in ["", ".hidden", "all", "default", "space name", "é"] {
+            assert!(validate_remote_name(name).is_err(), "accepted {name:?}");
+        }
+        for target in ["host", "user@host", "ssh-alias"] {
+            validate_remote_target(target).expect("valid target");
+        }
+        for target in [
+            "",
+            "-host",
+            "two hosts",
+            "host\targ",
+            "host\narg",
+            "host\0arg",
+        ] {
+            assert!(
+                validate_remote_target(target).is_err(),
+                "accepted {target:?}"
+            );
+        }
+
+        let first = generate_config_id().expect("generate config id");
+        let second = generate_config_id().expect("generate second config id");
+        assert!(valid_config_id(&first));
+        assert!(valid_config_id(&second));
+        assert_ne!(first, second);
+        for invalid in [
+            "",
+            "ABCDEF0123456789ABCDEF0123456789",
+            "g0000000000000000000000000000000",
+        ] {
+            assert!(!valid_config_id(invalid));
+        }
+
+        let mut value = config();
+        let pending_id = "00000000000000000000000000000002";
+        let endpoint = value.remotes[0].endpoint_id.clone().expect("endpoint");
+        value.remotes.push(RemoteRecord {
+            config_id: pending_id.into(),
+            name: "pending".into(),
+            target: "alias".into(),
+            endpoint_id: Some(endpoint.clone()),
+            lifecycle: Lifecycle::Pending,
+            observed_state: ObservedState::Connecting,
+            state_changed_unix_ms: 0,
+            last_error: None,
+        });
+        assert_eq!(value.remote_by_selector("one"), Some(&value.remotes[0]));
+        assert_eq!(
+            value.remote_by_selector("00000000000000000000000000000001"),
+            Some(&value.remotes[0])
+        );
+        assert_eq!(
+            value.remote_by_endpoint_excluding(&endpoint, pending_id),
+            Some(&value.remotes[0])
+        );
+        assert!(value
+            .remote_by_endpoint_excluding(&endpoint, &value.remotes[0].config_id)
+            .is_some());
+    }
+
+    #[test]
     fn recovery_actions_respect_lifecycle_error_and_stop_intent() {
         let mut value = config();
         value.remotes = vec![
             remote(
-                "pending",
+                "00000000000000000000000000000001",
                 "pending",
                 Lifecycle::Pending,
                 ObservedState::Connecting,
             ),
             remote(
-                "active",
+                "00000000000000000000000000000002",
                 "active",
                 Lifecycle::Active,
                 ObservedState::Reconnecting,
             ),
-            remote("error", "error", Lifecycle::Active, ObservedState::Error),
             remote(
-                "removing",
+                "00000000000000000000000000000003",
+                "error",
+                Lifecycle::Active,
+                ObservedState::Error,
+            ),
+            remote(
+                "00000000000000000000000000000004",
                 "removing",
                 Lifecycle::Removing,
                 ObservedState::Removing,

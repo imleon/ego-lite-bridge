@@ -16,3 +16,6 @@ build:
 
 installer-test:
     python3 -m unittest scripts.test_unix_installer
+
+e2e-manual:
+    python3 -m unittest scripts.test_manual_e2e
