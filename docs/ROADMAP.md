@@ -92,9 +92,9 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 
 验收：一台Mac同时服务至少两个Linux；重复endpoint不产生第二配置；失败add无残留claim；pending/removing记录不因崩溃变为active；一个remote故障不影响其他remote；stop强制清理和daemon全局process/payload上限通过真实RemoteWorker E2E。
 
-### M7 — Status与Doctor（已实现，待真实E2E）
+### M7 — Status与Doctor（已完成）
 
-状态：代码和本地自动化已完成；真实Mac/Linux手动E2E通过前不标记完成。
+状态：代码、本地自动化及真实Mac/Linux手动E2E均已通过。
 
 - daemon及remote desired/observed状态；
 - remote status展示错误、重连、protocol/capabilities和请求容量；
