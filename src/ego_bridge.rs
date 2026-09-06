@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 #[cfg(any(target_os = "macos", test))]
 use std::process::{Child, ExitStatus};
+#[cfg(any(target_os = "macos", test))]
+use std::sync::atomic::AtomicUsize;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -553,14 +555,23 @@ impl InboundScheduler {
         true
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn pop_timeout(&self, timeout: Duration) -> io::Result<Option<InboundItem>> {
+        self.pop_timeout_matching(timeout, |_| true)
+    }
+
+    fn pop_timeout_matching(
+        &self,
+        timeout: Duration,
+        request_ready: impl Fn(u64) -> bool,
+    ) -> io::Result<Option<InboundItem>> {
         let deadline = Instant::now() + timeout;
         let mut state = self
             .state
             .lock()
             .map_err(|_| io::Error::other("inbound scheduler lock poisoned"))?;
         loop {
-            if let Some(item) = pop_inbound(&mut state) {
+            if let Some(item) = pop_inbound_matching(&mut state, &request_ready) {
                 return Ok(Some(item));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -573,9 +584,37 @@ impl InboundScheduler {
                 .map_err(|_| io::Error::other("inbound scheduler lock poisoned"))?;
             state = next;
             if wait.timed_out() {
-                return Ok(pop_inbound(&mut state));
+                return Ok(pop_inbound_matching(&mut state, &request_ready));
             }
         }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn discard_request_input(&self, request_id: u64) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("inbound scheduler lock poisoned"))?;
+        let Some(mut queue) = state.requests.remove(&request_id) else {
+            return Ok(());
+        };
+        let (frames, bytes) = discard_input_before_next_open(&mut queue.events);
+        queue.ordinary_frames -= frames;
+        queue.ordinary_bytes -= bytes;
+        state.ordinary_frames -= frames;
+        state.ordinary_bytes -= bytes;
+        discard_input_before_next_open(&mut queue.retained);
+        state.ready.retain(|ready| *ready != request_id);
+        if !queue.events.is_empty() || queue.overload_delivered && !queue.retained.is_empty() {
+            state.ready.push_back(request_id);
+        }
+        if !queue.events.is_empty()
+            || !queue.retained.is_empty()
+            || queue.overloaded && !queue.overload_delivered
+        {
+            state.requests.insert(request_id, queue);
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -639,6 +678,27 @@ impl InboundScheduler {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn discard_input_before_next_open(events: &mut VecDeque<InboundEvent>) -> (usize, usize) {
+    let mut frames = 0;
+    let mut bytes = 0;
+    let mut next_generation = false;
+    events.retain(|event| {
+        next_generation |= matches!(event.message, EgoBridgeMessage::Open { .. });
+        let discard = !next_generation
+            && matches!(
+                event.message,
+                EgoBridgeMessage::Stdin { .. } | EgoBridgeMessage::StdinEof { .. }
+            );
+        if discard {
+            frames += 1;
+            bytes += inbound_ordinary_bytes(&event.message);
+        }
+        !discard
+    });
+    (frames, bytes)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn inbound_ordinary_bytes(message: &EgoBridgeMessage) -> usize {
     match message {
@@ -666,9 +726,56 @@ fn inbound_drained(state: &InboundState) -> bool {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
-fn pop_inbound(state: &mut InboundState) -> Option<InboundItem> {
+fn pop_inbound_matching(
+    state: &mut InboundState,
+    request_ready: impl Fn(u64) -> bool,
+) -> Option<InboundItem> {
     if let Some(event) = state.control.pop_front() {
         return Some(InboundItem::Message(event));
+    }
+    if let Some(request_id) = state.requests.iter().find_map(|(request_id, queue)| {
+        queue
+            .events
+            .iter()
+            .chain(&queue.retained)
+            .any(|event| matches!(event.message, EgoBridgeMessage::Cancel { .. }))
+            .then_some(*request_id)
+    }) {
+        let queue = state.requests.get_mut(&request_id)?;
+        if queue.overloaded && !queue.overload_delivered {
+            for event in queue.events.drain(..) {
+                queue.ordinary_frames -= 1;
+                state.ordinary_frames -= 1;
+                let bytes = inbound_ordinary_bytes(&event.message);
+                queue.ordinary_bytes -= bytes;
+                state.ordinary_bytes -= bytes;
+            }
+            state.ready.retain(|ready| *ready != request_id);
+        } else {
+            let event = if let Some(index) = queue
+                .events
+                .iter()
+                .position(|event| matches!(event.message, EgoBridgeMessage::Cancel { .. }))
+            {
+                let event = queue.events.remove(index)?;
+                queue.ordinary_frames -= 1;
+                state.ordinary_frames -= 1;
+                event
+            } else {
+                let index = queue
+                    .retained
+                    .iter()
+                    .position(|event| matches!(event.message, EgoBridgeMessage::Cancel { .. }))
+                    .expect("cancel exists");
+                queue.retained.remove(index)?
+            };
+            if queue.events.is_empty() && queue.retained.is_empty() {
+                state.requests.remove(&request_id);
+                state.ready.retain(|ready| *ready != request_id);
+                state.overload.retain(|overload| *overload != request_id);
+            }
+            return Some(InboundItem::Message(event));
+        }
     }
     if let Some(index) = state.overload.iter().position(|request_id| {
         state
@@ -695,7 +802,12 @@ fn pop_inbound(state: &mut InboundState) -> Option<InboundItem> {
         }
         return Some(InboundItem::Overload(request_id, budget_exhausted));
     }
-    if let Some(request_id) = state.ready.pop_front() {
+    if let Some(index) = state
+        .ready
+        .iter()
+        .position(|request_id| request_ready(*request_id))
+    {
+        let request_id = state.ready.remove(index)?;
         let queue = state.requests.get_mut(&request_id)?;
         let retained = queue.events.is_empty();
         let event = if retained {
@@ -2714,6 +2826,7 @@ enum RequestInput {
 struct ExecutorRoute {
     generation: u64,
     input: Option<mpsc::SyncSender<RequestInput>>,
+    pending_input: Arc<AtomicUsize>,
     cancelled: Arc<AtomicBool>,
     retiring: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
@@ -2741,7 +2854,13 @@ fn serve_requests(
         }
         drain_executor_completions(&completed, &mut routes)?;
 
-        let Some(incoming) = inbound.pop_timeout(EXEC_POLL_INTERVAL)? else {
+        let Some(incoming) = inbound.pop_timeout_matching(EXEC_POLL_INTERVAL, |request_id| {
+            routes.get(&request_id).is_none_or(|route| {
+                route.input.is_none()
+                    || route.pending_input.load(Ordering::Acquire) < REQUEST_QUEUE_CAPACITY
+            })
+        })?
+        else {
             continue;
         };
         let (message, payload) = match incoming {
@@ -2799,11 +2918,13 @@ fn serve_requests(
                     continue;
                 }
                 let (input, request_input) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
+                let pending_input = Arc::new(AtomicUsize::new(0));
                 let cancelled = Arc::new(AtomicBool::new(false));
                 let retiring = Arc::new(AtomicBool::new(false));
                 let error = Arc::new(Mutex::new(None));
                 let generation = next_generation;
                 next_generation = next_generation.wrapping_add(1);
+                let worker_pending_input = Arc::clone(&pending_input);
                 let worker_cancelled = Arc::clone(&cancelled);
                 let worker_retiring = Arc::clone(&retiring);
                 let worker_error = Arc::clone(&error);
@@ -2818,6 +2939,7 @@ fn serve_requests(
                         request_id,
                         &argv,
                         request_input,
+                        &worker_pending_input,
                         &worker_cancelled,
                         &worker_retiring,
                         &worker_error,
@@ -2832,6 +2954,7 @@ fn serve_requests(
                     ExecutorRoute {
                         generation,
                         input: Some(input),
+                        pending_input,
                         cancelled,
                         retiring,
                         error,
@@ -2867,8 +2990,10 @@ fn serve_requests(
                 }
             }
             EgoBridgeMessage::Cancel { request_id } => {
-                if let Some(route) = routes.get(&request_id) {
+                if let Some(route) = routes.get_mut(&request_id) {
                     route.cancelled.store(true, Ordering::Release);
+                    route.input.take();
+                    inbound.discard_request_input(request_id)?;
                 }
             }
             message => {
@@ -2951,19 +3076,15 @@ fn reap_executor_completion(
 
 #[cfg(any(target_os = "macos", test))]
 fn route_input(request_id: u64, route: &mut ExecutorRoute, input: RequestInput) {
-    let failed = route
-        .input
-        .as_ref()
-        .is_none_or(|sender| sender.try_send(input).is_err());
-    if failed {
-        if let Ok(mut error) = route.error.lock() {
-            if error.is_none() {
-                *error = Some(format!("request {request_id} input queue saturated"));
-            }
-        }
+    let Some(sender) = route.input.as_ref() else {
+        return;
+    };
+    route.pending_input.fetch_add(1, Ordering::Release);
+    if sender.send(input).is_err() {
+        route.pending_input.fetch_sub(1, Ordering::Release);
         route.cancelled.store(true, Ordering::Release);
         route.input.take();
-        eprintln!("ego-lite-bridge: request {request_id} input rejected; cancelling request");
+        eprintln!("ego-lite-bridge: request {request_id} input closed; cancelling request");
     }
 }
 
@@ -2985,6 +3106,7 @@ fn execute_request(
     request_id: u64,
     argv: &[std::ffi::OsString],
     receiver: mpsc::Receiver<RequestInput>,
+    pending_input: &Arc<AtomicUsize>,
     cancelled: &Arc<AtomicBool>,
     retiring: &Arc<AtomicBool>,
     request_error: &Arc<Mutex<Option<String>>>,
@@ -2996,6 +3118,7 @@ fn execute_request(
         request_id,
         argv,
         receiver,
+        pending_input,
         cancelled,
         retiring,
         request_error,
@@ -3034,6 +3157,7 @@ fn execute_request_inner(
     request_id: u64,
     argv: &[std::ffi::OsString],
     receiver: mpsc::Receiver<RequestInput>,
+    pending_input: &Arc<AtomicUsize>,
     cancelled: &Arc<AtomicBool>,
     retiring: &Arc<AtomicBool>,
     request_error: &Arc<Mutex<Option<String>>>,
@@ -3115,7 +3239,13 @@ fn execute_request_inner(
         let stdin_worker_done = Arc::clone(&stdin_done);
         let stdin_cancelled = Arc::clone(cancelled);
         let stdin_worker = scope.spawn(move || {
-            forward_input(child_stdin, &receiver, &stdin_cancelled, &stdin_worker_done)
+            forward_input(
+                child_stdin,
+                &receiver,
+                pending_input,
+                &stdin_cancelled,
+                &stdin_worker_done,
+            )
         });
 
         let status = wait_for_child(&mut child, cancelled, channel_out);
@@ -3157,25 +3287,36 @@ fn execute_request_inner(
 fn forward_input(
     mut child_stdin: impl Write,
     receiver: &mpsc::Receiver<RequestInput>,
+    pending_input: &AtomicUsize,
     cancelled: &AtomicBool,
     done: &AtomicBool,
 ) -> io::Result<()> {
     while !done.load(Ordering::Acquire) && !cancelled.load(Ordering::Acquire) {
         match receiver.recv_timeout(EXEC_POLL_INTERVAL) {
-            Ok(RequestInput::Stdin(data, _payload)) => {
-                if let Err(err) = child_stdin
-                    .write_all(&data)
-                    .and_then(|()| child_stdin.flush())
-                {
-                    if err.kind() == io::ErrorKind::BrokenPipe || cancelled.load(Ordering::Acquire)
-                    {
-                        return Ok(());
+            Ok(input) => {
+                pending_input.fetch_sub(1, Ordering::Release);
+                if cancelled.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                match input {
+                    RequestInput::Stdin(data, _payload) => {
+                        if let Err(err) = child_stdin
+                            .write_all(&data)
+                            .and_then(|()| child_stdin.flush())
+                        {
+                            if err.kind() == io::ErrorKind::BrokenPipe
+                                || cancelled.load(Ordering::Acquire)
+                            {
+                                return Ok(());
+                            }
+                            cancelled.store(true, Ordering::Release);
+                            return Err(err);
+                        }
                     }
-                    cancelled.store(true, Ordering::Release);
-                    return Err(err);
+                    RequestInput::StdinEof => return Ok(()),
                 }
             }
-            Ok(RequestInput::StdinEof) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
@@ -4168,6 +4309,102 @@ mod tests {
     }
 
     #[test]
+    fn cancel_priority_discards_old_stdin_and_preserves_reused_generation() {
+        let scheduler = InboundScheduler::new(false);
+        let request_id = 23;
+        assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Open {
+            request_id,
+            argv: Vec::new(),
+        })));
+        assert!(matches!(
+            scheduler.pop_timeout(Duration::ZERO).unwrap(),
+            Some(InboundItem::Message(InboundEvent {
+                message: EgoBridgeMessage::Open { .. },
+                ..
+            }))
+        ));
+        assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Stdin {
+            request_id,
+            data: b"old".to_vec(),
+        })));
+        assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Cancel { request_id })));
+        assert!(matches!(
+            scheduler
+                .pop_timeout_matching(Duration::ZERO, |_| false)
+                .unwrap(),
+            Some(InboundItem::Message(InboundEvent {
+                message: EgoBridgeMessage::Cancel { .. },
+                ..
+            }))
+        ));
+        scheduler
+            .discard_request_input(request_id)
+            .expect("discard cancelled input");
+        assert!(scheduler.pop_timeout(Duration::ZERO).unwrap().is_none());
+
+        assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Open {
+            request_id,
+            argv: Vec::new(),
+        })));
+        assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Stdin {
+            request_id,
+            data: b"new".to_vec(),
+        })));
+        assert!(matches!(
+            scheduler.pop_timeout(Duration::ZERO).unwrap(),
+            Some(InboundItem::Message(InboundEvent {
+                message: EgoBridgeMessage::Open { .. },
+                ..
+            }))
+        ));
+        assert!(matches!(
+            scheduler.pop_timeout(Duration::ZERO).unwrap(),
+            Some(InboundItem::Message(InboundEvent {
+                message: EgoBridgeMessage::Stdin { data, .. },
+                ..
+            })) if data == b"new"
+        ));
+    }
+
+    #[test]
+    fn cancelled_input_worker_does_not_write_already_queued_data() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(RequestInput::Stdin(b"must-not-write".to_vec(), None))
+            .expect("queue stdin");
+        let mut output = Vec::new();
+        forward_input(
+            &mut output,
+            &receiver,
+            &AtomicUsize::new(1),
+            &AtomicBool::new(true),
+            &AtomicBool::new(false),
+        )
+        .expect("cancel input worker");
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn standalone_cancels_do_not_leak_request_ids_or_ready_entries() {
+        let scheduler = InboundScheduler::new(false);
+        for request_id in 0..MAX_CONCURRENT_REQUESTS * 3 {
+            assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Cancel {
+                request_id: request_id as u64,
+            })));
+            assert!(matches!(
+                scheduler.pop_timeout(Duration::ZERO).unwrap(),
+                Some(InboundItem::Message(InboundEvent {
+                    message: EgoBridgeMessage::Cancel { .. },
+                    ..
+                }))
+            ));
+        }
+        let state = scheduler.state.lock().expect("scheduler lock");
+        assert!(state.requests.is_empty());
+        assert!(state.ready.is_empty());
+    }
+
+    #[test]
     fn empty_overloaded_queues_do_not_leak_request_ids() {
         let scheduler = InboundScheduler::new(true);
         for request_id in 0..MAX_CONCURRENT_REQUESTS * 3 {
@@ -4909,6 +5146,7 @@ mod tests {
             ExecutorRoute {
                 generation: 2,
                 input: Some(input),
+                pending_input: Arc::new(AtomicUsize::new(0)),
                 cancelled: Arc::new(AtomicBool::new(false)),
                 retiring: Arc::new(AtomicBool::new(false)),
                 error: Arc::new(Mutex::new(None)),
@@ -4935,6 +5173,7 @@ mod tests {
             39,
             &["-c".into(), "printf output; exec sleep 30".into()],
             receiver,
+            &Arc::new(AtomicUsize::new(0)),
             &cancelled,
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(None)),
@@ -4949,7 +5188,68 @@ mod tests {
     }
 
     #[test]
-    fn executor_input_backpressure_is_request_local() {
+    fn executor_roundtrips_stdin_larger_than_input_queue() {
+        let (sender, output, worker) = start_test_executor();
+        let request_id = 39;
+        let input = (0..256 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        sender
+            .send(Ok(EgoBridgeMessage::Open {
+                request_id,
+                argv: vec![
+                    b"-c".to_vec(),
+                    b"tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; cat >\"$tmp\"; cat \"$tmp\""
+                        .to_vec(),
+                ],
+            }))
+            .expect("open echo request");
+        for chunk in input.chunks(16 * 1024) {
+            sender
+                .send(Ok(EgoBridgeMessage::Stdin {
+                    request_id,
+                    data: chunk.to_vec(),
+                }))
+                .expect("send binary stdin");
+        }
+        sender
+            .send(Ok(EgoBridgeMessage::StdinEof { request_id }))
+            .expect("close stdin");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let messages = loop {
+            let messages = decode_messages(&output);
+            if messages
+                .iter()
+                .any(|message| matches!(message, EgoBridgeMessage::Exit { request_id: 39, .. }))
+            {
+                break messages;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for exit");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let actual = messages
+            .iter()
+            .filter_map(|message| match message {
+                EgoBridgeMessage::Stdout {
+                    request_id: 39,
+                    data,
+                } => Some(data.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(actual, input);
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, EgoBridgeMessage::Exit { request_id: 39, .. })));
+        drop(sender);
+        assert!(worker.join().expect("executor worker").is_err());
+    }
+
+    #[test]
+    fn executor_backpressures_blocked_stdin_without_blocking_other_requests() {
         let (sender, output, worker) = start_test_executor();
         sender
             .send(Ok(EgoBridgeMessage::Open {
@@ -4957,17 +5257,14 @@ mod tests {
                 argv: vec![b"-c".to_vec(), b"exec sleep 30".to_vec()],
             }))
             .expect("open blocked request");
-        for _ in 0..128 {
+        for _ in 0..REQUEST_QUEUE_CAPACITY {
             sender
                 .send(Ok(EgoBridgeMessage::Stdin {
                     request_id: 40,
                     data: vec![0; MAX_STREAM_PAYLOAD_SIZE],
                 }))
-                .expect("fill request input queue");
+                .expect("fill bounded request input");
         }
-        sender
-            .send(Ok(EgoBridgeMessage::StdinEof { request_id: 40 }))
-            .expect("retain overloaded EOF");
         sender
             .send(Ok(EgoBridgeMessage::Open {
                 request_id: 41,
@@ -4978,16 +5275,17 @@ mod tests {
             .send(Ok(EgoBridgeMessage::StdinEof { request_id: 41 }))
             .expect("close independent stdin");
 
-        let messages = wait_for_messages(&output, 3);
+        let messages = wait_for_messages(&output, 2);
         assert!(messages.iter().any(
             |message| matches!(message, EgoBridgeMessage::Stdout { request_id: 41, data } if data == b"ready")
         ));
         assert!(messages
             .iter()
-            .any(|message| matches!(message, EgoBridgeMessage::Error { request_id: 40, .. })));
-        assert!(messages
-            .iter()
             .any(|message| matches!(message, EgoBridgeMessage::Exit { request_id: 41, .. })));
+        sender
+            .send(Ok(EgoBridgeMessage::Cancel { request_id: 40 }))
+            .expect("cancel blocked request");
+        wait_for_messages(&output, 3);
         drop(sender);
         assert!(worker.join().expect("executor worker").is_err());
     }
@@ -5019,6 +5317,56 @@ mod tests {
         assert!(messages.iter().any(
             |message| matches!(message, EgoBridgeMessage::Stdout { request_id: 51, data } if data == b"alive")
         ));
+        drop(sender);
+        assert!(worker.join().expect("executor worker").is_err());
+    }
+
+    #[test]
+    fn saturated_then_cancel_emits_exactly_one_terminal() {
+        let (sender, output, worker) = start_test_executor();
+        let request_id = 58;
+        sender
+            .send(Ok(EgoBridgeMessage::Open {
+                request_id,
+                argv: vec![b"-c".to_vec(), b"exec sleep 30".to_vec()],
+            }))
+            .expect("open request");
+        for _ in 0..=INBOUND_REQUEST_FRAMES_PER_REQUEST {
+            sender
+                .send(Ok(EgoBridgeMessage::Stdin {
+                    request_id,
+                    data: Vec::new(),
+                }))
+                .expect("saturate request");
+        }
+        sender
+            .send(Ok(EgoBridgeMessage::Cancel { request_id }))
+            .expect("cancel request");
+
+        let messages = wait_for_messages(&output, 1);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    EgoBridgeMessage::Exit { request_id: 58, .. }
+                        | EgoBridgeMessage::Error { request_id: 58, .. }
+                ))
+                .count(),
+            1
+        );
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            decode_messages(&output)
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    EgoBridgeMessage::Exit { request_id: 58, .. }
+                        | EgoBridgeMessage::Error { request_id: 58, .. }
+                ))
+                .count(),
+            1
+        );
         drop(sender);
         assert!(worker.join().expect("executor worker").is_err());
     }
@@ -5266,6 +5614,7 @@ mod tests {
             3,
             &["-c".into(), "exit 7".into()],
             receiver,
+            &Arc::new(AtomicUsize::new(0)),
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(None)),
@@ -5294,6 +5643,7 @@ mod tests {
             4,
             &["-c".into(), "exec sleep 30".into()],
             receiver,
+            &Arc::new(AtomicUsize::new(0)),
             &Arc::new(AtomicBool::new(true)),
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(None)),
@@ -5317,6 +5667,7 @@ mod tests {
             5,
             &[],
             receiver,
+            &Arc::new(AtomicUsize::new(0)),
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(Mutex::new(None)),
@@ -5393,11 +5744,15 @@ mod tests {
     }
 
     fn decode_messages(output: &Arc<Mutex<Vec<u8>>>) -> Vec<EgoBridgeMessage> {
-        let bytes = output.lock().expect("output lock").clone();
+        let bytes = output.lock().expect("output lock");
         let mut input = bytes.as_slice();
         let mut messages = Vec::new();
         while !input.is_empty() {
-            messages.push(read_message(&mut input).expect("decode message"));
+            match read_message(&mut input) {
+                Ok(message) => messages.push(message),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => panic!("decode message: {error}"),
+            }
         }
         messages
     }
