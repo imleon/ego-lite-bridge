@@ -57,15 +57,20 @@ daemon 会在短暂的 SSH 或网络故障后自动重连。
 | 命令 | 用途 | 成功输出 |
 | --- | --- | --- |
 | `ego-lite-bridge start` | 启动用户级 daemon；重复运行安全。 | `ego-lite-bridge started`，已启动时为 `ego-lite-bridge is running` |
-| `ego-lite-bridge status` | 检查 daemon 健康状态和 remote 数量。 | `running (<数量> remotes)` |
-| `ego-lite-bridge remote add <名称> <SSH-target>` | 添加 remote，并等待其 broker ready。 | 以 `Active/Connected` 结尾的制表符分隔记录 |
-| `ego-lite-bridge remote list` | 列出全部已配置 remote。 | 每个 remote 一行；空列表无输出 |
-| `ego-lite-bridge remote status <名称或配置ID>` | 显示一个 remote 的生命周期和观测状态。 | 同一记录格式；错误信息可能显示在下一缩进行 |
-| `ego-lite-bridge remote retry <名称或配置ID>` | 重试当前处于 `Active/Error` 的 remote。 | 更新后的 remote 记录 |
+| `ego-lite-bridge status` | 显示 daemon 健康状态，以及每个 remote 的 desired/observed 状态。 | `daemon=running remotes=<数量>`，随后每个 remote 一行 `<名称> desired=<状态> observed=<状态>` |
+| `ego-lite-bridge doctor [名称或配置ID]` | 检查 Mac 本地环境，以及 daemon 中全部 remote 或指定 remote 的当前快照。 | 下文说明的 `PASS`、`FAIL` 和 `NOT CHECKED` 记录 |
+| `ego-lite-bridge remote add <名称> <SSH-target>` | 添加 remote，并等待其 broker ready。 | `<配置ID>\t<名称>\t<SSH-target>\tdesired=active observed=connected` |
+| `ego-lite-bridge remote list` | 列出全部已配置 remote。 | 每个 remote 一行 `<配置ID>\t<名称>\t<SSH-target>\tdesired=<状态> observed=<状态>`；空列表无输出 |
+| `ego-lite-bridge remote status <名称或配置ID>` | 显示右侧所列的 remote 字段。 | 带标签的多行输出：`config-id`、`name`、`target`、`desired`、`observed`、`state-changed-unix-ms`、`last-error`、`protocol-version`、`capabilities`、`reconnect-attempt`、`reconnect-at-unix-ms` 和 `active-requests` |
+| `ego-lite-bridge remote retry <名称或配置ID>` | 重试当前处于 `active/error` 的 remote。 | 更新后 remote 的 `remote list` 记录 |
 | `ego-lite-bridge remote remove <名称或配置ID>` | 删除 remote 并清理其 worker。 | `removed <配置ID>` |
 | `ego-lite-bridge stop` | 停止 daemon 及其 worker。 | `ego-lite-bridge stopped`，已停止时为 `ego-lite-bridge is stopped` |
 
-Remote 记录格式为 `<配置ID>\t<名称>\t<SSH-target>\t<生命周期>/<观测状态>`。所有 `<名称或配置ID>` 参数都接受 remote 名称或配置 ID。控制命令仅支持 macOS；Linux 提供 `ego-browser` shim。
+Desired 状态为 `pending`、`active` 和 `removing`；observed 状态为 `connecting`、`connected`、`reconnecting`、`error` 和 `removing`。当前无法获得的详情显示为 `unknown`；`active-requests` 格式为 `<活跃数>/<容量>`。所有 `<名称或配置ID>` 参数都接受 remote 名称或配置 ID。
+
+`doctor` 是只读命令。M7 检查 LaunchAgent 是否 loaded、daemon 是否 running，以及配置中的 `ego-browser` 绝对路径是否有效。对每个 remote，它检查持久配置中 endpoint identity 是否存在、desired/observed 状态，以及 daemon **当前 worker 快照**中的 handshake、容量和重连/错误信息；不验证 live endpoint identity 是否与持久值匹配。`PASS` 表示被检查的本地状态或快照健康；`FAIL` 表示环境、daemon、selector 或快照检查失败；`NOT CHECKED` 明确表示 M7 没有新建 SSH 连接，也没有验证 live endpoint identity、Linux socket 权限或端到端执行。这些主动 remote 检查属于 M8。没有 `FAIL` 时退出状态为 0，存在任一 `FAIL` 时为 1，`doctor` 语法无效时为 2。`doctor` 不修复、不安装，也不修改配置。
+
+控制命令仅支持 macOS；Linux 提供 `ego-browser` shim。
 
 ## 从源码构建和安装
 

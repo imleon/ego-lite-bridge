@@ -394,8 +394,11 @@ ego-lite-bridge doctor [name-or-id]
 
 - status展示daemon和持久remote的desired/observed state；
 - remote status展示最近错误、重连状态、protocol/capabilities和请求容量；
-- doctor执行Mac环境、SSH、remote bridge、endpoint identity、socket权限和端到端probe检查；
-- exit code：0健康、1环境或连接异常、2用法错误；
+- M7 doctor只读检查Mac本地LaunchAgent、daemon和配置中的绝对`ego-browser`路径；对remote检查持久配置中endpoint identity是否存在、desired/observed state，以及daemon当前worker快照中的已知handshake、请求容量和重连错误；
+- M7不验证live endpoint identity是否与持久值匹配；无法证明的主动remote检查明确输出`NOT CHECKED`，不伪装为健康；
+- M7 doctor不新建SSH连接，不主动检查Linux binary、endpoint identity文件或运行目录/socket权限，也不执行端到端probe；这些live检查和probe属于M8真实SSH自动化；
+- `PASS`表示该本地或快照检查健康，`FAIL`表示检查失败，`NOT CHECKED`表示超出M7检查范围且不影响健康判定；
+- exit code：0无失败、1存在环境、daemon、selector或快照失败、2用法错误；
 - doctor不自动修复、不安装软件、不修改配置。
 
 ## 14. 非目标
