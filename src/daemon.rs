@@ -1,11 +1,11 @@
 #[cfg(any(target_os = "macos", test))]
 use crate::config;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 use crate::control;
+#[cfg(any(target_os = "macos", test))]
+use crate::ego_bridge::RemoteIdentity;
 #[cfg(target_os = "macos")]
-use crate::ego_bridge::{
-    RemoteApproval, RemoteIdentity, RemoteWorker, RemoteWorkerEvent, ResourceBudget,
-};
+use crate::ego_bridge::{RemoteApproval, RemoteWorker, RemoteWorkerEvent, ResourceBudget};
 use crate::ipc::{self, SecureDirectory};
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -162,13 +162,56 @@ enum ActorMessage {
     ListenerFailed(String),
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Default)]
 struct RuntimeState {
     protocol: Option<u32>,
     capabilities: Option<u64>,
+    active_requests: Option<u32>,
+    request_capacity: Option<u32>,
     reconnect_attempt: u32,
     reconnect_at_unix_ms: Option<u64>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl RuntimeState {
+    fn identity(&mut self, identity: RemoteIdentity) {
+        self.protocol = Some(identity.protocol);
+        self.capabilities = Some(identity.capabilities);
+        self.active_requests = None;
+        self.request_capacity = None;
+    }
+
+    fn ready(&mut self, identity: RemoteIdentity, active_requests: u32, request_capacity: u32) {
+        self.identity(identity);
+        self.active_requests = Some(active_requests);
+        self.request_capacity = Some(request_capacity);
+        self.reconnect_attempt = 0;
+        self.reconnect_at_unix_ms = None;
+    }
+
+    fn retrying(&mut self, reconnect_at_unix_ms: u64) {
+        self.clear_connection();
+        self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
+        self.reconnect_at_unix_ms = Some(reconnect_at_unix_ms);
+    }
+
+    fn clear_connection(&mut self) {
+        self.protocol = None;
+        self.capabilities = None;
+        self.active_requests = None;
+        self.request_capacity = None;
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn apply_runtime(dto: &mut control::RemoteDto, runtime: &RuntimeState) {
+    dto.protocol_version = runtime.protocol;
+    dto.capabilities = runtime.capabilities;
+    dto.active_requests = runtime.active_requests;
+    dto.request_capacity = runtime.request_capacity;
+    dto.reconnect_attempt = (runtime.reconnect_attempt > 0).then_some(runtime.reconnect_attempt);
+    dto.reconnect_at_unix_ms = runtime.reconnect_at_unix_ms;
 }
 
 #[cfg(target_os = "macos")]
@@ -752,7 +795,15 @@ impl DaemonActor {
     fn handle_worker(&mut self, id: &str, event: RemoteWorkerEvent) {
         match event {
             RemoteWorkerEvent::Identity(identity) => self.identity(id, identity),
-            RemoteWorkerEvent::Ready(identity) => self.ready(id, identity),
+            RemoteWorkerEvent::Ready {
+                identity,
+                active_requests,
+                request_capacity,
+            } => self.ready(id, identity, active_requests, request_capacity),
+            RemoteWorkerEvent::Load {
+                active_requests,
+                request_capacity,
+            } => self.load(id, active_requests, request_capacity),
             RemoteWorkerEvent::Retrying { error, delay } => self.retrying(id, error, delay),
             RemoteWorkerEvent::PermanentFailure(error) => self.permanent_failure(id, error),
             RemoteWorkerEvent::Stopped => self.worker_stopped(id),
@@ -785,8 +836,7 @@ impl DaemonActor {
                 .identity(&endpoint, duplicate.map(|remote| remote.name.as_str()))
                 .err();
             if let Some(slot) = self.workers.get_mut(id) {
-                slot.runtime.protocol = Some(identity.protocol);
-                slot.runtime.capabilities = Some(identity.capabilities);
+                slot.runtime.identity(identity);
                 if let Some(error) = rejection {
                     let _ = slot.worker.approve(RemoteApproval::Reject(error.clone()));
                     slot.worker.cancel();
@@ -872,15 +922,20 @@ impl DaemonActor {
             return;
         }
         if let Some(slot) = self.workers.get_mut(id) {
-            slot.runtime.protocol = Some(identity.protocol);
-            slot.runtime.capabilities = Some(identity.capabilities);
+            slot.runtime.identity(identity);
             if slot.worker.approve(RemoteApproval::Proceed).is_err() {
                 slot.worker.cancel();
             }
         }
     }
 
-    fn ready(&mut self, id: &str, identity: RemoteIdentity) {
+    fn ready(
+        &mut self,
+        id: &str,
+        identity: RemoteIdentity,
+        active_requests: u32,
+        request_capacity: u32,
+    ) {
         if let Some(slot) = self.workers.get_mut(id) {
             if let Some(Operation::Remove {
                 require_ready: true,
@@ -939,19 +994,23 @@ impl DaemonActor {
             return;
         }
         if let Some(slot) = self.workers.get_mut(id) {
-            slot.runtime.protocol = Some(identity.protocol);
-            slot.runtime.capabilities = Some(identity.capabilities);
-            slot.runtime.reconnect_attempt = 0;
-            slot.runtime.reconnect_at_unix_ms = None;
+            slot.runtime
+                .ready(identity, active_requests, request_capacity);
             if let Some(Operation::Add { reply, .. }) = slot.operation.as_mut() {
                 if let Some(reply) = reply.take() {
                     let mut dto = control::RemoteDto::persisted(&self.config.remotes[index]);
-                    dto.protocol_version = slot.runtime.protocol;
-                    dto.capabilities = slot.runtime.capabilities;
+                    apply_runtime(&mut dto, &slot.runtime);
                     let _ = reply.send(control::Response::RemoteAdded(dto));
                 }
                 slot.operation = None;
             }
+        }
+    }
+
+    fn load(&mut self, id: &str, active_requests: u32, request_capacity: u32) {
+        if let Some(slot) = self.workers.get_mut(id) {
+            slot.runtime.active_requests = Some(active_requests);
+            slot.runtime.request_capacity = Some(request_capacity);
         }
     }
 
@@ -971,13 +1030,15 @@ impl DaemonActor {
             let _ = self.save_current();
         }
         if let Some(slot) = self.workers.get_mut(id) {
-            slot.runtime.reconnect_attempt = slot.runtime.reconnect_attempt.saturating_add(1);
-            slot.runtime.reconnect_at_unix_ms =
-                Some(unix_ms().saturating_add(delay.as_millis() as u64));
+            slot.runtime
+                .retrying(unix_ms().saturating_add(delay.as_millis() as u64));
         }
     }
 
     fn permanent_failure(&mut self, id: &str, error: String) {
+        if let Some(slot) = self.workers.get_mut(id) {
+            slot.runtime.clear_connection();
+        }
         let pending = self
             .config
             .remote_by_selector(id)
@@ -1204,11 +1265,7 @@ impl DaemonActor {
     fn dto(&self, record: &config::RemoteRecord) -> control::RemoteDto {
         let mut dto = control::RemoteDto::persisted(record);
         if let Some(slot) = self.workers.get(&record.config_id) {
-            dto.protocol_version = slot.runtime.protocol;
-            dto.capabilities = slot.runtime.capabilities;
-            dto.reconnect_attempt =
-                (slot.runtime.reconnect_attempt > 0).then_some(slot.runtime.reconnect_attempt);
-            dto.reconnect_at_unix_ms = slot.runtime.reconnect_at_unix_ms;
+            apply_runtime(&mut dto, &slot.runtime);
         }
         dto
     }
@@ -1534,6 +1591,64 @@ mod tests {
         assert!(ready_can_promote(config::Lifecycle::Pending, false, false));
         assert!(!ready_can_promote(config::Lifecycle::Removing, true, false));
         assert!(!ready_can_promote(config::Lifecycle::Pending, false, true));
+    }
+
+    fn test_identity() -> RemoteIdentity {
+        RemoteIdentity {
+            endpoint_id: [1; 16],
+            protocol: 2,
+            capabilities: 63,
+        }
+    }
+
+    #[test]
+    fn runtime_dto_is_unknown_before_ready_and_populated_after_snapshot() {
+        let record = config::RemoteRecord {
+            config_id: "0123456789abcdef0123456789abcdef".into(),
+            name: "dev".into(),
+            target: "dev.example".into(),
+            endpoint_id: None,
+            lifecycle: config::Lifecycle::Active,
+            observed_state: config::ObservedState::Connecting,
+            state_changed_unix_ms: 1,
+            last_error: None,
+        };
+        let mut dto = control::RemoteDto::persisted(&record);
+        apply_runtime(&mut dto, &RuntimeState::default());
+        assert_eq!((dto.active_requests, dto.request_capacity), (None, None));
+
+        let mut runtime = RuntimeState::default();
+        runtime.ready(test_identity(), 2, 8);
+        apply_runtime(&mut dto, &runtime);
+        assert_eq!(
+            (dto.active_requests, dto.request_capacity),
+            (Some(2), Some(8))
+        );
+    }
+
+    #[test]
+    fn reconnect_clears_connection_snapshot_until_new_identity_and_ready() {
+        let mut runtime = RuntimeState::default();
+        runtime.ready(test_identity(), 2, 8);
+        runtime.retrying(1234);
+        assert_eq!(runtime.protocol, None);
+        assert_eq!(runtime.capabilities, None);
+        assert_eq!(runtime.active_requests, None);
+        assert_eq!(runtime.request_capacity, None);
+        assert_eq!(runtime.reconnect_attempt, 1);
+        assert_eq!(runtime.reconnect_at_unix_ms, Some(1234));
+
+        runtime.identity(test_identity());
+        assert_eq!(runtime.protocol, Some(2));
+        assert_eq!(runtime.capabilities, Some(63));
+        assert_eq!(runtime.active_requests, None);
+        assert_eq!(runtime.request_capacity, None);
+
+        runtime.ready(test_identity(), 0, 8);
+        assert_eq!(runtime.active_requests, Some(0));
+        assert_eq!(runtime.request_capacity, Some(8));
+        assert_eq!(runtime.reconnect_attempt, 0);
+        assert_eq!(runtime.reconnect_at_unix_ms, None);
     }
 
     #[test]

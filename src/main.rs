@@ -1,5 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
@@ -23,7 +25,7 @@ mod macos_process;
 #[cfg(target_os = "macos")]
 mod managed_ssh;
 
-const USAGE: &str = "ego-lite-bridge — headless reverse remote exec bridge for ego-browser\n\nUsage:\n  ego-lite-bridge start\n  ego-lite-bridge stop\n  ego-lite-bridge status\n  ego-lite-bridge remote add <name> <target>\n  ego-lite-bridge remote list\n  ego-lite-bridge remote status <name-or-config-id>\n  ego-lite-bridge remote retry <name-or-config-id>\n  ego-lite-bridge remote remove <name-or-config-id>\n  ego-lite-bridge --help\n  ego-lite-bridge --version";
+const USAGE: &str = "ego-lite-bridge — headless reverse remote exec bridge for ego-browser\n\nUsage:\n  ego-lite-bridge start\n  ego-lite-bridge stop\n  ego-lite-bridge status\n  ego-lite-bridge doctor [name-or-config-id]\n  ego-lite-bridge remote add <name> <target>\n  ego-lite-bridge remote list\n  ego-lite-bridge remote status <name-or-config-id>\n  ego-lite-bridge remote retry <name-or-config-id>\n  ego-lite-bridge remote remove <name-or-config-id>\n  ego-lite-bridge --help\n  ego-lite-bridge --version";
 #[cfg(target_os = "macos")]
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "macos")]
@@ -53,6 +55,7 @@ fn run(args: &[OsString]) -> io::Result<i32> {
         Some(command) if command == "start" && args.len() == 2 => run_start(),
         Some(command) if command == "stop" && args.len() == 2 => run_stop(),
         Some(command) if command == "status" && args.len() == 2 => run_status(),
+        Some(command) if command == "doctor" => run_doctor(&args[2..]),
         Some(command) if command == "remote" => run_remote(&args[2..]),
         Some(command) if command == "daemon" && args.len() == 4 && args[2] == "--ego-browser" => {
             run_daemon(Path::new(&args[3]))
@@ -184,11 +187,26 @@ fn run_status() -> io::Result<i32> {
     let socket = daemon::application_paths(&home_directory()?)?.control_socket;
     match control::probe(&socket, CONTROL_TIMEOUT) {
         Ok(control::Response::Status {
-            state: control::DaemonState::Running,
+            state,
             remote_count,
         }) => {
-            println!("running ({remote_count} remotes)");
-            Ok(0)
+            let response = control_request(&socket, control::Request::RemoteList)?;
+            match status_lines(state, remote_count, response) {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                    Ok(if state == control::DaemonState::Running {
+                        0
+                    } else {
+                        1
+                    })
+                }
+                Err(error) => {
+                    eprintln!("unhealthy: {error}");
+                    Ok(1)
+                }
+            }
         }
         Ok(response) => {
             eprintln!("unhealthy: unexpected response: {response:?}");
@@ -208,6 +226,213 @@ fn run_status() -> io::Result<i32> {
 #[cfg(not(target_os = "macos"))]
 fn run_status() -> io::Result<i32> {
     unsupported("status")
+}
+
+#[cfg(target_os = "macos")]
+fn control_request(socket: &Path, request: control::Request) -> io::Result<control::Response> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    control::request(&mut stream, CONTROL_TIMEOUT, request)
+        .map_err(|error| control_io_error(&error))
+}
+
+#[cfg(target_os = "macos")]
+fn run_doctor(args: &[OsString]) -> io::Result<i32> {
+    let selector = match doctor_selector(args) {
+        Ok(selector) => selector,
+        Err(message) => {
+            eprintln!("ego-lite-bridge: {message}");
+            return Ok(2);
+        }
+    };
+    let home = home_directory()?;
+    let paths = daemon::application_paths(&home)?;
+    let mut checks = Vec::new();
+    checks.push(match launchd::loaded(unsafe { libc::geteuid() }) {
+        Ok(loaded) => check(
+            "mac.launchd",
+            loaded,
+            if loaded { "loaded" } else { "not loaded" },
+        ),
+        Err(error) => format!("FAIL mac.launchd: check failed: {error}"),
+    });
+
+    let status = control::probe(&paths.control_socket, CONTROL_TIMEOUT);
+    let daemon_running = matches!(
+        status,
+        Ok(control::Response::Status {
+            state: control::DaemonState::Running,
+            ..
+        })
+    );
+    checks.push(match &status {
+        Ok(control::Response::Status { state, .. }) => check(
+            "mac.daemon",
+            *state == control::DaemonState::Running,
+            daemon_state(*state),
+        ),
+        Ok(response) => format!("FAIL mac.daemon: unexpected response: {response:?}"),
+        Err(error) => format!("FAIL mac.daemon: {error}"),
+    });
+    checks.push(browser_check(&paths.directory));
+
+    if daemon_running {
+        let response = match selector {
+            Some(selector) => control_request(
+                &paths.control_socket,
+                control::Request::RemoteStatus {
+                    selector: selector.into(),
+                },
+            ),
+            None => control_request(&paths.control_socket, control::Request::RemoteList),
+        };
+        match response {
+            Ok(control::Response::RemoteStatus(remote)) => remote_checks(&remote, &mut checks),
+            Ok(control::Response::RemoteList(remotes)) => {
+                for remote in &remotes {
+                    remote_checks(remote, &mut checks);
+                }
+            }
+            Ok(control::Response::Error { code, message }) => {
+                checks.push(format!("FAIL remote.selector: {code}: {message}"));
+            }
+            Ok(response) => checks.push(format!(
+                "FAIL remote.status: unexpected response: {response:?}"
+            )),
+            Err(error) => checks.push(format!("FAIL remote.status: {error}")),
+        }
+    }
+
+    for line in &checks {
+        println!("{line}");
+    }
+    Ok(if checks.iter().any(|line| line.starts_with("FAIL ")) {
+        1
+    } else {
+        0
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn browser_check(directory: &Path) -> String {
+    let result = validate_existing_application_directory(directory)
+        .and_then(config::ConfigStore::open)
+        .and_then(|store| store.load())
+        .and_then(|config| {
+            config.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "config not found"))
+        })
+        .and_then(|config| daemon::validate_ego_browser(Path::new(&config.ego_browser_path)));
+    match result {
+        Ok(path) => format!(
+            "PASS mac.browser: valid configured executable {}",
+            path.display()
+        ),
+        Err(error) => format!("FAIL mac.browser: configured executable invalid: {error}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_existing_application_directory(path: &Path) -> io::Result<&Path> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "application directory must be owned by the current user with mode 0700",
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn doctor_selector(args: &[OsString]) -> Result<Option<&str>, &'static str> {
+    match args {
+        [] => Ok(None),
+        [selector] => selector
+            .to_str()
+            .map(Some)
+            .ok_or("remote selector is not valid UTF-8"),
+        _ => Err("doctor accepts at most one remote selector"),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn check(scope: &str, passed: bool, detail: &str) -> String {
+    format!("{} {scope}: {detail}", if passed { "PASS" } else { "FAIL" })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn remote_checks(remote: &control::RemoteDto, checks: &mut Vec<String>) {
+    let scope = format!("remote.{}", remote.name);
+    let connected = remote.lifecycle == config::Lifecycle::Active
+        && remote.observed_state == config::ObservedState::Connected;
+    checks.push(check(
+        &format!("{scope}.state"),
+        connected,
+        &format!(
+            "daemon snapshot desired={} observed={}",
+            lifecycle(remote.lifecycle),
+            observed_state(remote.observed_state)
+        ),
+    ));
+    checks.push(check(
+        &format!("{scope}.configured_identity"),
+        remote.endpoint_id.is_some(),
+        if remote.endpoint_id.is_some() {
+            "present"
+        } else {
+            "unknown"
+        },
+    ));
+    let protocol_ok = connected
+        && remote.protocol_version == Some(ego_bridge::PROTOCOL_VERSION)
+        && remote.capabilities == Some(ego_bridge::PROTOCOL_CAPABILITIES);
+    checks.push(check(
+        &format!("{scope}.handshake"),
+        protocol_ok,
+        &format!(
+            "currently known v{} capabilities={}",
+            number(remote.protocol_version),
+            hex(remote.capabilities)
+        ),
+    ));
+    let capacity_ok = connected
+        && matches!(
+            (remote.active_requests, remote.request_capacity),
+            (Some(active), Some(total)) if active <= total
+        );
+    checks.push(check(
+        &format!("{scope}.capacity"),
+        capacity_ok,
+        &format!(
+            "{} active",
+            capacity(remote.active_requests, remote.request_capacity)
+        ),
+    ));
+    let reconnect_ok = connected
+        && remote.reconnect_attempt.is_none()
+        && remote.reconnect_at_unix_ms.is_none()
+        && remote.last_error.is_none();
+    checks.push(check(
+        &format!("{scope}.reconnect"),
+        reconnect_ok,
+        &format!(
+            "attempt={} at={} error={}",
+            number(remote.reconnect_attempt),
+            number(remote.reconnect_at_unix_ms),
+            option(remote.last_error.as_deref())
+        ),
+    ));
+    checks.push(format!(
+        "NOT CHECKED {scope}.live_endpoint: no new SSH, socket permission check, or end-to-end probe"
+    ));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_doctor(_args: &[OsString]) -> io::Result<i32> {
+    unsupported("doctor")
 }
 
 #[cfg(target_os = "macos")]
@@ -264,15 +489,17 @@ fn run_remote(args: &[OsString]) -> io::Result<i32> {
     let response = control::request(&mut stream, timeout, request)
         .map_err(|error| control_io_error(&error))?;
     match response {
-        control::Response::RemoteAdded(remote)
-        | control::Response::RemoteStatus(remote)
-        | control::Response::RemoteRetryAccepted(remote) => {
-            print_remote(&remote);
+        control::Response::RemoteAdded(remote) | control::Response::RemoteRetryAccepted(remote) => {
+            print_remote_list(&remote);
+            Ok(0)
+        }
+        control::Response::RemoteStatus(remote) => {
+            print_remote_status(&remote);
             Ok(0)
         }
         control::Response::RemoteList(remotes) => {
             for remote in &remotes {
-                print_remote(remote);
+                print_remote_list(remote);
             }
             Ok(0)
         }
@@ -310,14 +537,116 @@ fn remote_argument<'a>(value: &'a OsStr, description: &str) -> io::Result<&'a st
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn status_lines(
+    state: control::DaemonState,
+    remote_count: u32,
+    response: control::Response,
+) -> Result<Vec<String>, String> {
+    let control::Response::RemoteList(remotes) = response else {
+        return Err(format!("unexpected response: {response:?}"));
+    };
+    let mut lines = vec![format!(
+        "daemon={} remotes={remote_count}",
+        daemon_state(state)
+    )];
+    lines.extend(remotes.iter().map(|remote| {
+        format!(
+            "{} desired={} observed={}",
+            remote.name,
+            lifecycle(remote.lifecycle),
+            observed_state(remote.observed_state)
+        )
+    }));
+    Ok(lines)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn lifecycle(value: config::Lifecycle) -> &'static str {
+    match value {
+        config::Lifecycle::Pending => "pending",
+        config::Lifecycle::Active => "active",
+        config::Lifecycle::Removing => "removing",
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn observed_state(value: config::ObservedState) -> &'static str {
+    match value {
+        config::ObservedState::Connecting => "connecting",
+        config::ObservedState::Connected => "connected",
+        config::ObservedState::Reconnecting => "reconnecting",
+        config::ObservedState::Error => "error",
+        config::ObservedState::Removing => "removing",
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn daemon_state(value: control::DaemonState) -> &'static str {
+    match value {
+        control::DaemonState::Running => "running",
+        control::DaemonState::Stopping => "stopping",
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn print_remote(remote: &control::RemoteDto) {
+fn print_remote_list(remote: &control::RemoteDto) {
     println!(
-        "{}\t{}\t{}\t{:?}/{:?}",
-        remote.config_id, remote.name, remote.target, remote.lifecycle, remote.observed_state
+        "{}\t{}\t{}\tdesired={} observed={}",
+        remote.config_id,
+        remote.name,
+        remote.target,
+        lifecycle(remote.lifecycle),
+        observed_state(remote.observed_state)
     );
-    if let Some(error) = &remote.last_error {
-        println!("  error: {error}");
+}
+
+#[cfg(target_os = "macos")]
+fn print_remote_status(remote: &control::RemoteDto) {
+    println!("config-id: {}", remote.config_id);
+    println!("name: {}", remote.name);
+    println!("target: {}", remote.target);
+    println!("desired: {}", lifecycle(remote.lifecycle));
+    println!("observed: {}", observed_state(remote.observed_state));
+    println!("state-changed-unix-ms: {}", remote.state_changed_unix_ms);
+    println!("last-error: {}", option(remote.last_error.as_deref()));
+    println!("protocol-version: {}", number(remote.protocol_version));
+    println!("capabilities: {}", hex(remote.capabilities));
+    println!("reconnect-attempt: {}", number(remote.reconnect_attempt));
+    println!(
+        "reconnect-at-unix-ms: {}",
+        number(remote.reconnect_at_unix_ms)
+    );
+    println!(
+        "active-requests: {}",
+        capacity(remote.active_requests, remote.request_capacity)
+    );
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn option(value: Option<&str>) -> &str {
+    value.unwrap_or("unknown")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn number<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn hex(value: Option<u64>) -> String {
+    value
+        .map(|value| format!("{value:#x}"))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn capacity(active: Option<u32>, total: Option<u32>) -> String {
+    match (active, total) {
+        (Some(active), Some(total)) => format!("{active}/{total}"),
+        _ => "unknown".into(),
     }
 }
 
@@ -458,6 +787,104 @@ mod tests {
             run(&["ego-lite-bridge".into(), "unknown".into()]).expect("dispatch"),
             2
         );
+    }
+
+    fn remote() -> control::RemoteDto {
+        control::RemoteDto {
+            config_id: "0123456789abcdef0123456789abcdef".into(),
+            name: "dev".into(),
+            target: "user@host".into(),
+            endpoint_id: Some("fedcba9876543210fedcba9876543210".into()),
+            lifecycle: config::Lifecycle::Active,
+            observed_state: config::ObservedState::Connected,
+            state_changed_unix_ms: 42,
+            last_error: None,
+            protocol_version: Some(ego_bridge::PROTOCOL_VERSION),
+            capabilities: Some(ego_bridge::PROTOCOL_CAPABILITIES),
+            active_requests: Some(1),
+            request_capacity: Some(8),
+            reconnect_attempt: None,
+            reconnect_at_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn status_helpers_label_values_and_unknown_runtime() {
+        assert_eq!(lifecycle(config::Lifecycle::Active), "active");
+        assert_eq!(
+            observed_state(config::ObservedState::Reconnecting),
+            "reconnecting"
+        );
+        assert_eq!(capacity(None, Some(8)), "unknown");
+        assert_eq!(hex(Some(63)), "0x3f");
+        assert_eq!(
+            status_lines(
+                control::DaemonState::Running,
+                1,
+                control::Response::RemoteList(vec![remote()])
+            ),
+            Ok(vec![
+                "daemon=running remotes=1".into(),
+                "dev desired=active observed=connected".into()
+            ])
+        );
+        assert!(status_lines(
+            control::DaemonState::Running,
+            1,
+            control::Response::Error {
+                code: control::ErrorCode::DaemonStopping,
+                message: "stopping".into()
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn doctor_parser_accepts_zero_or_one_utf8_selector() {
+        assert_eq!(doctor_selector(&[]), Ok(None));
+        assert_eq!(doctor_selector(&["dev".into()]), Ok(Some("dev")));
+        assert!(doctor_selector(&["a".into(), "b".into()]).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert!(doctor_selector(&[OsString::from_vec(vec![0xff])]).is_err());
+        }
+    }
+
+    #[test]
+    fn doctor_aggregates_remote_health_and_unknown_is_failure() {
+        let mut checks = Vec::new();
+        remote_checks(&remote(), &mut checks);
+        assert!(checks.iter().any(|line| {
+            line == "PASS remote.dev.state: daemon snapshot desired=active observed=connected"
+        }));
+        assert!(checks
+            .iter()
+            .any(|line| line == "PASS remote.dev.configured_identity: present"));
+        assert!(checks
+            .iter()
+            .any(|line| line.starts_with("PASS remote.dev.handshake: currently known v2")));
+        assert!(checks.iter().any(|line| line.starts_with(
+            "NOT CHECKED remote.dev.live_endpoint: no new SSH, socket permission check"
+        )));
+        assert!(!checks.iter().any(|line| line.starts_with("FAIL ")));
+
+        let mut unhealthy = remote();
+        unhealthy.observed_state = config::ObservedState::Reconnecting;
+        unhealthy.active_requests = None;
+        unhealthy.request_capacity = None;
+        unhealthy.last_error = Some("channel lost".into());
+        unhealthy.reconnect_attempt = Some(2);
+        remote_checks(&unhealthy, &mut checks);
+        assert!(checks.iter().any(|line| {
+            line == "FAIL remote.dev.state: daemon snapshot desired=active observed=reconnecting"
+        }));
+        assert!(checks
+            .iter()
+            .any(|line| line == "FAIL remote.dev.capacity: unknown active"));
+        assert!(checks.iter().any(|line| {
+            line == "FAIL remote.dev.reconnect: attempt=2 at=unknown error=channel lost"
+        }));
     }
 
     #[test]

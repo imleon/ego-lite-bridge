@@ -146,6 +146,11 @@ pub(crate) fn bootout(uid: u32) -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn loaded(uid: u32) -> io::Result<bool> {
+    Ok(run_launchctl(&print_args(uid))?.success())
+}
+
+#[cfg(target_os = "macos")]
 fn run_launchctl(args: &[OsString]) -> io::Result<ExitStatus> {
     Command::new("launchctl")
         .args(args)

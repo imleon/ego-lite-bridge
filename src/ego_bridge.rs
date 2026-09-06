@@ -26,14 +26,14 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
 const CAPABILITY_BINARY_ARGV: u64 = 1 << 0;
 const CAPABILITY_STDIO_STREAMS: u64 = 1 << 1;
 const CAPABILITY_REQUEST_CANCEL: u64 = 1 << 2;
 const CAPABILITY_SIGNAL_EXIT: u64 = 1 << 3;
 const CAPABILITY_BROKER_OWNERSHIP: u64 = 1 << 4;
 const CAPABILITY_MULTIPLEXING: u64 = 1 << 5;
-const PROTOCOL_CAPABILITIES: u64 = CAPABILITY_BINARY_ARGV
+pub(crate) const PROTOCOL_CAPABILITIES: u64 = CAPABILITY_BINARY_ARGV
     | CAPABILITY_STDIO_STREAMS
     | CAPABILITY_REQUEST_CANCEL
     | CAPABILITY_SIGNAL_EXIT
@@ -2459,8 +2459,19 @@ impl TryCloneStream for crate::ipc::LocalStream {
 #[derive(Debug)]
 pub(crate) enum RemoteWorkerEvent {
     Identity(RemoteIdentity),
-    Ready(RemoteIdentity),
-    Retrying { error: String, delay: Duration },
+    Ready {
+        identity: RemoteIdentity,
+        active_requests: u32,
+        request_capacity: u32,
+    },
+    Load {
+        active_requests: u32,
+        request_capacity: u32,
+    },
+    Retrying {
+        error: String,
+        delay: Duration,
+    },
     PermanentFailure(String),
     Stopped,
 }
@@ -2638,9 +2649,11 @@ fn remote_worker_loop(
             cancelled,
             budget,
             &mut approve,
-            |identity| {
-                connected_at = Some(Instant::now());
-                event(RemoteWorkerEvent::Ready(identity));
+            &mut |worker_event| {
+                if matches!(worker_event, RemoteWorkerEvent::Ready { .. }) {
+                    connected_at = Some(Instant::now());
+                }
+                event(worker_event);
             },
         );
         let status = ssh_group.stop_and_wait(&mut child);
@@ -2740,7 +2753,7 @@ fn run_serve_child(
     cancelled: &AtomicBool,
     budget: &ResourceBudget,
     approve: &mut impl FnMut(RemoteIdentity) -> io::Result<RemoteApproval>,
-    connected: impl FnOnce(RemoteIdentity),
+    event: &mut impl FnMut(RemoteWorkerEvent),
 ) -> io::Result<()> {
     let channel_out = child
         .stdin
@@ -2813,7 +2826,11 @@ fn run_serve_child(
     let channel_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(channel_out.into_raw_fd()) };
     let (channel_out, writer_failed) =
         start_channel_writer_with_budget(channel_fd, Some(budget.clone()))?;
-    connected(identity);
+    event(RemoteWorkerEvent::Ready {
+        identity,
+        active_requests: 0,
+        request_capacity: MAX_CONCURRENT_REQUESTS as u32,
+    });
 
     let result = serve_requests(
         &inbound,
@@ -2822,6 +2839,12 @@ fn run_serve_child(
         ego_browser.as_os_str(),
         Some(cancelled),
         budget,
+        |active_requests| {
+            event(RemoteWorkerEvent::Load {
+                active_requests,
+                request_capacity: MAX_CONCURRENT_REQUESTS as u32,
+            });
+        },
     );
     let shutdown = channel_out.shutdown();
     result.and(shutdown)
@@ -2852,9 +2875,11 @@ fn serve_requests(
     program: &OsStr,
     cancelled: Option<&AtomicBool>,
     budget: &ResourceBudget,
+    mut load_changed: impl FnMut(u32),
 ) -> io::Result<()> {
     let (completed_sender, completed) = mpsc::channel();
     let mut routes = HashMap::<u64, ExecutorRoute>::new();
+    let mut reported_routes = 0;
     let mut next_generation = 0_u64;
     let result = (|| loop {
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
@@ -2863,7 +2888,12 @@ fn serve_requests(
         if writer_failed.try_recv().is_ok() {
             return Err(channel_out.channel_error());
         }
-        drain_executor_completions(&completed, &mut routes)?;
+        drain_executor_completions(
+            &completed,
+            &mut routes,
+            &mut reported_routes,
+            &mut load_changed,
+        )?;
 
         let Some(incoming) = inbound.pop_timeout_matching(EXEC_POLL_INTERVAL, |request_id| {
             routes.get(&request_id).is_none_or(|route| {
@@ -2902,15 +2932,34 @@ fn serve_requests(
                 channel_out.control_committed(EgoBridgeMessage::OwnerProbeAck { nonce })?;
             }
             EgoBridgeMessage::Open { request_id, argv } => {
-                drain_executor_completions(&completed, &mut routes)?;
+                drain_executor_completions(
+                    &completed,
+                    &mut routes,
+                    &mut reported_routes,
+                    &mut load_changed,
+                )?;
+                report_executor_load(&routes, &mut reported_routes, &mut load_changed);
                 if let Some(generation) = routes.get(&request_id).and_then(|route| {
                     route
                         .retiring
                         .load(Ordering::Acquire)
                         .then_some(route.generation)
                 }) {
-                    wait_for_executor_completion(request_id, generation, &completed, &mut routes)?;
-                    drain_executor_completions(&completed, &mut routes)?;
+                    wait_for_executor_completion(
+                        request_id,
+                        generation,
+                        &completed,
+                        &mut routes,
+                        &mut reported_routes,
+                        &mut load_changed,
+                    )?;
+                    drain_executor_completions(
+                        &completed,
+                        &mut routes,
+                        &mut reported_routes,
+                        &mut load_changed,
+                    )?;
+                    report_executor_load(&routes, &mut reported_routes, &mut load_changed);
                 }
                 if routes.contains_key(&request_id) {
                     channel_out.terminal(EgoBridgeMessage::Error {
@@ -2972,6 +3021,7 @@ fn serve_requests(
                         worker,
                     },
                 );
+                report_executor_load(&routes, &mut reported_routes, &mut load_changed);
                 eprintln!("ego-lite-bridge: request {request_id} started");
             }
             message @ EgoBridgeMessage::Stdin { request_id, .. } => {
@@ -3023,7 +3073,22 @@ fn serve_requests(
     for (_, route) in routes {
         let _ = route.worker.join();
     }
+    if reported_routes != 0 {
+        load_changed(0);
+    }
     result
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn report_executor_load(
+    routes: &HashMap<u64, ExecutorRoute>,
+    reported_routes: &mut usize,
+    load_changed: &mut impl FnMut(u32),
+) {
+    if routes.len() != *reported_routes {
+        *reported_routes = routes.len();
+        load_changed(routes.len() as u32);
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -3039,9 +3104,12 @@ fn inbound_overload_error(request_id: u64, budget_exhausted: bool) -> String {
 fn drain_executor_completions(
     completed: &mpsc::Receiver<(u64, u64, io::Result<()>)>,
     routes: &mut HashMap<u64, ExecutorRoute>,
+    reported_routes: &mut usize,
+    load_changed: &mut impl FnMut(u32),
 ) -> io::Result<()> {
     while let Ok((request_id, generation, result)) = completed.try_recv() {
         reap_executor_completion(request_id, generation, result, routes)?;
+        report_executor_load(routes, reported_routes, load_changed);
     }
     Ok(())
 }
@@ -3052,12 +3120,15 @@ fn wait_for_executor_completion(
     generation: u64,
     completed: &mpsc::Receiver<(u64, u64, io::Result<()>)>,
     routes: &mut HashMap<u64, ExecutorRoute>,
+    reported_routes: &mut usize,
+    load_changed: &mut impl FnMut(u32),
 ) -> io::Result<()> {
     loop {
         let (completed_id, completed_generation, result) = completed
             .recv()
             .map_err(|_| io::Error::other("executor completion queue stopped"))?;
         reap_executor_completion(completed_id, completed_generation, result, routes)?;
+        report_executor_load(routes, reported_routes, load_changed);
         if completed_id == request_id && completed_generation == generation {
             return Ok(());
         }
@@ -3455,23 +3526,8 @@ mod tests {
     const TEST_PROBE_NONCE: ProbeNonce = ProbeNonce([3; 16]);
 
     fn pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
-        use std::os::fd::FromRawFd as _;
-        let mut fds = [0; 2];
-        // SAFETY: pipe initializes both descriptors on success.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        for fd in fds {
-            // SAFETY: fcntl updates flags on descriptors returned by pipe.
-            assert_ne!(
-                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
-                -1
-            );
-        }
-        unsafe {
-            (
-                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
-                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
-            )
-        }
+        let (read, write) = UnixStream::pair().expect("socket pair");
+        (read.into(), write.into())
     }
 
     fn start_captured_writer() -> (ChannelWriter, mpsc::Receiver<()>, Arc<Mutex<Vec<u8>>>) {
@@ -5047,6 +5103,7 @@ mod tests {
                 OsStr::new("/bin/sh"),
                 None,
                 &ResourceBudget::default(),
+                |_| {},
             )
         });
         (TestExecutorSender(inbound), output, worker)
@@ -5171,31 +5228,57 @@ mod tests {
     }
 
     #[test]
-    fn output_failure_cancels_and_reaps_long_running_child() {
-        let (_sender, receiver) = mpsc::sync_channel(1);
+    fn output_failure_cancels_and_waits_for_long_running_child() {
+        let (sender, receiver) = mpsc::sync_channel(1);
         let (read, write) = pipe();
-        drop(read);
+        let mut read = std::fs::File::from(read);
         let (output, _writer_failed) = start_channel_writer(write).expect("start writer");
+        let pending_input = Arc::new(AtomicUsize::new(1));
         let cancelled = Arc::new(AtomicBool::new(false));
-        let started = Instant::now();
 
-        let error = execute_request(
-            OsStr::new("/bin/sh"),
-            39,
-            &["-c".into(), "printf output; exec sleep 30".into()],
-            receiver,
-            &Arc::new(AtomicUsize::new(0)),
-            &cancelled,
-            &Arc::new(AtomicBool::new(false)),
-            &Arc::new(Mutex::new(None)),
-            &output,
-            &ResourceBudget::default(),
-        )
-        .expect_err("preserve channel write failure");
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                execute_request(
+                    OsStr::new("/bin/sh"),
+                    39,
+                    &[
+                        "-c".into(),
+                        "printf %s \"$$\"; read _; printf output; read _".into(),
+                    ],
+                    receiver,
+                    &pending_input,
+                    &cancelled,
+                    &Arc::new(AtomicBool::new(false)),
+                    &Arc::new(Mutex::new(None)),
+                    &output,
+                    &ResourceBudget::default(),
+                )
+            });
+            let child_pid = match read_message(&mut read) {
+                Ok(EgoBridgeMessage::Stdout {
+                    request_id: 39,
+                    data,
+                }) => std::str::from_utf8(&data)
+                    .expect("child PID is UTF-8")
+                    .parse::<libc::pid_t>()
+                    .expect("child PID is numeric"),
+                message => panic!("unexpected child start message: {message:?}"),
+            };
+            assert_eq!(unsafe { libc::kill(child_pid, 0) }, 0);
+            drop(read);
+            let started = Instant::now();
+            sender
+                .send(RequestInput::Stdin(b"\n".to_vec(), None))
+                .expect("release child after closing output sink");
 
-        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-        assert!(cancelled.load(Ordering::Acquire));
-        assert!(started.elapsed() < Duration::from_secs(2));
+            let error = worker
+                .join()
+                .expect("request worker")
+                .expect_err("preserve channel write failure");
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert!(cancelled.load(Ordering::Acquire));
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
     }
 
     #[test]
@@ -5420,6 +5503,7 @@ mod tests {
                 OsStr::new("/bin/sh"),
                 None,
                 &ResourceBudget::default(),
+                |_| {},
             )
         });
 
@@ -5477,6 +5561,43 @@ mod tests {
             2
         );
         drop(sender);
+        assert!(worker.join().expect("executor worker").is_err());
+    }
+
+    #[test]
+    fn executor_load_tracks_overlapping_cancel_and_teardown_without_duplicates() {
+        let inbound = InboundScheduler::new(false);
+        let sender = TestExecutorSender(Arc::clone(&inbound));
+        let (worker_output, writer_failed, _output) = start_captured_writer();
+        let (loads, reported) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            serve_requests(
+                &inbound,
+                &worker_output,
+                &writer_failed,
+                OsStr::new("/bin/sh"),
+                None,
+                &ResourceBudget::default(),
+                |active| loads.send(active).expect("record load"),
+            )
+        });
+        for request_id in [1, 2] {
+            sender
+                .send(Ok(EgoBridgeMessage::Open {
+                    request_id,
+                    argv: vec![b"-c".to_vec(), b"exec sleep 30".to_vec()],
+                }))
+                .expect("open request");
+        }
+        assert_eq!(reported.recv_timeout(Duration::from_secs(2)), Ok(1));
+        assert_eq!(reported.recv_timeout(Duration::from_secs(2)), Ok(2));
+        sender
+            .send(Ok(EgoBridgeMessage::Cancel { request_id: 1 }))
+            .expect("cancel first request");
+        assert_eq!(reported.recv_timeout(Duration::from_secs(2)), Ok(1));
+        drop(sender);
+        assert_eq!(reported.recv_timeout(Duration::from_secs(2)), Ok(0));
+        assert!(reported.recv_timeout(Duration::from_millis(100)).is_err());
         assert!(worker.join().expect("executor worker").is_err());
     }
 
