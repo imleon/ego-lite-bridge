@@ -118,6 +118,11 @@ fn ready_can_promote(lifecycle: config::Lifecycle, removing: bool, deadline_elap
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn stopped_confirms_cleanup(require_ready: bool, ready: bool, timed_out: bool) -> bool {
+    !require_ready || ready && !timed_out
+}
+
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 struct StartupCleanup {
     expected_endpoint: String,
@@ -355,7 +360,7 @@ impl DaemonActor {
             if let Err(error) = self.spawn_worker(
                 &id,
                 Some(Operation::Remove {
-                    grace: now + STOP_GRACE,
+                    grace: now + STOP_DEADLINE,
                     deadline: now + STOP_DEADLINE,
                     replies: Vec::new(),
                     timed_out: false,
@@ -704,11 +709,19 @@ impl DaemonActor {
             .remote_by_selector(id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "remote record disappeared"))?;
         let expected = record.endpoint_id.as_deref().map(parse_id).transpose()?;
+        let retry_owner_conflict = matches!(
+            operation,
+            Some(Operation::Remove {
+                require_ready: true,
+                ..
+            })
+        );
         let (worker, events) = RemoteWorker::spawn(
             record.target.clone(),
             expected,
             self.browser.clone(),
             self.budget.clone(),
+            retry_owner_conflict,
         )?;
         let sender = self.messages.clone();
         let event_id = id.to_owned();
@@ -872,16 +885,20 @@ impl DaemonActor {
             if let Some(Operation::Remove {
                 require_ready: true,
                 ready,
+                deadline,
+                timed_out,
                 ..
             }) = slot.operation.as_mut()
             {
-                let mut transition = StartupCleanup {
-                    expected_endpoint: String::new(),
-                    ready: *ready,
-                    error: None,
-                };
-                transition.ready();
-                *ready = transition.cleanup_confirmed();
+                if !*timed_out && Instant::now() < *deadline {
+                    let mut transition = StartupCleanup {
+                        expected_endpoint: String::new(),
+                        ready: *ready,
+                        error: None,
+                    };
+                    transition.ready();
+                    *ready = transition.cleanup_confirmed();
+                }
                 slot.worker.cancel();
                 return;
             }
@@ -1027,8 +1044,11 @@ impl DaemonActor {
                 replies,
                 require_ready,
                 ready,
+                timed_out,
                 ..
-            }) if !require_ready || ready => self.finish_remove(id, replies),
+            }) if stopped_confirms_cleanup(require_ready, ready, timed_out) => {
+                self.finish_remove(id, replies)
+            }
             Some(Operation::Remove { replies, .. }) => {
                 if let Some(record) = self
                     .config
@@ -1555,6 +1575,32 @@ mod tests {
         assert!(
             !conflict.cleanup_confirmed(),
             "owner conflict retains tombstone"
+        );
+    }
+
+    #[test]
+    fn startup_cleanup_retries_owner_conflict_then_confirms_ready_stopped() {
+        let endpoint = "0123456789abcdef0123456789abcdef";
+        let mut cleanup = StartupCleanup {
+            expected_endpoint: endpoint.into(),
+            ready: false,
+            error: None,
+        };
+        assert!(crate::ego_bridge::owner_conflict_is_retryable(
+            true,
+            io::ErrorKind::AddrInUse
+        ));
+        assert_eq!(cleanup.identity(endpoint, None), Ok(()));
+        cleanup.ready();
+        assert!(cleanup.cleanup_confirmed());
+    }
+
+    #[test]
+    fn startup_cleanup_ready_then_timeout_stopped_retains_tombstone() {
+        assert!(!stopped_confirms_cleanup(true, true, true));
+        assert!(
+            stopped_confirms_cleanup(false, true, true),
+            "normal remove preserves late Stopped cleanup semantics"
         );
     }
 

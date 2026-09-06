@@ -2487,6 +2487,7 @@ impl RemoteWorker {
         expected_endpoint: Option<[u8; 16]>,
         ego_browser: PathBuf,
         budget: ResourceBudget,
+        retry_owner_conflict: bool,
     ) -> io::Result<(Self, mpsc::Receiver<RemoteWorkerEvent>)> {
         let owner_id = OwnerId(random_id()?);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -2504,6 +2505,7 @@ impl RemoteWorker {
                 &worker_cancelled,
                 &worker_group,
                 &budget,
+                retry_owner_conflict,
                 |identity| {
                     events
                         .send(RemoteWorkerEvent::Identity(identity))
@@ -2606,6 +2608,7 @@ fn remote_worker_loop(
     cancelled: &AtomicBool,
     ssh_group: &crate::macos_process::ProcessGroup,
     budget: &ResourceBudget,
+    retry_owner_conflict: bool,
     mut approve: impl FnMut(RemoteIdentity) -> io::Result<RemoteApproval>,
     mut event: impl FnMut(RemoteWorkerEvent),
 ) -> io::Result<()> {
@@ -2654,13 +2657,16 @@ fn remote_worker_loop(
             return Ok(());
         }
         if let Err(error) = result {
-            if matches!(
+            if owner_conflict_is_retryable(retry_owner_conflict, error.kind()) {
+                wait_to_reconnect(cancelled, &mut failures, error.to_string(), &mut event);
+            } else if matches!(
                 error.kind(),
                 io::ErrorKind::InvalidInput | io::ErrorKind::AddrInUse
             ) {
                 return Err(error);
+            } else {
+                wait_to_reconnect(cancelled, &mut failures, error.to_string(), &mut event);
             }
-            wait_to_reconnect(cancelled, &mut failures, error.to_string(), &mut event);
         } else {
             wait_to_reconnect(
                 cancelled,
@@ -2704,6 +2710,11 @@ fn ssh_spawn_error_is_permanent(kind: io::ErrorKind) -> bool {
         kind,
         io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput
     )
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn owner_conflict_is_retryable(cleanup: bool, kind: io::ErrorKind) -> bool {
+    cleanup && kind == io::ErrorKind::AddrInUse
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -5689,6 +5700,19 @@ mod tests {
         ));
         assert!(ssh_spawn_error_is_permanent(io::ErrorKind::InvalidInput));
         assert!(!ssh_spawn_error_is_permanent(io::ErrorKind::ResourceBusy));
+    }
+
+    #[test]
+    fn owner_conflict_is_retryable_only_for_startup_cleanup() {
+        assert!(owner_conflict_is_retryable(true, io::ErrorKind::AddrInUse));
+        assert!(!owner_conflict_is_retryable(
+            false,
+            io::ErrorKind::AddrInUse
+        ));
+        assert!(!owner_conflict_is_retryable(
+            true,
+            io::ErrorKind::InvalidInput
+        ));
     }
 
     #[test]
