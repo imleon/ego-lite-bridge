@@ -71,14 +71,6 @@ pub(crate) fn bootstrap_args(uid: u32, path: &Path) -> Vec<OsString> {
     ]
 }
 
-pub(crate) fn kickstart_args(uid: u32) -> Vec<OsString> {
-    vec![
-        "kickstart".into(),
-        "-k".into(),
-        format!("gui/{uid}/{LABEL}").into(),
-    ]
-}
-
 pub(crate) fn bootout_args(uid: u32) -> Vec<OsString> {
     vec!["bootout".into(), format!("gui/{uid}/{LABEL}").into()]
 }
@@ -145,19 +137,6 @@ fn start_with(
             )));
         }
     }
-    let kickstart = run(&kickstart_args(uid))?;
-    if !kickstart.success() {
-        let cleanup = run(&bootout_args(uid));
-        return Err(io::Error::other(match cleanup {
-            Ok(status) if status.success() => format!("launchctl kickstart failed: {kickstart}"),
-            Ok(status) => {
-                format!("launchctl kickstart failed ({kickstart}) and cleanup failed ({status})")
-            }
-            Err(error) => format!(
-                "launchctl kickstart failed ({kickstart}) and cleanup could not run: {error}"
-            ),
-        }));
-    }
     Ok(())
 }
 
@@ -221,14 +200,6 @@ mod tests {
             ["bootstrap", "gui/501", path.to_str().expect("UTF-8 path")]
         );
         assert_eq!(
-            kickstart_args(501),
-            [
-                "kickstart",
-                "-k",
-                "gui/501/com.github.imleon.ego-lite-bridge"
-            ]
-        );
-        assert_eq!(
             bootout_args(501),
             ["bootout", "gui/501/com.github.imleon.ego-lite-bridge"]
         );
@@ -239,35 +210,30 @@ mod tests {
     }
 
     #[test]
-    fn failed_bootstrap_boots_out_retries_then_kickstarts() {
+    fn bootstrap_starts_run_at_load_job_without_kickstart() {
         let mut calls = Vec::new();
-        let mut results = [false, true, true, true].into_iter();
+        start_with(501, Path::new("/tmp/job.plist"), |args| {
+            calls.push(args.to_vec());
+            Ok(status(true))
+        })
+        .expect("bootstrap job");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0], "bootstrap");
+    }
+
+    #[test]
+    fn failed_bootstrap_boots_out_then_retries_once() {
+        let mut calls = Vec::new();
+        let mut results = [false, true, true].into_iter();
         start_with(501, Path::new("/tmp/job.plist"), |args| {
             calls.push(args.to_vec());
             Ok(status(results.next().expect("expected command")))
         })
         .expect("recover loaded job");
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0][0], "bootstrap");
         assert_eq!(calls[1][0], "bootout");
         assert_eq!(calls[2][0], "bootstrap");
-        assert_eq!(calls[3][0], "kickstart");
-    }
-
-    #[test]
-    fn failed_kickstart_boots_out_loaded_job() {
-        let mut calls = Vec::new();
-        let mut results = [true, false, true].into_iter();
-        let error = start_with(501, Path::new("/tmp/job.plist"), |args| {
-            calls.push(args.to_vec());
-            Ok(status(results.next().expect("expected command")))
-        })
-        .expect_err("reject failed kickstart");
-        assert!(error.to_string().contains("kickstart failed"));
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0][0], "bootstrap");
-        assert_eq!(calls[1][0], "kickstart");
-        assert_eq!(calls[2][0], "bootout");
     }
 
     #[test]
