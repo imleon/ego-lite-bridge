@@ -81,25 +81,22 @@ fn run_start() -> io::Result<i32> {
     let paths = daemon::application_paths(&home)?;
     let directory = daemon::open_application_directory(&home)?;
     let _lifecycle_lock = daemon::DaemonLock::acquire_lifecycle(&directory)?;
-    match control::probe(&paths.control_socket, CONTROL_TIMEOUT) {
-        Ok(control::Response::Status {
-            state: control::DaemonState::Running,
-            ..
-        }) => {
-            println!("ego-lite-bridge is running");
-            return Ok(0);
-        }
-        Err(control::ControlError::VersionMismatch { .. }) => {
-            launchd::bootout(unsafe { libc::geteuid() })?;
-        }
-        Ok(_) | Err(_) => {}
+    if let Ok(control::Response::Status {
+        state: control::DaemonState::Running,
+        ..
+    }) = control::probe(&paths.control_socket, CONTROL_TIMEOUT)
+    {
+        println!("ego-lite-bridge is running");
+        return Ok(0);
     }
+    let uid = unsafe { libc::geteuid() };
+    launchd::bootout(uid)?;
+    wait_for_daemon_exit(&directory, LIFECYCLE_TIMEOUT)?;
     let browser = resolve_ego_browser()?;
     daemon::clear_stop_intent(&home, &browser)?;
     let bridge = std::env::current_exe()?.canonicalize()?;
     let plist_path = launchd::plist_path(&home)?;
     launchd::install(&plist_path, &launchd::plist(&bridge, &browser)?)?;
-    let uid = unsafe { libc::geteuid() };
     launchd::start(uid, &plist_path)?;
     if let Err(error) = poll_until(LIFECYCLE_TIMEOUT, || running(&paths.control_socket)) {
         launchd::bootout(uid)?;
@@ -400,6 +397,18 @@ fn running(socket: &Path) -> io::Result<bool> {
         Err(error @ control::ControlError::VersionMismatch { .. }) => Err(control_io_error(&error)),
         Ok(_) | Err(_) => Ok(false),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_daemon_exit(directory: &ipc::SecureDirectory, timeout: Duration) -> io::Result<()> {
+    poll_until(timeout, || match daemon::DaemonLock::acquire(directory) {
+        Ok(lock) => {
+            drop(lock);
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
+    })
 }
 
 #[cfg(target_os = "macos")]

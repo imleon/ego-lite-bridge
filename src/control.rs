@@ -207,6 +207,7 @@ pub(crate) fn serve_connection(
     timeout: Duration,
     handle: impl FnOnce(Request) -> Response,
 ) -> Result<(), ControlError> {
+    stream.set_nonblocking(false)?;
     apply_timeouts(stream, timeout)?;
     let version = match read(stream)? {
         Message::ClientHello { version } => version,
@@ -295,6 +296,31 @@ mod tests {
             .expect("server thread")
             .expect("serve request");
         received
+    }
+
+    #[test]
+    fn server_clears_inherited_nonblocking_mode() {
+        let (mut client, mut server) = UnixStream::pair().expect("create socket pair");
+        server.set_nonblocking(true).expect("set nonblocking");
+        let server = thread::spawn(move || {
+            serve_connection(&mut server, TIMEOUT, |_| Response::Status {
+                state: DaemonState::Running,
+                remote_count: 0,
+            })
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            request(&mut client, TIMEOUT, Request::Status).expect("request succeeds"),
+            Response::Status {
+                state: DaemonState::Running,
+                remote_count: 0,
+            }
+        );
+        server
+            .join()
+            .expect("server thread")
+            .expect("serve request");
     }
 
     #[test]
