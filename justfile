@@ -17,5 +17,5 @@ build:
 installer-test:
     python3 -m unittest scripts.test_unix_installer
 
-ssh-e2e: build
-    python3 -m unittest scripts.test_ssh_e2e
+e2e-manual:
+    python3 -m unittest scripts.test_manual_e2e

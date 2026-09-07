@@ -131,13 +131,12 @@ just test             # Rust tests
 just installer-test   # Unix installer tests
 just check            # formatting, Clippy, Rust tests, installer tests
 
-# Opt-in: real Mac -> SSH-reachable Linux E2E (not part of just check or CI)
-EGO_LITE_BRIDGE_SSH_TARGET=user@linux-host just ssh-e2e
+# Opt-in: real Mac -> SSH-reachable Linux smoke (not part of just check)
+EGO_LITE_BRIDGE_BIN=target/release/ego-lite-bridge \
+EGO_LITE_BRIDGE_SSH_TARGET=user@linux-host just e2e-manual
 ```
 
-Run the narrowest relevant test while iterating and `just check` before committing. Run `ssh-e2e` from the repository on a Mac with Python 3, Rust/Cargo, and `just`; the Linux target must have Rust/Cargo and GNU coreutils, and accept `ssh -o BatchMode=yes` with its host key already trusted. The harness builds both platforms from the current checkout, temporarily installs the Linux binary and `ego-browser` shim under `~/.local/bin`, and restores the previous files afterward.
-
-The test can use the normal Mac account, but first run `ego-lite-bridge stop`. It refuses to run if the real daemon is reachable or the fixed LaunchAgent label is loaded. Its direct test daemon uses a temporary `HOME` with a symlink to the real `~/.ssh`; it does not read, move, or delete the real LaunchAgent plist or bridge configuration. After the test, run `ego-lite-bridge start` to restore the normal service. This gate does not exercise public `start`/`stop`, LaunchAgent installation, or launchd KeepAlive; those require unit tests and separate real-system acceptance. M8 is still incomplete: self-hosted CI, cross-UID Linux coverage, and a real-browser smoke remain separate gates.
+Run the narrowest relevant test while iterating and `just check` before committing. The manual smoke requires `EGO_LITE_BRIDGE_BIN` (the current macOS binary) and `EGO_LITE_BRIDGE_SSH_TARGET` (an SSH destination with the Linux bridge installed); `EGO_LITE_BRIDGE_LINUX_SHIM` optionally overrides `~/.local/bin/ego-browser`. It starts and stops the daemon, so do not run it against a daemon serving unrelated work.
 
 ## License
 
