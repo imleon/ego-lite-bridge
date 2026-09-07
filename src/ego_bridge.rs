@@ -2420,13 +2420,7 @@ where
                 ..
             } => {
                 #[cfg(unix)]
-                {
-                    // SAFETY: raising the reported child signal preserves normal CLI signal semantics.
-                    if unsafe { libc::raise(signal) } != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    return Ok(128 + signal);
-                }
+                return replay_signal(signal);
                 #[cfg(not(unix))]
                 return Ok(1);
             }
@@ -2439,6 +2433,60 @@ where
             }
         }
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn replay_signal(signal: i32) -> io::Result<i32> {
+    if signal <= 0
+        || matches!(
+            signal,
+            libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
+        )
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cannot replay signal {signal}"),
+        ));
+    }
+
+    if signal != libc::SIGKILL {
+        // SAFETY: zeroed sigaction is initialized below before installation.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = libc::SIG_DFL;
+        // SAFETY: action owns a valid sigset_t and sigemptyset initializes it.
+        if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: action is fully initialized and signal is validated by sigaction.
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot replay signal {signal}: {error}"),
+            ));
+        }
+    }
+
+    // SAFETY: mask is initialized before use and pthread_sigmask only changes this thread.
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigemptyset(&mut mask) } != 0
+        || unsafe { libc::sigaddset(&mut mask, signal) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: mask contains one validated signal; the old mask is not needed.
+    let result = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut()) };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+
+    // SAFETY: getpid has no preconditions and kill targets this process.
+    if unsafe { libc::kill(libc::getpid(), signal) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Err(io::Error::other(format!(
+        "replayed signal {signal} did not terminate the process"
+    )))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -4122,6 +4170,57 @@ mod tests {
             (code, stdout, stderr),
             (7, b"out".to_vec(), b"err".to_vec())
         );
+    }
+
+    #[test]
+    fn shim_replays_ignored_and_blocked_sigpipe() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        const HELPER_SENTINEL: &str = "shim_replays_ignored_and_blocked_sigpipe";
+        if std::env::var_os("ELB_SIGNAL_HELPER").as_deref() == Some(OsStr::new(HELPER_SENTINEL)) {
+            // SAFETY: SIG_IGN is a valid disposition and the mask is initialized before use.
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                assert_eq!(libc::sigemptyset(&mut mask), 0);
+                assert_eq!(libc::sigaddset(&mut mask, libc::SIGPIPE), 0);
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()),
+                    0
+                );
+            }
+            let error = replay_signal(libc::SIGPIPE).expect_err("signal must terminate helper");
+            panic!("{error}");
+        }
+
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "ego_bridge::tests::shim_replays_ignored_and_blocked_sigpipe",
+            ])
+            .env("ELB_SIGNAL_HELPER", HELPER_SENTINEL)
+            .status()
+            .expect("run isolated signal test");
+        let raw = status.into_raw();
+        assert!(libc::WIFSIGNALED(raw));
+        assert_eq!(libc::WTERMSIG(raw), libc::SIGPIPE);
+    }
+
+    #[test]
+    fn shim_rejects_invalid_and_stop_exit_signals() {
+        for signal in [
+            0,
+            -1,
+            i32::MAX,
+            libc::SIGSTOP,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+        ] {
+            let error = replay_signal(signal).expect_err("reject signal");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(&signal.to_string()));
+        }
     }
 
     #[test]

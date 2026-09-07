@@ -12,7 +12,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "distribution" / "install.sh"
-REQUIRED_COMMANDS = ("awk", "cat", "chmod", "cp", "ln", "mkdir", "mktemp", "mv", "rm")
+REQUIRED_COMMANDS = ("awk", "cat", "chmod", "cp", "ln", "mkdir", "mktemp", "mv", "readlink", "rm")
 
 
 class UnixInstallerTests(unittest.TestCase):
@@ -45,6 +45,7 @@ for argument in "$@"; do
   previous="$argument"
 done
 if [ -n "$out" ]; then
+  printf '%s\n' "$out" > "$FAKE_OUTPUT_LOG"
   cp "$FAKE_PAYLOAD" "$out"
 else
   cat "$FAKE_MANIFEST"
@@ -65,7 +66,9 @@ fi
             path = shutil.which("sha256sum")
             if path is None:
                 self.fail("test host is missing sha256sum")
-            (self.bin_dir / "sha256sum").symlink_to(path)
+            checksum_tool = self.bin_dir / "sha256sum"
+            if not checksum_tool.exists():
+                checksum_tool.symlink_to(path)
             return
 
         if tool == "shasum":
@@ -98,31 +101,34 @@ exec {sha256sum} "$@"
         *,
         product: str = "ego-lite-bridge",
         available: bool = True,
+        version: str | None = "9.9.9",
         asset_url: str | None = None,
     ) -> Path:
         target = f"{os_name}-x86_64"
         manifest: dict[str, object] = {
             "product": product,
             "available": available,
-            "version": "9.9.9",
             "assets": {
                 target: asset_url
-                or f"https://github.com/imleon/ego-lite-bridge/releases/download/v9.9.9/ego-lite-bridge-{target}"
+                if asset_url is not None
+                else f"https://github.com/imleon/ego-lite-bridge/releases/download/v{version}/ego-lite-bridge-{target}"
             },
         }
+        if version is not None:
+            manifest["version"] = version
         if checksum is not None:
             manifest["sha256"] = {target: checksum}
         path = self.root / "latest.json"
         path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         return path
 
-    def _run_installer(
+    def _installer_env(
         self,
         checksum: str | None,
         tool: str = "sha256sum",
         os_name: str = "linux",
         **manifest_options: object,
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> dict[str, str]:
         self._select_checksum_tool(tool)
         manifest = self._write_manifest(checksum, os_name, **manifest_options)
         uname = "Linux" if os_name == "linux" else "Darwin"
@@ -136,17 +142,26 @@ case "$1" in
 esac
 ''',
         )
-        env = {
+        return {
             **os.environ,
             "PATH": str(self.bin_dir),
             "FAKE_MANIFEST": str(manifest),
             "FAKE_PAYLOAD": str(self.payload),
+            "FAKE_OUTPUT_LOG": str(self.root / "output-path"),
             "EGO_LITE_BRIDGE_INSTALL_DIR": str(self.install_dir),
             "EGO_LITE_BRIDGE_MANIFEST_URL": "https://example.invalid/latest.json",
         }
+
+    def _run_installer(
+        self,
+        checksum: str | None,
+        tool: str = "sha256sum",
+        os_name: str = "linux",
+        **manifest_options: object,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["/bin/sh", str(INSTALLER)],
-            env=env,
+            env=self._installer_env(checksum, tool, os_name, **manifest_options),
             capture_output=True,
             text=True,
             check=False,
@@ -166,6 +181,29 @@ esac
                 self.assertEqual(installed.read_bytes(), self.payload.read_bytes())
                 self.assertFalse(installed.is_symlink())
                 self.assertEqual(os.readlink(self.install_dir / "ego-browser"), "ego-lite-bridge")
+
+    def test_success_remains_success_after_stdout_disconnects_at_commit(self) -> None:
+        process = subprocess.Popen(
+            ["/bin/sh", str(INSTALLER)],
+            env=self._installer_env(self.expected_sha256),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            if "created ego-browser shim" in line:
+                process.stdout.close()
+                break
+        stderr = process.stderr.read() if process.stderr is not None else ""
+        if process.stderr is not None:
+            process.stderr.close()
+
+        self.assertEqual(process.wait(), 0, stderr)
+        self.assertEqual(
+            (self.install_dir / "ego-lite-bridge").read_bytes(),
+            self.payload.read_bytes(),
+        )
 
     def test_macos_installs_no_shim(self) -> None:
         result = self._run_installer(self.expected_sha256, os_name="macos")
@@ -214,8 +252,126 @@ esac
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("untrusted asset URL", result.stderr)
+        self.assertIn("asset URL does not match version 9.9.9 and target linux-x86_64", result.stderr)
         self.assertEqual(installed.read_bytes(), b"existing-ego-lite-bridge\n")
+
+    def test_missing_version_fails_without_replacing_existing_binary(self) -> None:
+        self.install_dir.mkdir()
+        installed = self.install_dir / "ego-lite-bridge"
+        installed.write_bytes(b"existing-ego-lite-bridge\n")
+
+        result = self._run_installer(
+            self.expected_sha256,
+            version=None,
+            asset_url="https://github.com/imleon/ego-lite-bridge/releases/download/v9.9.9/ego-lite-bridge-linux-x86_64",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manifest does not include a version", result.stderr)
+        self.assertEqual(installed.read_bytes(), b"existing-ego-lite-bridge\n")
+
+    def test_asset_url_must_match_manifest_version_and_target(self) -> None:
+        for asset_url in (
+            "https://github.com/imleon/ego-lite-bridge/releases/download/v8.8.8/ego-lite-bridge-linux-x86_64",
+            "https://github.com/imleon/ego-lite-bridge/releases/download/v9.9.9/ego-lite-bridge-macos-x86_64",
+        ):
+            with self.subTest(asset_url=asset_url):
+                result = self._run_installer(self.expected_sha256, asset_url=asset_url)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "asset URL does not match version 9.9.9 and target linux-x86_64",
+                    result.stderr,
+                )
+
+    def test_stages_download_inside_install_dir(self) -> None:
+        result = self._run_installer(self.expected_sha256)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output_path = Path((self.root / "output-path").read_text(encoding="utf-8").strip())
+        self.assertEqual(output_path.parent.parent, self.install_dir)
+        self.assertTrue(output_path.parent.name.startswith(".ego-lite-bridge."))
+        self.assertFalse(output_path.parent.exists())
+
+    def test_rejects_binary_or_shim_directory_before_download(self) -> None:
+        for name in ("ego-lite-bridge", "ego-browser"):
+            with self.subTest(name=name):
+                shutil.rmtree(self.install_dir, ignore_errors=True)
+                (self.install_dir / name).mkdir(parents=True)
+                (self.root / "output-path").unlink(missing_ok=True)
+
+                result = self._run_installer(self.expected_sha256)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("path is a directory", result.stderr)
+                self.assertFalse((self.root / "output-path").exists())
+
+    def test_rejects_nonmatching_existing_shim_before_download(self) -> None:
+        for kind in ("file", "wrong-symlink"):
+            with self.subTest(kind=kind):
+                shutil.rmtree(self.install_dir, ignore_errors=True)
+                self.install_dir.mkdir()
+                shim = self.install_dir / "ego-browser"
+                if kind == "file":
+                    shim.write_text("not a shim\n", encoding="utf-8")
+                else:
+                    shim.symlink_to("other-binary")
+                (self.root / "output-path").unlink(missing_ok=True)
+
+                result = self._run_installer(self.expected_sha256)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("shim path is not a symlink to ego-lite-bridge", result.stderr)
+                self.assertFalse((self.root / "output-path").exists())
+
+    def test_link_failure_does_not_replace_binary(self) -> None:
+        self.install_dir.mkdir()
+        installed = self.install_dir / "ego-lite-bridge"
+        installed.write_bytes(b"existing-ego-lite-bridge\n")
+        (self.bin_dir / "ln").unlink()
+        self._write_executable("ln", "#!/bin/sh\nexit 1\n")
+
+        result = self._run_installer(self.expected_sha256)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(installed.read_bytes(), b"existing-ego-lite-bridge\n")
+        self.assertFalse((self.install_dir / "ego-browser").exists())
+
+    def test_binary_move_failure_keeps_shim_and_rerun_recovers(self) -> None:
+        real_mv = os.readlink(self.bin_dir / "mv")
+        (self.bin_dir / "mv").unlink()
+        self._write_executable("mv", "#!/bin/sh\nexit 1\n")
+
+        failed = self._run_installer(self.expected_sha256)
+
+        shim = self.install_dir / "ego-browser"
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(os.readlink(shim), "ego-lite-bridge")
+        self.assertFalse((self.install_dir / "ego-lite-bridge").exists())
+
+        (self.bin_dir / "mv").unlink()
+        (self.bin_dir / "mv").symlink_to(real_mv)
+        recovered = self._run_installer(self.expected_sha256)
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(os.readlink(shim), "ego-lite-bridge")
+        self.assertEqual(
+            (self.install_dir / "ego-lite-bridge").read_bytes(),
+            self.payload.read_bytes(),
+        )
+
+    def test_preparation_failure_does_not_replace_existing_binary(self) -> None:
+        self.install_dir.mkdir()
+        installed = self.install_dir / "ego-lite-bridge"
+        installed.write_bytes(b"existing-ego-lite-bridge\n")
+        (self.bin_dir / "chmod").unlink()
+        self._write_executable("chmod", "#!/bin/sh\nexit 1\n")
+
+        result = self._run_installer(self.expected_sha256)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(installed.read_bytes(), b"existing-ego-lite-bridge\n")
+        self.assertEqual(list(self.install_dir.glob(".ego-lite-bridge.*")), [])
 
     def test_checksum_mismatch_does_not_replace_existing_binary(self) -> None:
         self.install_dir.mkdir()

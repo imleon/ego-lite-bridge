@@ -30,6 +30,9 @@ main() {
     # check dependencies
     need curl
     need awk
+    if [ "$os" = "linux" ]; then
+        need readlink
+    fi
 
     TARGET="${os}-${arch}"
     log "fetching latest release manifest..."
@@ -65,13 +68,16 @@ main() {
     if [ "$AVAILABLE" != "true" ]; then
         err "ego-lite-bridge release is not available yet"
     fi
+    if [ -z "$VERSION" ]; then
+        err "release manifest does not include a version"
+    fi
     if [ -z "$URL" ]; then
         err "release manifest does not include a binary for ${TARGET}"
     fi
-    case "$URL" in
-        https://github.com/imleon/ego-lite-bridge/releases/download/*/ego-lite-bridge-*) ;;
-        *) err "release manifest contains an untrusted asset URL for ${TARGET}" ;;
-    esac
+    EXPECTED_URL="https://github.com/imleon/ego-lite-bridge/releases/download/v${VERSION}/ego-lite-bridge-${TARGET}"
+    if [ "$URL" != "$EXPECTED_URL" ]; then
+        err "release manifest asset URL does not match version ${VERSION} and target ${TARGET}"
+    fi
     if [ "${#SHA256}" -ne 64 ]; then
         err "release manifest does not include a valid SHA-256 checksum for ${TARGET}"
     fi
@@ -90,34 +96,38 @@ main() {
         err "SHA-256 verification requires sha256sum, shasum, or openssl"
     fi
 
-    if [ -n "$VERSION" ]; then
-        log "downloading v${VERSION}..."
-    else
-        log "downloading latest release..."
-    fi
-    TMP="$(mktemp -d)"
-    trap 'rm -rf "$TMP"' EXIT
+    log "downloading v${VERSION}..."
+    mkdir -p "$INSTALL_DIR"
+    SHIM="${INSTALL_DIR}/ego-browser"
+    validate_install_paths
 
-    if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 "$URL" -o "${TMP}/${BIN}"; then
+    TMP="$(mktemp -d "${INSTALL_DIR}/.${BIN}.XXXXXX")"
+    trap 'rm -rf "$TMP"' EXIT
+    STAGED_BINARY="${TMP}/${BIN}"
+
+    if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 "$URL" -o "$STAGED_BINARY"; then
         err "download failed from ${URL}"
     fi
 
     case "$SHA256_TOOL" in
-        sha256sum) ACTUAL_SHA256="$(sha256sum < "${TMP}/${BIN}" | awk '{ print $1 }')" ;;
-        shasum)    ACTUAL_SHA256="$(shasum -a 256 < "${TMP}/${BIN}" | awk '{ print $1 }')" ;;
-        openssl)   ACTUAL_SHA256="$(openssl dgst -sha256 < "${TMP}/${BIN}" | awk '{ print $NF }')" ;;
+        sha256sum) ACTUAL_SHA256="$(sha256sum < "$STAGED_BINARY" | awk '{ print $1 }')" ;;
+        shasum)    ACTUAL_SHA256="$(shasum -a 256 < "$STAGED_BINARY" | awk '{ print $1 }')" ;;
+        openssl)   ACTUAL_SHA256="$(openssl dgst -sha256 < "$STAGED_BINARY" | awk '{ print $NF }')" ;;
     esac
     if [ "$ACTUAL_SHA256" != "$SHA256" ]; then
         err "downloaded ego-lite-bridge checksum did not match"
     fi
 
     # install
-    mkdir -p "$INSTALL_DIR"
-    mv "${TMP}/${BIN}" "${INSTALL_DIR}/${BIN}"
-    chmod +x "${INSTALL_DIR}/${BIN}"
-    if [ "$os" = "linux" ]; then
-        ln -sf "$BIN" "${INSTALL_DIR}/ego-browser"
+    chmod +x "$STAGED_BINARY"
+    validate_install_paths
+    if [ "$os" = "linux" ] && [ ! -L "$SHIM" ]; then
+        ln -s "$BIN" "$SHIM"
+        log "created ego-browser shim at ${SHIM}"
     fi
+    trap '' PIPE
+    mv "$STAGED_BINARY" "${INSTALL_DIR}/${BIN}"
+    set +e
 
     log "installed ${BIN} to ${INSTALL_DIR}/${BIN}"
 
@@ -141,6 +151,21 @@ main() {
     fi
 
     echo ""
+    return 0
+}
+
+validate_install_paths() {
+    if [ -d "${INSTALL_DIR}/${BIN}" ]; then
+        err "installation path is a directory: ${INSTALL_DIR}/${BIN}"
+    fi
+    if [ "$os" = "linux" ] && { [ -e "$SHIM" ] || [ -L "$SHIM" ]; }; then
+        if [ -d "$SHIM" ]; then
+            err "shim path is a directory: ${SHIM}"
+        fi
+        if [ ! -L "$SHIM" ] || [ "$(readlink "$SHIM")" != "$BIN" ]; then
+            err "shim path is not a symlink to ${BIN}: ${SHIM}"
+        fi
+    fi
 }
 
 log()  { printf '  \033[32m>\033[0m %s\n' "$1"; }
