@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Destructive, real Mac -> SSH -> Linux end-to-end gate.
 
-Run only through ``just ssh-e2e`` on a dedicated test Mac account and Linux
-account.  The harness owns only objects it creates and refuses cleanup when an
-owned install target has changed underneath it.
+Stop the normal Mac daemon before running through ``just ssh-e2e``. The test
+daemon uses an isolated temporary HOME; the harness owns only objects it creates
+and refuses cleanup when an owned Linux install target has changed underneath it.
 """
 
 from __future__ import annotations
 
 import os
 import platform
-import re
 import shlex
 import signal
 import subprocess
@@ -171,19 +170,23 @@ class SshE2E(unittest.TestCase):
         cls.remote_endpoint_identity = ""
         cls.remote_runtime_identity = ""
         cls.remote_state_dirs_existed: list[bool] = []
-        cls.start_attempted = False
-        cls.started = False
-        cls.plist_identity: tuple[int, int] | None = None
+        cls.daemon: subprocess.Popen[bytes] | None = None
         cls.added: set[str] = set()
         cls.temp = tempfile.TemporaryDirectory(prefix="ego-lite-ssh-e2e-")
         cls.work = Path(cls.temp.name)
+        cls.mac_home = cls.work / "mac-home"
+        cls.mac_home.mkdir()
+        user_ssh = Path.home() / ".ssh"
+        if user_ssh.is_dir():
+            (cls.mac_home / ".ssh").symlink_to(user_ssh, target_is_directory=True)
+        cls.mac_env = os.environ.copy()
+        cls.mac_env["HOME"] = str(cls.mac_home)
         cls.fake_dir = cls.work / "fake-bin"
         cls.fake_dir.mkdir()
         cls.fake = cls.fake_dir / "ego-browser"
         cls.fake.write_text(FAKE.replace("#!/usr/bin/env python3", f"#!{sys.executable}", 1))
         cls.fake.chmod(0o700)
-        cls.plist = Path.home() / "Library/LaunchAgents/com.github.imleon.ego-lite-bridge.plist"
-        cls.app_dir = Path.home() / "Library/Application Support/ego-lite-bridge"
+        cls.app_dir = cls.mac_home / "Library/Application Support/ego-lite-bridge"
         try:
             cls.preflight()
             cls.build_and_install_remote()
@@ -224,18 +227,36 @@ class SshE2E(unittest.TestCase):
 
     @classmethod
     def bridge(cls, *args: str, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        kwargs.setdefault("env", cls.mac_env)
         return cls.run_command([str(cls.binary), *args], **kwargs)
 
     @classmethod
-    def start_bridge(cls, env: dict[str, str]) -> None:
-        cls.start_attempted = True
+    def start_bridge(cls) -> None:
+        with (cls.work / "daemon.log").open("ab") as log:
+            cls.daemon = subprocess.Popen(
+                [str(cls.binary), "daemon", "--ego-browser", str(cls.fake)],
+                env=cls.mac_env,
+                stdout=log,
+                stderr=log,
+            )
+        cls.wait_for(
+            lambda: cls.bridge("status", check=False).returncode == 0,
+            "daemon did not start",
+        )
+
+    @classmethod
+    def stop_bridge(cls, sig: signal.Signals = signal.SIGTERM) -> None:
+        daemon = cls.daemon
+        if daemon is None:
+            return
+        if daemon.poll() is None:
+            daemon.send_signal(sig)
         try:
-            cls.bridge("start", env=env)
-        finally:
-            if cls.plist_identity is None and (cls.plist.exists() or cls.plist.is_symlink()):
-                plist_stat = cls.plist.lstat()
-                cls.plist_identity = (plist_stat.st_dev, plist_stat.st_ino)
-        cls.started = True
+            daemon.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.communicate()
+        cls.daemon = None
 
     @classmethod
     def ssh_argv(cls, target: str | None = None) -> list[str]:
@@ -258,19 +279,15 @@ class SshE2E(unittest.TestCase):
 
     @classmethod
     def preflight(cls) -> None:
-        if cls.plist.exists() or cls.plist.is_symlink():
-            raise RuntimeError(f"existing LaunchAgent is not test-owned: {cls.plist}")
-        if cls.app_dir.exists():
-            raise RuntimeError(f"existing bridge state is not test-owned: {cls.app_dir}")
-        status = cls.bridge("status", check=False)
+        status = cls.run_command([str(cls.binary), "status"], check=False)
         if status.returncode == 0:
-            raise RuntimeError("a bridge daemon is already running")
+            raise RuntimeError("the real bridge daemon is already running; stop it before testing")
         loaded = cls.run_command(
             ["launchctl", "print", f"gui/{os.getuid()}/com.github.imleon.ego-lite-bridge"],
             check=False,
         )
         if loaded.returncode == 0:
-            raise RuntimeError("the bridge LaunchAgent is already loaded")
+            raise RuntimeError("the bridge LaunchAgent is loaded; stop it before testing")
         probe = cls.ssh(
             "sh",
             "-c",
@@ -372,36 +389,10 @@ class SshE2E(unittest.TestCase):
                     cls.added.discard(name)
             except BaseException as error:
                 errors.append(f"remove {name}: {error}")
-        if getattr(cls, "start_attempted", False):
-            try:
-                result = cls.bridge("stop", check=False, timeout=15)
-                if result.returncode != 0:
-                    errors.append(f"stop: {result.stderr.decode(errors='replace')}")
-                else:
-                    cls.started = False
-                    cls.start_attempted = False
-            except BaseException as error:
-                errors.append(f"stop: {error}")
         try:
-            plist = getattr(cls, "plist", Path("/nonexistent"))
-            if plist.exists() or plist.is_symlink():
-                identity = (plist.lstat().st_dev, plist.lstat().st_ino)
-                if identity != getattr(cls, "plist_identity", None):
-                    errors.append("LaunchAgent plist changed; refusing removal")
-                else:
-                    plist.unlink()
-            app = getattr(cls, "app_dir", Path("/nonexistent"))
-            if app.exists() and not cls.started:
-                allowed = {"config.json", "daemon.lock", "lifecycle.lock"}
-                unknown = {path.name for path in app.iterdir()} - allowed
-                if unknown:
-                    errors.append(f"bridge state has unknown entries; refusing removal: {sorted(unknown)}")
-                else:
-                    for path in app.iterdir():
-                        path.unlink()
-                    app.rmdir()
+            cls.stop_bridge()
         except BaseException as error:
-            errors.append(f"Mac state cleanup: {error}")
+            errors.append(f"stop daemon: {error}")
         endpoint_removed = False
         if getattr(cls, "remote_endpoint_identity", "") and not getattr(
             cls, "remote_endpoint_existed", False
@@ -538,14 +529,10 @@ class SshE2E(unittest.TestCase):
         self.disconnect_recovery()
         self.bridge("remote", "remove", self.remote_name)
         self.added.remove(self.remote_name)
-        self.bridge("stop")
-        self.started = False
-        self.start_attempted = False
+        self.stop_bridge()
 
     def lifecycle_and_crud(self) -> None:
-        env = os.environ.copy()
-        env["PATH"] = str(self.fake_dir) + os.pathsep + env["PATH"]
-        self.start_bridge(env)
+        self.start_bridge()
         self.remote_add_attempted = True
         added = self.bridge("remote", "add", self.remote_name, self.target)
         self.added.add(self.remote_name)
@@ -572,8 +559,12 @@ class SshE2E(unittest.TestCase):
         retry = self.bridge("remote", "retry", self.remote_name, check=False)
         self.assertNotEqual(retry.returncode, 0)
         before = (self.app_dir / "config.json").read_bytes()
-        doctor = self.bridge("doctor", self.remote_name)
-        self.assertNotIn(b"FAIL ", doctor.stdout)
+        doctor = self.bridge("doctor", self.remote_name, check=False)
+        self.assertEqual(doctor.returncode, 1)
+        self.assertIn(b"FAIL mac.launchd:", doctor.stdout)
+        self.assertIn(b"PASS mac.daemon:", doctor.stdout)
+        self.assertIn(b"PASS mac.browser:", doctor.stdout)
+        self.assertNotIn(b"FAIL remote.", doctor.stdout)
         self.assertEqual((self.app_dir / "config.json").read_bytes(), before)
 
     def transparent_execution(self) -> None:
@@ -698,21 +689,14 @@ class SshE2E(unittest.TestCase):
             "d=/tmp/ego-lite-bridge-$(id -u); stat -c '%a:%u' \"$d\"; stat -c '%a:%u' \"$d/broker.sock\" \"$d/owner.sock\"",
         ).stdout.decode().splitlines()
         self.assertEqual(modes, [f"700:{self.remote_uid}", f"600:{self.remote_uid}", f"600:{self.remote_uid}"])
-        self.bridge("stop")
-        self.started = False
-        self.start_attempted = False
-        env = os.environ.copy()
-        env["PATH"] = str(self.fake_dir) + os.pathsep + env["PATH"]
-        self.start_bridge(env)
-        self.wait_for(lambda: self.remote_details()["observed"] == "connected", "remote did not recover after restart", 30)
+        self.stop_bridge(signal.SIGKILL)
+        self.start_bridge()
+        self.wait_for(
+            lambda: self.remote_details()["observed"] == "connected",
+            "remote did not recover after crash restart",
+            30,
+        )
         self.assertEqual(self.shim("exit", "0").returncode, 0)
-
-    def launchd_pid(self) -> int:
-        result = self.run_command(["launchctl", "print", f"gui/{os.getuid()}/com.github.imleon.ego-lite-bridge"])
-        match = re.search(rb"\bpid = ([0-9]+)", result.stdout)
-        if not match:
-            raise AssertionError("launchctl did not report daemon pid")
-        return int(match.group(1))
 
     def owner_conflict(self) -> None:
         home = self.work / "claimant-home"
@@ -758,8 +742,8 @@ class SshE2E(unittest.TestCase):
                 app.rmdir()
 
     def disconnect_recovery(self) -> None:
-        pid = self.launchd_pid()
-        children = self.run_command(["pgrep", "-P", str(pid)], check=False).stdout.split()
+        assert self.daemon is not None
+        children = self.run_command(["pgrep", "-P", str(self.daemon.pid)], check=False).stdout.split()
         ssh_pids = []
         for child in children:
             command = self.run_command(["ps", "-p", child, "-o", "comm="], check=False).stdout.strip()
@@ -776,9 +760,8 @@ class SshE2E(unittest.TestCase):
         )
         self.wait_for(lambda: self.remote_details()["observed"] == "connected", "remote did not reconnect", 30)
         self.assertEqual(self.shim("exit", "0").returncode, 0)
-        old_pid = self.launchd_pid()
-        os.kill(old_pid, signal.SIGKILL)
-        self.wait_for(lambda: self.launchd_pid() != old_pid, "launchd did not restart daemon", 15)
+        self.stop_bridge(signal.SIGKILL)
+        self.start_bridge()
         self.wait_for(lambda: self.remote_details()["observed"] == "connected", "remote did not recover after crash", 30)
 
 

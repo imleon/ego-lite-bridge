@@ -137,7 +137,7 @@ EGO_LITE_BRIDGE_SSH_TARGET=user@linux-host just ssh-e2e
 
 迭代时运行最小相关测试，提交前运行 `just check`。在 Mac 仓库中运行 `ssh-e2e`；Mac 需要 Python 3、Rust/Cargo 和 `just`，Linux 目标需要 Rust/Cargo 和 GNU coreutils，并且已信任主机密钥且可通过 `ssh -o BatchMode=yes` 连接。Harness 从当前 checkout 构建两个平台，临时安装 Linux 的 binary 和 `~/.local/bin` 下的 `ego-browser` shim，并在结束后恢复原文件。
 
-必须使用专用、空闲的 Mac 用户和 Linux 账户：harness 会占用当前 macOS 用户固定的 LaunchAgent label 和 bridge 状态。若发现已有 daemon、remote 配置或无法证明归属的其他状态，它会 fail closed，不会停止、覆盖或自动修复。M8 仍未完成：self-hosted CI、Linux 跨 UID 覆盖和真实 browser smoke 仍是独立门禁。
+测试可使用普通 Mac 账号，但必须先运行 `ego-lite-bridge stop`。若真实 daemon 可达或固定 LaunchAgent label 仍 loaded，测试会拒绝运行。测试 daemon 在临时 `HOME` 下直接启动，并通过软链接复用真实 `~/.ssh`；不会读取、移动或删除真实 LaunchAgent plist 与 bridge 配置。测试结束后运行 `ego-lite-bridge start` 恢复正常服务。当前门禁不覆盖公开 `start`/`stop`、LaunchAgent 安装或 launchd KeepAlive；这些仍需单元测试和独立真实系统验收。M8 仍未完成：self-hosted CI、Linux 跨 UID 覆盖和真实 browser smoke 仍是独立门禁。
 
 ## 许可证
 
