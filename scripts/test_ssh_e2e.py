@@ -168,7 +168,6 @@ class SshE2E(unittest.TestCase):
         cls.remote_add_attempted = False
         cls.remote_endpoint_existed = False
         cls.remote_endpoint_identity = ""
-        cls.remote_runtime_identity = ""
         cls.remote_state_dirs_existed: list[bool] = []
         cls.daemon: subprocess.Popen[bytes] | None = None
         cls.added: set[str] = set()
@@ -433,9 +432,10 @@ class SshE2E(unittest.TestCase):
                 runtime = cls.ssh(
                     "sh",
                     "-c",
-                    "d=/tmp/ego-lite-bridge-$(id -u); expected=$1; "
+                    "d=/tmp/ego-lite-bridge-$(id -u); "
                     "if [ -e \"$d\" ] || [ -L \"$d\" ]; then "
-                    "[ -n \"$expected\" ] && [ \"$(stat -c '%d:%i:%f:%u:%a' \"$d\" 2>/dev/null)\" = \"$expected\" ] "
+                    "[ ! -L \"$d\" ] && [ -d \"$d\" ] "
+                    "&& [ \"$(stat -c '%u:%a' \"$d\")\" = \"$(id -u):700\" ] "
                     "|| exit 72; "
                     "for p in \"$d/broker.sock\" \"$d/owner.sock\"; do "
                     "[ ! -e \"$p\" ] && [ ! -S \"$p\" ] || exit 73; done; "
@@ -443,8 +443,6 @@ class SshE2E(unittest.TestCase):
                     "[ ! -L \"$d/acquire.lock\" ] && [ -f \"$d/acquire.lock\" ] "
                     "&& [ \"$(stat -c '%u:%a' \"$d/acquire.lock\")\" = \"$(id -u):600\" ] "
                     "|| exit 74; rm \"$d/acquire.lock\" || exit 75; fi; rmdir \"$d\" || exit 76; fi",
-                    "sh",
-                    cls.remote_runtime_identity,
                     check=False,
                     timeout=15,
                 )
@@ -532,15 +530,6 @@ class SshE2E(unittest.TestCase):
         result = cls.bridge("remote", "status", name or cls.remote_name)
         return dict(line.split(": ", 1) for line in result.stdout.decode().splitlines())
 
-    @classmethod
-    def snapshot_remote_runtime(cls) -> None:
-        cls.remote_runtime_identity = cls.ssh(
-            "sh",
-            "-c",
-            "d=/tmp/ego-lite-bridge-$(id -u); "
-            "stat -c '%d:%i:%f:%u:%a' \"$d\"",
-        ).stdout.decode().strip()
-
     def test_ssh_e2e(self) -> None:
         self.lifecycle_and_crud()
         self.transparent_execution()
@@ -558,11 +547,6 @@ class SshE2E(unittest.TestCase):
         added = self.bridge("remote", "add", self.remote_name, self.target)
         self.added.add(self.remote_name)
         self.remote_add_attempted = False
-        self.remote_runtime_identity = self.ssh(
-            "sh",
-            "-c",
-            "d=/tmp/ego-lite-bridge-$(id -u); stat -c '%d:%i:%f:%u:%a' \"$d\"",
-        ).stdout.decode().strip()
         endpoint = self.ssh(
             "sh",
             "-c",
@@ -610,7 +594,7 @@ class SshE2E(unittest.TestCase):
             "~/.local/bin/ego-browser signal \"$1\"; status=$?; "
             "[ \"$status\" -eq \"$2\" ] || { echo \"unexpected signal status: $status\" >&2; exit 1; }",
             "sh",
-            str(signal.SIGTERM),
+            str(signal.SIGTERM.value),
             str(128 + signal.SIGTERM),
             check=False,
         )
@@ -718,7 +702,6 @@ class SshE2E(unittest.TestCase):
             "remote did not recover after crash restart",
             30,
         )
-        self.snapshot_remote_runtime()
         self.assertEqual(self.shim("exit", "0").returncode, 0)
 
     def owner_conflict(self) -> None:
@@ -790,7 +773,6 @@ class SshE2E(unittest.TestCase):
             "remote did not recover after crash",
             30,
         )
-        self.snapshot_remote_runtime()
 
 
 if __name__ == "__main__":
