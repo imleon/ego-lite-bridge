@@ -73,10 +73,12 @@ jobs:
       matrix:
         include:
           - target: linux-x86_64
+            rust_target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             runner_arch: x86_64
             binary_arch: 'ELF 64-bit LSB.*x86-64'
           - target: macos-aarch64
+            rust_target: aarch64-apple-darwin
             runner: macos-15
             runner_arch: arm64
             binary_arch: 'Mach-O 64-bit executable arm64'
@@ -95,8 +97,16 @@ jobs:
           test "$(uname -m)" = "$EXPECTED_ARCH"
           uname -a
 
+      - name: Install Linux build tools
+        if: matrix.target == 'linux-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools binutils
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -104,16 +114,52 @@ jobs:
           cache-bin: false
           key: release-${{ matrix.target }}
 
-      - name: Build native release binary
-        run: cargo build --release --locked
+      - name: Test Linux release target
+        if: matrix.target == 'linux-x86_64'
+        run: cargo test --locked --target ${{ matrix.rust_target }}
 
-      - name: Verify and stage release asset
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.rust_target }}
+
+      - name: Stage and verify release asset
         env:
           EXPECTED_BINARY_ARCH: ${{ matrix.binary_arch }}
+          RUST_TARGET: ${{ matrix.rust_target }}
         run: |
-          file target/release/ego-lite-bridge
-          file target/release/ego-lite-bridge | grep -E "$EXPECTED_BINARY_ARCH"
-          install -m 755 target/release/ego-lite-bridge ego-lite-bridge-${{ matrix.target }}
+          candidate="ego-lite-bridge-${{ matrix.target }}"
+          install -m 755 "target/$RUST_TARGET/release/ego-lite-bridge" "$candidate"
+          file "$candidate"
+          file "$candidate" | grep -E "$EXPECTED_BINARY_ARCH"
+
+      - name: Verify static Linux candidate
+        if: matrix.target == 'linux-x86_64'
+        run: |
+          candidate=ego-lite-bridge-linux-x86_64
+          readelf -lW "$candidate" > program-headers.txt
+          readelf -dW "$candidate" > dynamic-section.txt
+          readelf -aW "$candidate" > elf-details.txt
+          if grep ' INTERP ' program-headers.txt >/dev/null; then
+            echo 'Linux candidate has a program interpreter' >&2
+            exit 1
+          fi
+          if grep '(NEEDED)' dynamic-section.txt >/dev/null; then
+            echo 'Linux candidate has dynamic dependencies' >&2
+            exit 1
+          fi
+          if grep 'GLIBC_' elf-details.txt >/dev/null; then
+            echo 'Linux candidate has a GLIBC version requirement' >&2
+            exit 1
+          fi
+
+      - name: Smoke Linux candidate on glibc 2.31
+        if: matrix.target == 'linux-x86_64'
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          docker run --rm --volume "$PWD:/work:ro" ubuntu:20.04 sh -c '
+            test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.31"
+            test "$(/work/ego-lite-bridge-linux-x86_64 --version)" = "ego-lite-bridge $1"
+          ' sh "$VERSION"
 
       - name: Upload release asset
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

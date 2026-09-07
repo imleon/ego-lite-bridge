@@ -116,7 +116,8 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 
 - preparation-only `workflow_dispatch`在所选ref/commit的干净checkout运行`just check`等价门禁，不要求tag且不发布release；
 - 输入version与Cargo version一致；
-- 维护者分别构建并核验两个候选目标的release binary及runner/binary架构；
+- 维护者分别构建并核验两个候选目标：`linux-x86_64`使用静态`x86_64-unknown-linux-musl` binary，并确认无program interpreter、动态依赖或`GLIBC_*`版本要求；`macos-aarch64`使用原生`aarch64-apple-darwin` binary；
+- preparation workflow在Ubuntu 20.04、glibc 2.31容器中运行精确的已暂存Linux候选并验证`--version`；
 - 为候选产物生成并复核SHA-256；
 - 在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；
 - README只陈述已验证的候选范围和实际发布状态，不宣称尚未完成的自动化；
