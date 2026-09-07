@@ -17,6 +17,10 @@ Linux ego-browser shim -> Linux broker -> SSH channel -> Mac executor -> ego-bro
 - The executable name `ego-browser` selects shim mode; the real binary is only started on the Mac.
 - If the bridge is unavailable, the Linux command fails instead of falling back to local execution.
 
+## Release status
+
+The 0.1 release candidates target `linux-x86_64` and `macos-aarch64`. Maintainers are preparing and validating them with a manual release workflow; no 0.1 release has been published yet. `distribution/latest.json` remains unavailable, so the release installer cannot install this project yet. Build and install from source as described below.
+
 ## Quick start
 
 Prerequisites:
@@ -68,7 +72,7 @@ Run these control commands on macOS:
 
 Desired states are `pending`, `active`, and `removing`; observed states are `connecting`, `connected`, `reconnecting`, `error`, and `removing`. Unknown unavailable detail is printed as `unknown`. `active-requests` is `<active>/<capacity>`. Names and config IDs are accepted wherever `<name-or-config-id>` appears.
 
-`doctor` is read-only. In M7 it checks whether the LaunchAgent is loaded, the daemon is running, and the configured absolute `ego-browser` path is valid. For each remote, it checks persisted endpoint identity presence and desired/observed state, plus handshake, capacity, and reconnect/error data from the daemon's **current worker snapshot**. It does not verify that the live endpoint identity matches the persisted value. `PASS` means that check is healthy in the inspected local state or snapshot; `FAIL` means an environment, daemon, selector, or snapshot check failed; `NOT CHECKED` explicitly means M7 did not open a new SSH connection or verify live endpoint identity, Linux socket permissions, or end-to-end execution. Those active remote checks are part of M8. Exit status is 0 when no check fails, 1 when any check fails, and 2 for invalid `doctor` syntax. `doctor` never repairs, installs, or changes configuration.
+`doctor` is read-only. In M7 it checks whether the LaunchAgent is loaded, the daemon is running, and the configured absolute `ego-browser` path is valid. For each remote, it checks persisted endpoint identity presence and desired/observed state, plus handshake, capacity, and reconnect/error data from the daemon's **current worker snapshot**. It does not verify that the live endpoint identity matches the persisted value. `PASS` means that check is healthy in the inspected local state or snapshot; `FAIL` means an environment, daemon, selector, or snapshot check failed; `NOT CHECKED` explicitly means M7 did not open a new SSH connection or verify live endpoint identity, Linux socket permissions, or end-to-end execution. Those active remote checks are planned for post-0.1 hardening. Exit status is 0 when no check fails, 1 when any check fails, and 2 for invalid `doctor` syntax. `doctor` never repairs, installs, or changes configuration.
 
 Control commands are macOS-only; Linux exposes the `ego-browser` shim.
 
