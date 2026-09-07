@@ -300,8 +300,20 @@ class SshE2E(unittest.TestCase):
             "-c",
             "mv --help 2>&1 | grep -q -- '--no-target-directory' || exit 73; "
             "printf '%s\\n' \"$HOME\"; uname -s; command -v cargo; id -u; "
-            "d=/tmp/ego-lite-bridge-$(id -u); "
-            "[ ! -e \"$d\" ] && [ ! -L \"$d\" ] || exit 74; "
+            "d=/tmp/ego-lite-bridge-$(id -u); uid=$(id -u); "
+            "if [ ! -e \"$d\" ] && [ ! -L \"$d\" ]; then echo 0; "
+            "else [ ! -L \"$d\" ] && [ -d \"$d\" ] "
+            "&& [ \"$(stat -c '%u:%a' \"$d\")\" = \"$uid:700\" ] || exit 74; "
+            "set -- \"$d\"/* \"$d\"/.[!.]* \"$d\"/..?*; count=0; "
+            "for p do [ -e \"$p\" ] || [ -L \"$p\" ] || continue; "
+            "[ \"$p\" = \"$d/acquire.lock\" ] || exit 74; count=$((count + 1)); done; "
+            "[ \"$count\" -eq 1 ] && [ ! -L \"$d/acquire.lock\" ] "
+            "&& [ -f \"$d/acquire.lock\" ] && exec 9<\"$d/acquire.lock\" "
+            "&& [ ! -L \"$d/acquire.lock\" ] "
+            "&& [ \"$(stat -c '%d:%i:%f:%u:%a' \"$d/acquire.lock\")\" = "
+            "\"$(stat -Lc '%d:%i:%f:%u:%a' /proc/$$/fd/9)\" ] "
+            "&& [ \"$(stat -Lc '%u:%a' /proc/$$/fd/9)\" = \"$uid:600\" ] "
+            "&& flock -n 9 || exit 74; echo 1; fi; "
             "for p in \"$HOME/.local\" \"$HOME/.local/state\" "
             "\"$HOME/.local/state/ego-lite-bridge\"; do "
             "if [ -d \"$p\" ] && [ ! -L \"$p\" ]; then echo 1; "
@@ -312,17 +324,19 @@ class SshE2E(unittest.TestCase):
             "else echo 0; fi",
         )
         lines = probe.stdout.decode().splitlines()
-        if len(lines) != 8 or not lines[0].startswith("/") or lines[1] != "Linux":
+        if len(lines) != 9 or not lines[0].startswith("/") or lines[1] != "Linux":
             raise RuntimeError(f"invalid Linux preflight response: {lines!r}")
         cls.remote_home = lines[0]
         cls.remote_uid = int(lines[3])
-        cls.remote_state_dirs_existed = [line == "1" for line in lines[4:7]]
-        if any(line not in {"0", "1"} for line in lines[4:7]):
-            raise RuntimeError(f"invalid remote state snapshot: {lines[4:7]!r}")
-        cls.remote_endpoint_existed = lines[7].startswith("1 ")
-        cls.remote_endpoint_identity = lines[7][2:] if cls.remote_endpoint_existed else ""
-        if not cls.remote_endpoint_existed and lines[7] != "0":
-            raise RuntimeError(f"invalid endpoint-id snapshot: {lines[7]!r}")
+        if lines[4] not in {"0", "1"}:
+            raise RuntimeError(f"invalid remote runtime snapshot: {lines[4]!r}")
+        cls.remote_state_dirs_existed = [line == "1" for line in lines[5:8]]
+        if any(line not in {"0", "1"} for line in lines[5:8]):
+            raise RuntimeError(f"invalid remote state snapshot: {lines[5:8]!r}")
+        cls.remote_endpoint_existed = lines[8].startswith("1 ")
+        cls.remote_endpoint_identity = lines[8][2:] if cls.remote_endpoint_existed else ""
+        if not cls.remote_endpoint_existed and lines[8] != "0":
+            raise RuntimeError(f"invalid endpoint-id snapshot: {lines[8]!r}")
 
     @classmethod
     def build_and_install_remote(cls) -> None:
@@ -432,17 +446,20 @@ class SshE2E(unittest.TestCase):
                 runtime = cls.ssh(
                     "sh",
                     "-c",
-                    "d=/tmp/ego-lite-bridge-$(id -u); "
+                    "d=/tmp/ego-lite-bridge-$(id -u); uid=$(id -u); "
                     "if [ -e \"$d\" ] || [ -L \"$d\" ]; then "
                     "[ ! -L \"$d\" ] && [ -d \"$d\" ] "
-                    "&& [ \"$(stat -c '%u:%a' \"$d\")\" = \"$(id -u):700\" ] "
-                    "|| exit 72; "
-                    "for p in \"$d/broker.sock\" \"$d/owner.sock\"; do "
-                    "[ ! -e \"$p\" ] && [ ! -S \"$p\" ] || exit 73; done; "
-                    "if [ -e \"$d/acquire.lock\" ] || [ -L \"$d/acquire.lock\" ]; then "
-                    "[ ! -L \"$d/acquire.lock\" ] && [ -f \"$d/acquire.lock\" ] "
-                    "&& [ \"$(stat -c '%u:%a' \"$d/acquire.lock\")\" = \"$(id -u):600\" ] "
-                    "|| exit 74; rm \"$d/acquire.lock\" || exit 75; fi; rmdir \"$d\" || exit 76; fi",
+                    "&& [ \"$(stat -c '%u:%a' \"$d\")\" = \"$uid:700\" ] || exit 72; "
+                    "set -- \"$d\"/* \"$d\"/.[!.]* \"$d\"/..?*; count=0; "
+                    "for p do [ -e \"$p\" ] || [ -L \"$p\" ] || continue; "
+                    "[ \"$p\" = \"$d/acquire.lock\" ] || exit 73; count=$((count + 1)); done; "
+                    "[ \"$count\" -eq 1 ] && [ ! -L \"$d/acquire.lock\" ] "
+                    "&& [ -f \"$d/acquire.lock\" ] && exec 9<\"$d/acquire.lock\" "
+                    "&& [ ! -L \"$d/acquire.lock\" ] "
+                    "&& [ \"$(stat -c '%d:%i:%f:%u:%a' \"$d/acquire.lock\")\" = "
+                    "\"$(stat -Lc '%d:%i:%f:%u:%a' /proc/$$/fd/9)\" ] "
+                    "&& [ \"$(stat -Lc '%u:%a' /proc/$$/fd/9)\" = \"$uid:600\" ] "
+                    "&& flock -n 9 || exit 74; fi",
                     check=False,
                     timeout=15,
                 )
