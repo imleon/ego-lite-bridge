@@ -103,13 +103,17 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 - exit code：0无失败、1环境、daemon、selector或快照异常、2用法错误；
 - 不自动修复、不自动安装、不修改配置。
 
-### M8 — 真实SSH自动化门禁
+### M8 — 真实SSH自动化门禁（进行中）
 
-- 专用Mac runner与可重置Linux VM/host；
-- deterministic fake `ego-browser`；
-- 覆盖binary streams、exit/signal、8路并发、cancel、backpressure、daemon重启、Remote CRUD、endpoint去重、owner冲突、断网、claimant竞态和socket安全；
-- 增加一条真实`ego-browser`网页smoke；
-- master/nightly和release tag环境不可用时失败，不skip。
+本地入口为在专用、空闲的Mac测试环境中运行`EGO_LITE_BRIDGE_SSH_TARGET=<target> just ssh-e2e`。Harness从当前checkout构建Mac和Linux binary，临时部署并恢复Linux binary/shim，注入deterministic fake `ego-browser`，并在已有daemon、remote或未知状态时fail closed。该入口不属于`just check`，尚未接入CI。
+
+本地真实SSH gate用于验证binary streams、exit/signal、8路并发容量与第9路capacity拒绝、cancel、慢速stdin不阻塞其他请求、大量stdout/stderr、daemon重启、Remote CRUD、endpoint去重、已有owner拒绝第二claimant、断连恢复，以及runtime目录最终为`0700`、socket最终为`0600`且属于当前Linux UID。环境或预检失败返回非零，不skip；尚未记录一次完整Mac/Linux运行结果。它不验证8路并发流隔离、并发claimant竞态、跨UID访问边界或队列饱和时的backpressure。
+
+M8完成仍需：
+
+- 专用self-hosted Mac runner与可重置Linux VM/host，并接入master/nightly和release tag；
+- 第二Linux UID的真实跨UID socket边界验证；
+- 一条真实`ego-browser`网页smoke。
 
 ### M9 — Release 0.1
 
