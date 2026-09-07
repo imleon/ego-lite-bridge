@@ -17,6 +17,10 @@ Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-brow
 - 可执行文件名为 `ego-browser` 时进入 shim 模式；真正的二进制只在 Mac 上启动。
 - bridge 不可用时，Linux 命令明确失败，不会回退到本地执行。
 
+## 发布状态
+
+0.1 候选版本仅面向 `linux-x86_64` 和 `macos-aarch64`。维护者正在通过手工发布流程准备和验证候选产物；0.1 尚未发布。`distribution/latest.json` 仍标记为不可用，因此发行版安装器目前还不能安装本项目。请按下文说明从源码构建并安装。
+
 ## 快速开始
 
 前置条件：
@@ -68,7 +72,7 @@ daemon 会在短暂的 SSH 或网络故障后自动重连。
 
 Desired 状态为 `pending`、`active` 和 `removing`；observed 状态为 `connecting`、`connected`、`reconnecting`、`error` 和 `removing`。当前无法获得的详情显示为 `unknown`；`active-requests` 格式为 `<活跃数>/<容量>`。所有 `<名称或配置ID>` 参数都接受 remote 名称或配置 ID。
 
-`doctor` 是只读命令。M7 检查 LaunchAgent 是否 loaded、daemon 是否 running，以及配置中的 `ego-browser` 绝对路径是否有效。对每个 remote，它检查持久配置中 endpoint identity 是否存在、desired/observed 状态，以及 daemon **当前 worker 快照**中的 handshake、容量和重连/错误信息；不验证 live endpoint identity 是否与持久值匹配。`PASS` 表示被检查的本地状态或快照健康；`FAIL` 表示环境、daemon、selector 或快照检查失败；`NOT CHECKED` 明确表示 M7 没有新建 SSH 连接，也没有验证 live endpoint identity、Linux socket 权限或端到端执行。这些主动 remote 检查属于 M8。没有 `FAIL` 时退出状态为 0，存在任一 `FAIL` 时为 1，`doctor` 语法无效时为 2。`doctor` 不修复、不安装，也不修改配置。
+`doctor` 是只读命令。M7 检查 LaunchAgent 是否 loaded、daemon 是否 running，以及配置中的 `ego-browser` 绝对路径是否有效。对每个 remote，它检查持久配置中 endpoint identity 是否存在、desired/observed 状态，以及 daemon **当前 worker 快照**中的 handshake、容量和重连/错误信息；不验证 live endpoint identity 是否与持久值匹配。`PASS` 表示被检查的本地状态或快照健康；`FAIL` 表示环境、daemon、selector 或快照检查失败；`NOT CHECKED` 明确表示 M7 没有新建 SSH 连接，也没有验证 live endpoint identity、Linux socket 权限或端到端执行。这些主动 remote 检查计划在 Post-0.1 hardening 中完成。没有 `FAIL` 时退出状态为 0，存在任一 `FAIL` 时为 1，`doctor` 语法无效时为 2。`doctor` 不修复、不安装，也不修改配置。
 
 控制命令仅支持 macOS；Linux 提供 `ego-browser` shim。
 

@@ -396,7 +396,7 @@ ego-lite-bridge doctor [name-or-id]
 - remote status展示最近错误、重连状态、protocol/capabilities和请求容量；
 - M7 doctor只读检查Mac本地LaunchAgent、daemon和配置中的绝对`ego-browser`路径；对remote检查持久配置中endpoint identity是否存在、desired/observed state，以及daemon当前worker快照中的已知handshake、请求容量和重连错误；
 - M7不验证live endpoint identity是否与持久值匹配；无法证明的主动remote检查明确输出`NOT CHECKED`，不伪装为健康；
-- M7 doctor不新建SSH连接，不主动检查Linux binary、endpoint identity文件或运行目录/socket权限，也不执行端到端probe；这些live检查和probe属于M8真实SSH自动化；
+- M7 doctor不新建SSH连接，不主动检查Linux binary、endpoint identity文件或运行目录/socket权限，也不执行端到端probe；这些live检查和probe属于Post-0.1 hardening；
 - `PASS`表示该本地或快照检查健康，`FAIL`表示检查失败，`NOT CHECKED`表示超出M7检查范围且不影响健康判定；
 - exit code：0无失败、1存在环境、daemon、selector或快照失败、2用法错误；
 - doctor不自动修复、不安装软件、不修改配置。
@@ -419,7 +419,9 @@ ego-lite-bridge doctor [name-or-id]
 - 严格跨主机execution fencing；
 - 动态并发配额和复杂公平调度。
 
-## 15. 验收标准
+## 15. 0.1产品行为验收
+
+以下标准定义0.1必须具备的产品语义、安全边界和可靠性，不要求在发布准备工作流中全部自动跨主机执行。
 
 ### 15.1 Daemon与remote管理
 
@@ -447,9 +449,17 @@ ego-lite-bridge doctor [name-or-id]
 - daemon全局active process不超过8，queued payload不超过8MiB；
 - takeover、断线、remove和stop后无残留Mac child、Linux shim或无限等待；
 - broker运行目录和socket从创建开始不可被其他UID访问；
-- 日志sentinel测试证明不泄露request payload；
-- 并发和ownership核心测试连续100轮无偶发失败；
-- Linux/macOS tests、Clippy `-D warnings`和release build全部通过。
+- 日志sentinel测试证明不泄露request payload。
+
+### 15.4 0.1发布验证
+
+- preparation-only `workflow_dispatch`在所选ref/commit的干净checkout上运行格式、Clippy `-D warnings`、Rust tests、installer tests和release preparation tests；不要求tag，也不发布release；
+- 原生runner分别构建并验证`linux-x86_64`（runner `x86_64`、ELF x86-64）和`macos-aarch64`（runner `arm64`、Mach-O arm64）；
+- 下载产物包含保持可执行权限的`tar.gz`候选bundle及其disabled manifest；
+- 维护者在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；
+- 实际发布前`distribution/latest.json`保持`available: false`，工作流不更新release metadata。
+
+自动跨主机重复测试、主动remote diagnostics、真实网页smoke和24小时soak属于Post-0.1 hardening。这些后续自动化不改变或放宽本节定义的产品语义与安全边界。
 
 ## 16. 过渡与升级
 

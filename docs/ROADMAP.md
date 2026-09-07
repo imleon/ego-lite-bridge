@@ -99,28 +99,40 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 - daemon及remote desired/observed状态；
 - remote status展示错误、重连、protocol/capabilities和请求容量；
 - doctor只读检查Mac本地LaunchAgent、绝对`ego-browser`和daemon当前worker快照；
-- 未主动检查的SSH、Linux binary、endpoint identity文件、运行目录/socket权限和end-to-end probe明确显示`NOT CHECKED`，归入M8；
+- 未主动检查的SSH、Linux binary、endpoint identity文件、运行目录/socket权限和end-to-end probe明确显示`NOT CHECKED`，归入Post-0.1 hardening；
 - exit code：0无失败、1环境、daemon、selector或快照异常、2用法错误；
 - 不自动修复、不自动安装、不修改配置。
 
-### M8 — 真实SSH自动化门禁
+### M8 — 0.1发布准备
 
-- 专用Mac runner与可重置Linux VM/host；
-- deterministic fake `ego-browser`；
-- 覆盖binary streams、exit/signal、8路并发、cancel、backpressure、daemon重启、Remote CRUD、endpoint去重、owner冲突、断网、claimant竞态和socket安全；
-- 增加一条真实`ego-browser`网页smoke；
-- master/nightly和release tag环境不可用时失败，不skip。
+目标：用可审计的维护者手工流程准备首批候选产物，不把尚未建设的SSH自动化当作0.1前置条件。
+
+候选目标仅为：
+
+- `linux-x86_64`；
+- `macos-aarch64`。
+
+发布门禁：
+
+- preparation-only `workflow_dispatch`在所选ref/commit的干净checkout运行`just check`等价门禁，不要求tag且不发布release；
+- 输入version与Cargo version一致；
+- 维护者分别构建并核验两个候选目标的release binary及runner/binary架构；
+- 为候选产物生成并复核SHA-256；
+- 在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；
+- README只陈述已验证的候选范围和实际发布状态，不宣称尚未完成的自动化；
+- 实际发布前保持`distribution/latest.json`的`available: false`，installer仍不可用。
+
+候选产物准备完成不等于已经发布。
 
 ### M9 — Release 0.1
 
-- 只保留CI、SSH integration和release工作流；
-- tag与Cargo version一致；
-- 发布经过验证的Linux/macOS架构；
-- workflow生成SHA-256和`latest.json`；
-- 干净Mac/Linux运行installer smoke；
-- 完成至少一次24小时daemon、多remote、断网soak；
-- README和installer只展示daemon产品入口；
-- 发布前`distribution/latest.json`保持`available: false`。
+仅在候选产物通过人工门禁并获得明确发布授权后：
+
+- 将CHANGELOG中的`0.1.0`从Unreleased改为实际发布日期；
+- 创建与Cargo version一致的`v0.1.0` tag；
+- 创建GitHub Release并上传已验证的两个binary及SHA-256；
+- 将审核后的URL与SHA-256写入`distribution/latest.json`并设置`available: true`；
+- 在Linux x86_64与macOS arm64分别执行一次公开installer smoke。
 
 ## 推荐分支与提交顺序
 
@@ -145,17 +157,17 @@ python3 -m unittest scripts.test_unix_installer
 git diff --check
 ```
 
-涉及daemon、remote或ownership的阶段还必须执行：
+涉及daemon、remote或ownership的实现阶段还必须执行对应的本地自动化和可用的真实环境验收。
 
-- add/remove每个状态转换点的SIGKILL恢复测试；
-- 两个Linux endpoint和两个Mac claimant的真实E2E；
-- 100轮并发、claim和断线竞态测试。
+## Post-0.1 hardening
 
-24小时soak是release gate，不作为单个实现阶段的完成条件。
+- 建设专用Mac runner与可重置Linux VM/host上的SSH自动化；
+- 使用deterministic fake `ego-browser`覆盖binary streams、exit/signal、8路并发、cancel、backpressure、daemon重启、Remote CRUD、endpoint去重、owner冲突、断网、claimant竞态和socket安全；
+- 增加真实`ego-browser`网页smoke，并在master/nightly和release tag上fail closed；
+- 执行至少一次24小时daemon、多remote和断网soak；
+- 扩展SIGKILL状态恢复、双endpoint/claimant和重复竞态测试。
 
-## Post-0.1
-
-仅由真实需求驱动：
+其他工作仅由真实需求驱动：
 
 - remote update/rename；
 - 可配置并发额度和跨remote公平调度；

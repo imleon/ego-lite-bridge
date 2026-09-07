@@ -1,0 +1,164 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version from Cargo.toml (for example, 0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate source and project gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout requested ref
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Report source context
+        run: |
+          printf 'requested ref: %s\n' "$GITHUB_REF"
+          printf 'requested sha: %s\n' "$GITHUB_SHA"
+          printf 'checked out commit: '
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+
+      - name: Match Cargo package version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as cargo_toml:
+              cargo_version = tomllib.load(cargo_toml)["package"]["version"]
+          if os.environ["VERSION"] != cargo_version:
+              raise SystemExit(
+                  f"input version {os.environ['VERSION']!r} does not match Cargo.toml {cargo_version!r}"
+              )
+          PY
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          components: rustfmt,clippy
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          key: release-check
+
+      - name: Run project gate
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+          python3 -m unittest scripts.test_unix_installer scripts.test_prepare_release
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-latest
+            runner_arch: x86_64
+            binary_arch: 'ELF 64-bit LSB.*x86-64'
+          - target: macos-aarch64
+            runner: macos-15
+            runner_arch: arm64
+            binary_arch: 'Mach-O 64-bit executable arm64'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout requested ref
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify runner architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.runner_arch }}
+        run: |
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          uname -a
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          key: release-${{ matrix.target }}
+
+      - name: Build native release binary
+        run: cargo build --release --locked
+
+      - name: Verify and stage release asset
+        env:
+          EXPECTED_BINARY_ARCH: ${{ matrix.binary_arch }}
+        run: |
+          file target/release/ego-lite-bridge
+          file target/release/ego-lite-bridge | grep -E "$EXPECTED_BINARY_ARCH"
+          install -m 755 target/release/ego-lite-bridge ego-lite-bridge-${{ matrix.target }}
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ego-lite-bridge-${{ matrix.target }}
+          path: ego-lite-bridge-${{ matrix.target }}
+          if-no-files-found: error
+
+  bundle:
+    name: Prepare release bundle
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout requested ref
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download release assets
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          path: artifacts
+
+      - name: Prepare candidate bundle
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          mkdir release-bundle
+          install -m 755 artifacts/ego-lite-bridge-linux-x86_64/ego-lite-bridge-linux-x86_64 release-bundle/ego-lite-bridge-linux-x86_64
+          install -m 755 artifacts/ego-lite-bridge-macos-aarch64/ego-lite-bridge-macos-aarch64 release-bundle/ego-lite-bridge-macos-aarch64
+          python3 scripts/prepare_release.py \
+            "$VERSION" \
+            release-bundle/ego-lite-bridge-linux-x86_64 \
+            release-bundle/ego-lite-bridge-macos-aarch64 \
+            > latest.json
+          cp latest.json release-bundle/
+          tar -czf release-bundle.tar.gz release-bundle
+          tar -tvzf release-bundle.tar.gz
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-bundle
+          path: |
+            release-bundle.tar.gz
+            latest.json
+          if-no-files-found: error
