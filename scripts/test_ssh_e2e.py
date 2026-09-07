@@ -512,6 +512,34 @@ class SshE2E(unittest.TestCase):
         return cls.run_command(cls.shim_command(*args), **kwargs)
 
     @classmethod
+    def terminate_remote_shim(
+        cls,
+        remote_pidfile: str,
+        mac_pidfile: Path,
+        sig: signal.Signals,
+        *,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return cls.ssh(
+            "sh",
+            "-c",
+            "p=$1; expected=$2; "
+            "[ -f \"$p\" ] && [ ! -L \"$p\" ] || exit 1; "
+            "pid=$(cat \"$p\") || exit 1; "
+            "case $pid in ''|*[!0-9]*) exit 1;; esac; "
+            "[ \"$(readlink -f \"/proc/$pid/exe\" 2>/dev/null)\" = "
+            "\"$(readlink -f \"$HOME/.local/bin/ego-browser\")\" ] || exit 1; "
+            "tr '\\0' '\\n' <\"/proc/$pid/cmdline\" | grep -Fqx -- \"$expected\" || exit 1; "
+            "kill -\"$3\" \"$pid\"",
+            "sh",
+            remote_pidfile,
+            str(mac_pidfile),
+            str(sig.value),
+            check=check,
+            timeout=15,
+        )
+
+    @classmethod
     def wait_for(cls, predicate, message: str, timeout: float = 15) -> None:
         deadline = time.monotonic() + timeout
         last_error: BaseException | None = None
@@ -604,13 +632,21 @@ class SshE2E(unittest.TestCase):
         release = self.work / "release"
         processes: list[subprocess.Popen[bytes]] = []
         pidfiles: list[Path] = []
+        remote_pidfile = f"{self.remote_dir}/cancel-shim.pid"
         try:
             for index in range(8):
                 ready = self.work / f"ready-{index}"
                 pidfile = self.work / f"pid-{index}"
                 pidfiles.append(pidfile)
+                command = self.shim_command("block", str(ready), str(release), str(pidfile))
+                if index == 0:
+                    command = [
+                        *self.ssh_argv(),
+                        f"printf '%s\\n' $$ > {shlex.quote(remote_pidfile)} && "
+                        + command[-1],
+                    ]
                 process = subprocess.Popen(
-                    self.shim_command("block", str(ready), str(release), str(pidfile)),
+                    command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
@@ -620,8 +656,8 @@ class SshE2E(unittest.TestCase):
             ninth = self.shim("exit", "0", check=False, timeout=10)
             self.assertNotEqual(ninth.returncode, 0)
             self.assertIn(b"capacity", ninth.stderr.lower())
-            processes[0].terminate()
-            processes[0].wait(timeout=10)
+            self.terminate_remote_shim(remote_pidfile, pidfiles[0], signal.SIGTERM)
+            self.assertNotEqual(processes[0].wait(timeout=10), 0)
             child_pid = int(pidfiles[0].read_text())
             self.wait_for(
                 lambda: subprocess.run(["kill", "-0", str(child_pid)], capture_output=True).returncode != 0,
@@ -669,6 +705,10 @@ class SshE2E(unittest.TestCase):
             self.assertEqual(flood.stdout, b"o" * (2 * 1024 * 1024))
             self.assertEqual(flood.stderr, b"e" * (2 * 1024 * 1024))
         finally:
+            if pidfiles:
+                self.terminate_remote_shim(
+                    remote_pidfile, pidfiles[0], signal.SIGTERM, check=False
+                )
             release.touch()
             for process in processes:
                 if process.poll() is None:
