@@ -532,6 +532,15 @@ class SshE2E(unittest.TestCase):
         result = cls.bridge("remote", "status", name or cls.remote_name)
         return dict(line.split(": ", 1) for line in result.stdout.decode().splitlines())
 
+    @classmethod
+    def snapshot_remote_runtime(cls) -> None:
+        cls.remote_runtime_identity = cls.ssh(
+            "sh",
+            "-c",
+            "d=/tmp/ego-lite-bridge-$(id -u); "
+            "stat -c '%d:%i:%f:%u:%a' \"$d\"",
+        ).stdout.decode().strip()
+
     def test_ssh_e2e(self) -> None:
         self.lifecycle_and_crud()
         self.transparent_execution()
@@ -590,7 +599,8 @@ class SshE2E(unittest.TestCase):
             [
                 *self.ssh_argv(),
                 "exec ~/.local/bin/ego-browser echo \"$(printf '\\377')\"",
-            ]
+            ],
+            input=b"",
         )
         self.assertEqual(non_utf8.stdout, b"\x00\x00\x00\x01\xff")
         self.assertEqual(self.shim("exit", "37", check=False).returncode, 37)
@@ -708,6 +718,7 @@ class SshE2E(unittest.TestCase):
             "remote did not recover after crash restart",
             30,
         )
+        self.snapshot_remote_runtime()
         self.assertEqual(self.shim("exit", "0").returncode, 0)
 
     def owner_conflict(self) -> None:
@@ -774,7 +785,12 @@ class SshE2E(unittest.TestCase):
         self.assertEqual(self.shim("exit", "0").returncode, 0)
         self.stop_bridge(signal.SIGKILL)
         self.start_bridge()
-        self.wait_for(lambda: self.remote_details()["observed"] == "connected", "remote did not recover after crash", 30)
+        self.wait_for(
+            lambda: self.remote_details()["observed"] == "connected",
+            "remote did not recover after crash",
+            30,
+        )
+        self.snapshot_remote_runtime()
 
 
 if __name__ == "__main__":
