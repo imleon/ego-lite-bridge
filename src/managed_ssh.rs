@@ -37,6 +37,14 @@ impl ManagedSsh {
         let mut command = crate::macos_process::command("ssh".as_ref());
         command.arg("-F").arg(&self.config_path).args([
             "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=4",
+            "-o",
             "ControlMaster=no",
             "-o",
             "ControlPath=none",
@@ -93,8 +101,6 @@ fn write_config(path: &Path) -> io::Result<()> {
     if system_config.is_file() {
         contents.push_str(&format!("Include {}\n", ssh_config_path(system_config)));
     }
-    contents
-        .push_str("Host *\n  BatchMode yes\n  ServerAliveInterval 15\n  ServerAliveCountMax 4\n");
 
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -113,24 +119,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_config_disables_interactive_authentication() {
+    fn managed_config_only_contains_includes() {
         let dir = create_private_dir().expect("private dir");
         let path = dir.join("config");
         write_config(&path).expect("write config");
         let contents = fs::read_to_string(path).expect("read config");
-        assert!(contents.contains("\n  BatchMode yes\n"));
+        assert!(contents.lines().all(|line| line.starts_with("Include ")));
         fs::remove_dir_all(dir).expect("remove private dir");
     }
 
     #[test]
-    fn command_disables_connection_sharing() {
+    fn command_sets_managed_options() {
         let managed = ManagedSsh::new("example.test").expect("managed ssh");
         let args = managed
             .command()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        for option in ["ControlMaster=no", "ControlPath=none", "ControlPersist=no"] {
+        for option in [
+            "BatchMode=yes",
+            "ConnectTimeout=10",
+            "ServerAliveInterval=15",
+            "ServerAliveCountMax=4",
+            "ControlMaster=no",
+            "ControlPath=none",
+            "ControlPersist=no",
+        ] {
             assert!(args.iter().any(|arg| arg == option), "missing {option}");
         }
     }

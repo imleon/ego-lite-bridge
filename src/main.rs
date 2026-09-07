@@ -5,8 +5,10 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(any(target_os = "macos", test))]
+use std::time::Duration;
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(any(target_os = "macos", test))]
 mod config;
@@ -26,11 +28,11 @@ mod macos_process;
 mod managed_ssh;
 
 const USAGE: &str = "ego-lite-bridge — headless reverse remote exec bridge for ego-browser\n\nUsage:\n  ego-lite-bridge start\n  ego-lite-bridge stop\n  ego-lite-bridge status\n  ego-lite-bridge doctor [name-or-config-id]\n  ego-lite-bridge remote add <name> <target>\n  ego-lite-bridge remote list\n  ego-lite-bridge remote status <name-or-config-id>\n  ego-lite-bridge remote retry <name-or-config-id>\n  ego-lite-bridge remote remove <name-or-config-id>\n  ego-lite-bridge --help\n  ego-lite-bridge --version";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const ADD_TIMEOUT: Duration = Duration::from_secs(32);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(12);
 #[cfg(target_os = "macos")]
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -63,11 +65,11 @@ fn run(args: &[OsString]) -> io::Result<i32> {
         Some(command) if command == "ego-browser-broker" && args.len() == 2 => {
             ego_bridge::run_broker().map(|()| 0)
         }
-        Some(command) if command == "--help" || command == "-h" => {
+        Some(command) if (command == "--help" || command == "-h") && args.len() == 2 => {
             println!("{USAGE}");
             Ok(0)
         }
-        Some(command) if command == "--version" || command == "-V" => {
+        Some(command) if (command == "--version" || command == "-V") && args.len() == 2 => {
             println!("ego-lite-bridge {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
@@ -442,45 +444,14 @@ fn control_io_error(error: &control::ControlError) -> io::Error {
 
 #[cfg(target_os = "macos")]
 fn run_remote(args: &[OsString]) -> io::Result<i32> {
-    let (request, timeout) = match args {
-        [command, name, target] if command == "add" => {
-            let name = remote_argument(name, "remote name")?;
-            let target = remote_argument(target, "remote target")?;
-            if let Err(error) = config::validate_remote_name(name)
-                .and_then(|()| config::validate_remote_target(target))
-            {
-                eprintln!("ego-lite-bridge: {error}");
-                return Ok(2);
-            }
-            (
-                control::Request::RemoteAdd {
-                    name: name.into(),
-                    target: target.into(),
-                },
-                ADD_TIMEOUT,
-            )
-        }
-        [command] if command == "list" => (control::Request::RemoteList, CONTROL_TIMEOUT),
-        [command, selector] if command == "status" => (
-            control::Request::RemoteStatus {
-                selector: remote_argument(selector, "remote selector")?.into(),
-            },
-            CONTROL_TIMEOUT,
-        ),
-        [command, selector] if command == "retry" => (
-            control::Request::RemoteRetry {
-                selector: remote_argument(selector, "remote selector")?.into(),
-            },
-            CONTROL_TIMEOUT,
-        ),
-        [command, selector] if command == "remove" => (
-            control::Request::RemoteRemove {
-                selector: remote_argument(selector, "remote selector")?.into(),
-            },
-            CLEANUP_TIMEOUT,
-        ),
-        _ => {
+    let (request, timeout) = match remote_request(args) {
+        Ok(Some(request)) => request,
+        Ok(None) => {
             eprintln!("{USAGE}");
+            return Ok(2);
+        }
+        Err(message) => {
+            eprintln!("ego-lite-bridge: {message}");
             return Ok(2);
         }
     };
@@ -527,14 +498,52 @@ fn run_remote(args: &[OsString]) -> io::Result<i32> {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn remote_argument<'a>(value: &'a OsStr, description: &str) -> io::Result<&'a str> {
-    value.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{description} is not valid UTF-8"),
-        )
-    })
+#[cfg(any(target_os = "macos", test))]
+fn remote_request(args: &[OsString]) -> Result<Option<(control::Request, Duration)>, String> {
+    let request = match args {
+        [command, name, target] if command == "add" => {
+            let name = remote_argument(name, "remote name")?;
+            let target = remote_argument(target, "remote target")?;
+            config::validate_remote_name(name)
+                .and_then(|()| config::validate_remote_target(target))
+                .map_err(|error| error.to_string())?;
+            (
+                control::Request::RemoteAdd {
+                    name: name.into(),
+                    target: target.into(),
+                },
+                ADD_TIMEOUT,
+            )
+        }
+        [command] if command == "list" => (control::Request::RemoteList, CONTROL_TIMEOUT),
+        [command, selector] if command == "status" => (
+            control::Request::RemoteStatus {
+                selector: remote_argument(selector, "remote selector")?.into(),
+            },
+            CONTROL_TIMEOUT,
+        ),
+        [command, selector] if command == "retry" => (
+            control::Request::RemoteRetry {
+                selector: remote_argument(selector, "remote selector")?.into(),
+            },
+            CONTROL_TIMEOUT,
+        ),
+        [command, selector] if command == "remove" => (
+            control::Request::RemoteRemove {
+                selector: remote_argument(selector, "remote selector")?.into(),
+            },
+            CLEANUP_TIMEOUT,
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some(request))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn remote_argument<'a>(value: &'a OsStr, description: &str) -> Result<&'a str, String> {
+    value
+        .to_str()
+        .ok_or_else(|| format!("{description} is not valid UTF-8"))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -787,6 +796,29 @@ mod tests {
             run(&["ego-lite-bridge".into(), "unknown".into()]).expect("dispatch"),
             2
         );
+        for flag in ["--help", "-h", "--version", "-V"] {
+            assert_eq!(
+                run(&["ego-lite-bridge".into(), flag.into(), "extra".into()]).expect("dispatch"),
+                2
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remote_parser_rejects_non_utf8_as_usage_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = OsString::from_vec(vec![0xff]);
+        for args in [
+            vec!["add".into(), invalid.clone(), "user@host".into()],
+            vec!["add".into(), "dev".into(), invalid.clone()],
+            vec!["status".into(), invalid.clone()],
+            vec!["retry".into(), invalid.clone()],
+            vec!["remove".into(), invalid],
+        ] {
+            assert!(remote_request(&args).is_err());
+        }
     }
 
     fn remote() -> control::RemoteDto {
