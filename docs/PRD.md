@@ -454,7 +454,8 @@ ego-lite-bridge doctor [name-or-id]
 ### 15.4 0.1发布验证
 
 - preparation-only `workflow_dispatch`在所选ref/commit的干净checkout上运行格式、Clippy `-D warnings`、Rust tests、installer tests和release preparation tests；不要求tag，也不发布release；
-- 原生runner分别构建并验证`linux-x86_64`（runner `x86_64`、ELF x86-64）和`macos-aarch64`（runner `arm64`、Mach-O arm64）；
+- 原生runner分别构建并验证`linux-x86_64`（静态`x86_64-unknown-linux-musl`、runner `x86_64`、ELF x86-64，无program interpreter、动态依赖或`GLIBC_*`版本要求）和`macos-aarch64`（原生`aarch64-apple-darwin`、runner `arm64`、Mach-O arm64）；
+- preparation workflow在Ubuntu 20.04、glibc 2.31容器中运行精确的已暂存Linux候选并验证`--version`；
 - 下载产物包含保持可执行权限的`tar.gz`候选bundle及其disabled manifest；
 - 维护者在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；
 - 实际发布前`distribution/latest.json`保持`available: false`，工作流不更新release metadata。

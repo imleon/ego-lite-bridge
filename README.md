@@ -19,7 +19,7 @@ Linux ego-browser shim -> Linux broker -> SSH channel -> Mac executor -> ego-bro
 
 ## Release status
 
-The 0.1 release candidates target `linux-x86_64` and `macos-aarch64`. Maintainers are preparing and validating them with a manual release workflow; no 0.1 release has been published yet. `distribution/latest.json` remains unavailable, so the release installer cannot install this project yet. Build and install from source as described below.
+The 0.1 release candidates target `linux-x86_64` and `macos-aarch64`. The Linux candidate is a static `x86_64-unknown-linux-musl` binary, and the macOS candidate is a native `aarch64-apple-darwin` binary. The preparation workflow runs the exact staged Linux candidate on Ubuntu 20.04 with glibc 2.31. Maintainers are preparing and validating these candidates with a manual release workflow; no 0.1 release has been published yet. `distribution/latest.json` remains unavailable, so the release installer cannot install this project yet. Build and install from source as described below.
 
 ## Quick start
 

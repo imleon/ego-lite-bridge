@@ -19,7 +19,7 @@ Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-brow
 
 ## 发布状态
 
-0.1 候选版本仅面向 `linux-x86_64` 和 `macos-aarch64`。维护者正在通过手工发布流程准备和验证候选产物；0.1 尚未发布。`distribution/latest.json` 仍标记为不可用，因此发行版安装器目前还不能安装本项目。请按下文说明从源码构建并安装。
+0.1 候选版本仅面向 `linux-x86_64` 和 `macos-aarch64`。Linux 候选是静态 `x86_64-unknown-linux-musl` binary，macOS 候选是原生 `aarch64-apple-darwin` binary。preparation workflow 会在 Ubuntu 20.04、glibc 2.31 环境中运行精确的已暂存 Linux 候选。维护者正在通过手工发布流程准备和验证这些候选产物；0.1 尚未发布。`distribution/latest.json` 仍标记为不可用，因此发行版安装器目前还不能安装本项目。请按下文说明从源码构建并安装。
 
 ## 快速开始
 
