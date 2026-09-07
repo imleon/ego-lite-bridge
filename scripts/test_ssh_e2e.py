@@ -232,17 +232,25 @@ class SshE2E(unittest.TestCase):
 
     @classmethod
     def start_bridge(cls) -> None:
-        with (cls.work / "daemon.log").open("ab") as log:
+        log_path = cls.work / "daemon.log"
+        with log_path.open("ab") as log:
             cls.daemon = subprocess.Popen(
                 [str(cls.binary), "daemon", "--ego-browser", str(cls.fake)],
                 env=cls.mac_env,
                 stdout=log,
                 stderr=log,
             )
-        cls.wait_for(
-            lambda: cls.bridge("status", check=False).returncode == 0,
-            "daemon did not start",
-        )
+
+        def ready() -> bool:
+            assert cls.daemon is not None
+            if cls.daemon.poll() is not None:
+                detail = log_path.read_text(errors="replace")
+                raise AssertionError(
+                    f"daemon exited during startup ({cls.daemon.returncode}):\n{detail}"
+                )
+            return cls.bridge("status", check=False).returncode == 0
+
+        cls.wait_for(ready, "daemon did not start")
 
     @classmethod
     def stop_bridge(cls, sig: signal.Signals = signal.SIGTERM) -> None:
@@ -340,9 +348,13 @@ class SshE2E(unittest.TestCase):
             for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src", "tests/fixtures"):
                 archive.add(ROOT / name, arcname=f"source/{name}")
         extract.stdin.close()
-        stderr = extract.stderr.read() if extract.stderr else b""
-        if extract.wait(timeout=DEADLINE) != 0:
-            raise RuntimeError(f"remote tar extraction failed: {stderr.decode(errors='replace')}")
+        extract.stdin = None
+        stdout, stderr = extract.communicate(timeout=DEADLINE)
+        if extract.returncode != 0:
+            raise RuntimeError(
+                "remote tar extraction failed: "
+                + (stderr or stdout).decode(errors="replace")
+            )
         cls.ssh(
             "sh",
             "-c",
