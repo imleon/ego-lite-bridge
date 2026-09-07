@@ -172,10 +172,10 @@ class SshE2E(unittest.TestCase):
         cls.remote_state_dirs_existed: list[bool] = []
         cls.daemon: subprocess.Popen[bytes] | None = None
         cls.added: set[str] = set()
-        cls.temp = tempfile.TemporaryDirectory(prefix="ego-lite-ssh-e2e-")
+        cls.temp = tempfile.TemporaryDirectory(prefix="elb-", dir="/tmp")
         cls.work = Path(cls.temp.name)
-        cls.mac_home = cls.work / "mac-home"
-        cls.mac_home.mkdir()
+        cls.mac_home = cls.work / "home"
+        cls.mac_home.mkdir(mode=0o700)
         user_ssh = Path.home() / ".ssh"
         if user_ssh.is_dir():
             (cls.mac_home / ".ssh").symlink_to(user_ssh, target_is_directory=True)
