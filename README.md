@@ -19,13 +19,7 @@ Linux ego-browser shim -> Linux broker -> SSH channel -> Mac executor -> ego-bro
 
 ## Release status
 
-Version 0.1.0 supports `linux-x86_64` and `macos-aarch64`. The Linux release is a static `x86_64-unknown-linux-musl` binary, and the macOS release is a native `aarch64-apple-darwin` binary. Install the latest release with:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/install.sh | sh
-```
-
-The installer verifies the downloaded binary against the SHA-256 checksum in the release manifest.
+Version 0.1.0 provides prebuilt binaries for `linux-x86_64` and `macos-aarch64`; users do not need Rust or a source build. The Linux release is a static `x86_64-unknown-linux-musl` binary, and the macOS release is a native `aarch64-apple-darwin` binary.
 
 ## Quick start
 
@@ -33,16 +27,15 @@ Prerequisites:
 
 - macOS with the real `ego-browser` available on `PATH`.
 - A Linux host reachable with non-interactive SSH authentication.
-- `ego-lite-bridge` installed at `~/.local/bin/ego-lite-bridge` on Linux.
-- `ego-lite-bridge` installed on the Mac.
+- `~/.local/bin` on `PATH` on both machines.
 
-On Linux, install the binary and create the shim:
+Install the latest release on both the Mac and Linux host:
 
 ```bash
-mkdir -p ~/.local/bin
-install -m755 target/release/ego-lite-bridge ~/.local/bin/ego-lite-bridge
-ln -sf ego-lite-bridge ~/.local/bin/ego-browser
+curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/install.sh | sh
 ```
+
+The installer verifies the binary against the release manifest's SHA-256 checksum. On Linux it also creates the `ego-browser` shim; on macOS it installs only `ego-lite-bridge`.
 
 On the Mac, start the daemon and add the remote:
 
@@ -82,7 +75,7 @@ Desired states are `pending`, `active`, and `removing`; observed states are `con
 
 Control commands are macOS-only; Linux exposes the `ego-browser` shim.
 
-## Build and install from source
+## Development from source
 
 Rust and `just` are required.
 
@@ -107,7 +100,7 @@ install -m755 target/release/ego-lite-bridge ~/.local/bin/ego-lite-bridge
 ln -sf ego-lite-bridge ~/.local/bin/ego-browser
 ```
 
-Ensure `~/.local/bin` is on `PATH`. The release installer performs the same platform-specific setup.
+These steps are for contributors building from source; regular users should use the release installer above.
 
 ## Current limitations
 

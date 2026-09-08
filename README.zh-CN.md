@@ -19,13 +19,7 @@ Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-brow
 
 ## 发布状态
 
-版本 0.1.0 支持 `linux-x86_64` 和 `macos-aarch64`。Linux 发行版是静态 `x86_64-unknown-linux-musl` binary，macOS 发行版是原生 `aarch64-apple-darwin` binary。使用以下命令安装最新版本：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/install.sh | sh
-```
-
-安装器会使用发行 manifest 中的 SHA-256 校验下载的二进制。
+版本 0.1.0 为 `linux-x86_64` 和 `macos-aarch64` 提供预编译二进制，用户无需安装 Rust 或从源码构建。Linux 发行版是静态 `x86_64-unknown-linux-musl` binary，macOS 发行版是原生 `aarch64-apple-darwin` binary。
 
 ## 快速开始
 
@@ -33,16 +27,15 @@ curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distr
 
 - macOS 的 `PATH` 中已有真正的 `ego-browser`。
 - Linux 主机可通过非交互 SSH 认证访问。
-- Linux 的 `~/.local/bin/ego-lite-bridge` 已安装。
-- Mac 已安装 `ego-lite-bridge`。
+- 两台机器的 `PATH` 中都包含 `~/.local/bin`。
 
-在 Linux 安装二进制并创建 shim：
+在 Mac 和 Linux 主机上分别安装最新版本：
 
 ```bash
-mkdir -p ~/.local/bin
-install -m755 target/release/ego-lite-bridge ~/.local/bin/ego-lite-bridge
-ln -sf ego-lite-bridge ~/.local/bin/ego-browser
+curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/install.sh | sh
 ```
+
+安装器会使用发行 manifest 中的 SHA-256 校验二进制。在 Linux 上还会创建 `ego-browser` shim；在 macOS 上只安装 `ego-lite-bridge`。
 
 在 Mac 启动 daemon 并添加 remote：
 
@@ -82,7 +75,7 @@ Desired 状态为 `pending`、`active` 和 `removing`；observed 状态为 `conn
 
 控制命令仅支持 macOS；Linux 提供 `ego-browser` shim。
 
-## 从源码构建和安装
+## 从源码开发
 
 需要 Rust 和 `just`。
 
@@ -107,7 +100,7 @@ install -m755 target/release/ego-lite-bridge ~/.local/bin/ego-lite-bridge
 ln -sf ego-lite-bridge ~/.local/bin/ego-browser
 ```
 
-确保 `~/.local/bin` 位于 `PATH`。发行版安装器会执行相同的平台安装步骤。
+以上步骤仅供贡献者从源码构建；普通用户应使用上方的发行版安装器。
 
 ## 当前限制
 
