@@ -5638,7 +5638,7 @@ mod tests {
     fn executor_forwards_stdin_larger_than_input_queue() {
         let (sender, output, worker) = start_test_executor();
         let request_id = 39;
-        let input = (0..9 * 16 * 1024)
+        let input = (0..REQUEST_QUEUE_CAPACITY * 16 * 1024)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         sender
@@ -5683,7 +5683,7 @@ mod tests {
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        assert_eq!(actual, b"1862523210 147456\n");
+        assert_eq!(actual, b"1837254396 131072\n");
         assert!(messages.iter().any(|message| matches!(
             message,
             EgoBridgeMessage::Exit {
