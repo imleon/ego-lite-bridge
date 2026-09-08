@@ -169,9 +169,8 @@ validate_install_paths() {
         if [ ! -L "$SHIM" ]; then
             err "shim path is not a symlink to ${BIN}: ${SHIM}"
         fi
-        SHIM_TARGET="$(readlink "$SHIM"; printf x)"
-        if [ "$SHIM_TARGET" != "${BIN}
-x" ]; then
+        SHIM_TARGET="$(readlink -n "$SHIM"; printf x)"
+        if [ "$SHIM_TARGET" != "${BIN}x" ]; then
             err "shim path is not a symlink to ${BIN}: ${SHIM}"
         fi
     fi
