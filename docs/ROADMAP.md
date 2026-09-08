@@ -70,6 +70,8 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 
 验收：alias identity、live owner拒绝、dead owner接管、网络分区恢复、多claimant、私有socket创建和日志sentinel测试通过。
 
+M5冻结的是identity/ownership wire基线；最终0.1 remote exec protocol在M8升级为v3，不保留v2 fallback。
+
 边界：ownership只fence Linux新请求入口；不承诺瞬时终止网络分区另一侧已运行的Mac child。
 
 ### M6 — Remote CRUD与RemoteWorker接入（已完成）
@@ -124,6 +126,8 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 - 在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；
 - README只陈述已验证的候选范围和实际发布状态，不宣称尚未完成的自动化；
 - 实际发布前保持`distribution/latest.json`的`available: false`，installer仍不可用。
+
+发布准备同时将remote exec protocol升级为v3：child exit signal使用canonical signal name白名单，unsupported child signal返回request error，未知wire signal视为protocol error；v2/v3 exact-version mismatch明确失败且无fallback。升级时先停止v2 Mac daemon，再更新Linux binary，最后启动v3 Mac daemon并通过status/doctor确认。remote name移除造成独立的本地wire shape变化，因此本地control protocol也升级为v3；config schema保持独立的v2，不迁移旧schema，不得混淆三个版本。
 
 候选产物准备完成不等于已经发布。
 

@@ -38,7 +38,7 @@ ego-browser <args...>
 - argv，包括 Unix 非 UTF-8 参数；
 - binary-safe stdin、stdout、stderr；
 - stdin EOF；
-- exit code，以及 Mac child 因 signal 终止时的 signal；
+- exit code，以及 Mac child 因 signal 终止时的 canonical signal name；
 - spawn、协议和连接错误；
 - request 级取消。
 
@@ -345,7 +345,7 @@ broker socket路径改为：
 - 配置schema固定为v2；持久remote模型包含`config_id`、`target`、`endpoint_id`、`lifecycle`、`observed_state`、`state_changed_unix_ms`和`last_error`；
 - 配置写入使用同目录临时文件、flush、fsync和原子rename；
 - 未知、旧版或损坏schema明确失败，不迁移、不猜测修复；
-- CLI与daemon使用独立、版本为v3、长度限制的本机控制协议；
+- CLI与daemon使用独立、版本化、长度限制的本机控制协议；
 - 控制协议不复用远程exec协议，也不能传递任意shell命令。
 
 ## 11. 日志与敏感数据
@@ -371,14 +371,16 @@ broker socket路径改为：
 
 ## 12. 协议要求
 
-正式0.1采用包含endpoint identity与ownership语义的protocol v2：
+正式0.1采用包含endpoint identity、ownership和portable exit signal语义的remote exec protocol v3；remote name移除导致wire shape变化，本地control protocol独立升级为v3：
 
-- exact-version和exact-capability匹配；
-- 不支持v1 fallback或静默降级；
+- exact-version和exact-capability匹配，不支持remote exec v2 fallback或静默降级；
+- child exit signal在wire上使用canonical名称，不使用平台signal number或enum ordinal；
+- replay白名单为`SIGHUP`、`SIGINT`、`SIGQUIT`、`SIGILL`、`SIGTRAP`、`SIGABRT`、`SIGFPE`、`SIGKILL`、`SIGBUS`、`SIGSEGV`、`SIGSYS`、`SIGPIPE`、`SIGALRM`、`SIGTERM`、`SIGUSR1`、`SIGUSR2`、`SIGVTALRM`、`SIGPROF`、`SIGXCPU`和`SIGXFSZ`；停止、继续、窗口/child通知及平台专有signal不进入白名单；
+- Mac child以白名单外signal退出时返回request-scoped error，不发送原始number、不猜测、不降级；收到未知wire signal name视为protocol error并关闭不可信channel；
 - Mac owner identity必须在candidate broker触碰现有socket之前交换；
 - ownership确定后broker返回明确ready或owner-conflict；
 - takeover、liveness probe和ack使用framed protocol，不解析日志；
-- v2 golden fixture覆盖全部消息和仲裁状态；
+- v3 golden fixture覆盖全部消息和仲裁状态，并包含canonical signal name；
 - wire shape变化必须显式升级版本和fixture。
 
 ## 13. Status 与 Doctor
@@ -466,11 +468,11 @@ ego-lite-bridge doctor [config-id]
 
 当前`serve <linux-host>`是开发入口，不是0.1最终控制面。在daemon与Remote CRUD整体可用前保留该入口，避免中间版本不可用；最终切换时删除公开入口或改为明确内部命令，不保留静默兼容别名。
 
-protocol v2升级顺序：
+remote exec protocol v2→v3升级顺序：
 
-1. 停止现有v1 Mac supervisor；
-2. 更新Linux binary；
-3. 更新并启动v2 Mac daemon；
-4. 通过`remote add`建立配置。
+1. 停止现有v2 Mac daemon，确保其不再持有remote owner claim；
+2. 更新Linux binary至v3；
+3. 更新并启动v3 Mac daemon；
+4. 确认remote status和doctor报告protocol v3，再恢复调用。
 
-不得在v1 Linux broker仍运行时直接用v2 Mac尝试接管。正式0.1只承诺daemon架构和protocol v2，不承诺开发阶段v1兼容。
+不得让v2和v3组件混用或并行接管；版本不匹配必须明确失败，不得fallback。正式0.1只承诺daemon架构、remote exec protocol v3和本地control protocol v3；两种v3协议独立版本化，不得混为同一协议。配置schema为v2，不提供旧schema迁移。

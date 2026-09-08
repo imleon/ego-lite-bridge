@@ -182,28 +182,22 @@ esac
                 self.assertFalse(installed.is_symlink())
                 self.assertEqual(os.readlink(self.install_dir / "ego-browser"), "ego-lite-bridge")
 
-    def test_success_remains_success_after_stdout_disconnects_at_commit(self) -> None:
-        process = subprocess.Popen(
-            ["/bin/sh", str(INSTALLER)],
-            env=self._installer_env(self.expected_sha256),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+    def test_pipe_during_link_does_not_interrupt_commit(self) -> None:
+        real_ln = os.readlink(self.bin_dir / "ln")
+        (self.bin_dir / "ln").unlink()
+        self._write_executable(
+            "ln",
+            f'#!/bin/sh\nkill -PIPE "$PPID"\nexec {real_ln} "$@"\n',
         )
-        assert process.stdout is not None
-        for line in process.stdout:
-            if "created ego-browser shim" in line:
-                process.stdout.close()
-                break
-        stderr = process.stderr.read() if process.stderr is not None else ""
-        if process.stderr is not None:
-            process.stderr.close()
 
-        self.assertEqual(process.wait(), 0, stderr)
+        result = self._run_installer(self.expected_sha256)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             (self.install_dir / "ego-lite-bridge").read_bytes(),
             self.payload.read_bytes(),
         )
+        self.assertEqual(os.readlink(self.install_dir / "ego-browser"), "ego-lite-bridge")
 
     def test_macos_installs_no_shim(self) -> None:
         result = self._run_installer(self.expected_sha256, os_name="macos")
@@ -307,15 +301,17 @@ esac
                 self.assertFalse((self.root / "output-path").exists())
 
     def test_rejects_nonmatching_existing_shim_before_download(self) -> None:
-        for kind in ("file", "wrong-symlink"):
+        for kind in ("file", "wrong-symlink", "newline-symlink"):
             with self.subTest(kind=kind):
                 shutil.rmtree(self.install_dir, ignore_errors=True)
                 self.install_dir.mkdir()
                 shim = self.install_dir / "ego-browser"
                 if kind == "file":
                     shim.write_text("not a shim\n", encoding="utf-8")
-                else:
+                elif kind == "wrong-symlink":
                     shim.symlink_to("other-binary")
+                else:
+                    shim.symlink_to("ego-lite-bridge\n")
                 (self.root / "output-path").unlink(missing_ok=True)
 
                 result = self._run_installer(self.expected_sha256)

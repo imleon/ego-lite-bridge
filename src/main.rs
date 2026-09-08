@@ -933,7 +933,7 @@ mod tests {
         assert!(checks.iter().any(|line| line
             == "PASS remote.0123456789abcdef0123456789abcdef.configured_identity: present"));
         assert!(checks.iter().any(|line| line.starts_with(
-            "PASS remote.0123456789abcdef0123456789abcdef.handshake: currently known v2"
+            "PASS remote.0123456789abcdef0123456789abcdef.handshake: currently known v3"
         )));
         assert!(checks.iter().any(|line| line.starts_with(
             "NOT CHECKED remote.0123456789abcdef0123456789abcdef.live_endpoint: no new SSH, socket permission check"

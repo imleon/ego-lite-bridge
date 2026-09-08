@@ -105,7 +105,7 @@ class ManualE2ETest(unittest.TestCase):
         self.assertEqual(details["desired"], "active")
         self.assertEqual(details["observed"], "connected")
         self.assertEqual(details["last-error"], "unknown")
-        self.assertEqual(details["protocol-version"], "2")
+        self.assertEqual(details["protocol-version"], "3")
         self.assertRegex(details["capabilities"], r"^0x[0-9a-f]+$")
         self.assertEqual(details["reconnect-attempt"], "unknown")
         self.assertEqual(details["reconnect-at-unix-ms"], "unknown")
@@ -133,7 +133,7 @@ class ManualE2ETest(unittest.TestCase):
                 f"PASS remote.{config_id}.configured_identity: present", lines
             )
             self.assertIn(
-                f"PASS remote.{config_id}.handshake: currently known v2 "
+                f"PASS remote.{config_id}.handshake: currently known v3 "
                 f"capabilities={details['capabilities']}",
                 lines,
             )
