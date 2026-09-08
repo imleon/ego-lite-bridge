@@ -37,6 +37,29 @@ curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distr
 
 The installer verifies the binary against the release manifest's SHA-256 checksum. On Linux it also creates the `ego-browser` shim; on macOS it installs only `ego-lite-bridge`.
 
+To download and install manually instead, run the matching commands on each machine.
+
+macOS arm64:
+
+```bash
+curl -fLO https://github.com/imleon/ego-lite-bridge/releases/latest/download/ego-lite-bridge-macos-aarch64
+curl -fLO https://github.com/imleon/ego-lite-bridge/releases/latest/download/SHA256SUMS
+grep ' ego-lite-bridge-macos-aarch64$' SHA256SUMS | shasum -a 256 -c -
+mkdir -p ~/.local/bin
+install -m755 ego-lite-bridge-macos-aarch64 ~/.local/bin/ego-lite-bridge
+```
+
+Linux x86_64:
+
+```bash
+curl -fLO https://github.com/imleon/ego-lite-bridge/releases/latest/download/ego-lite-bridge-linux-x86_64
+curl -fLO https://github.com/imleon/ego-lite-bridge/releases/latest/download/SHA256SUMS
+grep ' ego-lite-bridge-linux-x86_64$' SHA256SUMS | sha256sum -c -
+mkdir -p ~/.local/bin
+install -m755 ego-lite-bridge-linux-x86_64 ~/.local/bin/ego-lite-bridge
+ln -sf ego-lite-bridge ~/.local/bin/ego-browser
+```
+
 On the Mac, start the daemon and add the remote:
 
 ```bash
