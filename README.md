@@ -19,7 +19,13 @@ Linux ego-browser shim -> Linux broker -> SSH channel -> Mac executor -> ego-bro
 
 ## Release status
 
-The 0.1 release candidates target `linux-x86_64` and `macos-aarch64`. The Linux candidate is a static `x86_64-unknown-linux-musl` binary, and the macOS candidate is a native `aarch64-apple-darwin` binary. The preparation workflow runs the exact staged Linux candidate on Ubuntu 20.04 with glibc 2.31. Maintainers are preparing and validating these candidates with a manual release workflow; no 0.1 release has been published yet. `distribution/latest.json` remains unavailable, so the release installer cannot install this project yet. Build and install from source as described below.
+Version 0.1.0 supports `linux-x86_64` and `macos-aarch64`. The Linux release is a static `x86_64-unknown-linux-musl` binary, and the macOS release is a native `aarch64-apple-darwin` binary. Install the latest release with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/install.sh | sh
+```
+
+The installer verifies the downloaded binary against the SHA-256 checksum in the release manifest.
 
 ## Quick start
 
@@ -101,7 +107,7 @@ install -m755 target/release/ego-lite-bridge ~/.local/bin/ego-lite-bridge
 ln -sf ego-lite-bridge ~/.local/bin/ego-browser
 ```
 
-Ensure `~/.local/bin` is on `PATH`. The release installer in `distribution/install.sh` performs the same platform-specific setup when a release is available.
+Ensure `~/.local/bin` is on `PATH`. The release installer performs the same platform-specific setup.
 
 ## Current limitations
 
