@@ -28,6 +28,7 @@ Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-brow
 - macOS 的 `PATH` 中已有真正的 `ego-browser`。
 - Linux 主机可通过非交互 SSH 认证访问。
 - 两台机器的 `PATH` 中都包含 `~/.local/bin`。
+- Linux 需要 Node.js 22.20.0 或更高版本和 `npm`/`npx`，用于安装 Agent skill。
 
 在 Mac 和 Linux 主机上分别安装最新版本：
 
@@ -35,9 +36,19 @@ Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-brow
 curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/install.sh | sh
 ```
 
-安装器会使用发行 manifest 中的 SHA-256 校验二进制。在 Linux 上还会创建 `ego-browser` shim；在 macOS 上只安装 `ego-lite-bridge`。
+安装器会使用发行 manifest 中的 SHA-256 校验二进制。在 macOS 上只安装 `ego-lite-bridge`。release 还包含 `ego-browser-skill.tgz`；在 Linux 上，安装器从 manifest 的 `skill_url` 下载该文件，使用 manifest 中的 SHA-256 校验并解包，安装 binary 和 `ego-browser` shim，然后在解包后的本地目录内部运行以下固定命令：
 
-如果希望手工下载和安装，请在两台机器上分别运行对应命令。
+```bash
+npx --yes skills@1.5.24 add /path/to/extracted/ego-browser --skill ego-browser --global --agent '*' --yes --copy
+```
+
+该命令使用通用 Vercel skills CLI，为其能够写入的所有受支持 Agent target 全局安装或覆盖 `ego-browser` skill。少数 target 不支持 global 或 per-agent 写入；CLI 可能打印这些错误但整体退出状态仍为 0，因此安装器成功不代表每个 target 都已更新。重跑安装器会覆盖其写入目标中已有的 `ego-browser` skill，包括本地修改。
+
+分发的 skill 保持上游通用调用说明，仅将 installation reference 改为 Linux bridge 故障排查。调用仍由 Linux shim 透明转发，浏览器继续在 Mac 上运行。
+
+安装器会先提交已校验的 bridge binary 和 shim，再调用 skills CLI。若 skill 安装失败，bridge 仍保持已安装状态，安装器会以明确的部分成功错误退出。CLI 的多 target 写入不是事务：失败前可能已经覆盖部分 skill，安装器无法自动回滚这些变更。
+
+如果希望手工下载和安装，请在两台机器上分别运行对应命令。以下手工步骤只安装 bridge binary 和 Linux shim，不分发 Agent skill。
 
 macOS arm64：
 

@@ -63,7 +63,7 @@ jobs:
           cargo fmt --check
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --locked
-          python3 -m unittest scripts.test_unix_installer scripts.test_prepare_release
+          python3 -m unittest scripts.test_unix_installer scripts.test_prepare_release scripts.test_vendored_skill
 
   build:
     name: Build ${{ matrix.target }}
@@ -194,14 +194,18 @@ jobs:
           mkdir release-bundle
           install -m 755 artifacts/ego-lite-bridge-linux-x86_64/ego-lite-bridge-linux-x86_64 release-bundle/ego-lite-bridge-linux-x86_64
           install -m 755 artifacts/ego-lite-bridge-macos-aarch64/ego-lite-bridge-macos-aarch64 release-bundle/ego-lite-bridge-macos-aarch64
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -czf release-bundle/ego-browser-skill.tgz \
+            -C distribution/skills ego-browser
           python3 scripts/prepare_release.py \
             "$VERSION" \
             release-bundle/ego-lite-bridge-linux-x86_64 \
             release-bundle/ego-lite-bridge-macos-aarch64 \
+            release-bundle/ego-browser-skill.tgz \
             > latest.json
           (
             cd release-bundle
-            sha256sum ego-lite-bridge-linux-x86_64 ego-lite-bridge-macos-aarch64 > SHA256SUMS
+            sha256sum ego-lite-bridge-linux-x86_64 ego-lite-bridge-macos-aarch64 ego-browser-skill.tgz > SHA256SUMS
           )
           cp LICENSE latest.json release-bundle/
           tar -czf release-bundle.tar.gz release-bundle
@@ -215,6 +219,7 @@ jobs:
             release-bundle.tar.gz
             release-bundle/ego-lite-bridge-linux-x86_64
             release-bundle/ego-lite-bridge-macos-aarch64
+            release-bundle/ego-browser-skill.tgz
             release-bundle/SHA256SUMS
             release-bundle/LICENSE
             latest.json

@@ -2,6 +2,8 @@
   "product": "ego-lite-bridge",
   "available": true,
   "version": "0.1.0",
+  "skill_url": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.0/ego-browser-skill.tgz",
+  "skill_sha256": "e6f43cf90de460d061c9d179f363d2f0739eb37627ec74b8ad31b0b599703010",
   "assets": {
     "linux-x86_64": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.0/ego-lite-bridge-linux-x86_64",
     "macos-aarch64": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.0/ego-lite-bridge-macos-aarch64"

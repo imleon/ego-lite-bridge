@@ -9,7 +9,7 @@ lint:
 test:
     cargo test --locked
 
-check: fmt lint test installer-test release-test
+check: fmt lint test installer-test release-test skill-test
 
 build:
     cargo build --release --locked
@@ -19,6 +19,9 @@ installer-test:
 
 release-test:
     python3 -m unittest scripts.test_prepare_release
+
+skill-test:
+    python3 -m unittest scripts.test_vendored_skill
 
 e2e-manual:
     python3 -m unittest scripts.test_manual_e2e

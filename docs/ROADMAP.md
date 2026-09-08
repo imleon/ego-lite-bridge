@@ -7,7 +7,9 @@
 ### M0 — 分发安全
 
 - installer只接受本产品manifest和可信release URL；
-- release不可用或checksum失败时不覆盖已安装binary。
+- release不可用或checksum失败时不覆盖已安装binary；
+- macOS installer保持binary-only；release包含manifest SHA-256校验的`ego-browser-skill.tgz`，Linux installer在Node.js 22.20.0或更高版本及`npm`/`npx`前置条件满足后，从manifest的`skill_url`下载、校验并解包，再从本地skill目录通过固定`skills@1.5.24`命令全局安装或覆盖所有Agent target的`ego-browser` skill；
+- 明显前置条件skill失败时保留已提交bridge并报告部分成功；skills CLI非零退出时保留已提交的bridge并明确报告部分成功；多target写入不是事务，CLI可能部分覆盖且对不支持global/per-agent写入的target打印错误后整体exit 0，因此不承诺每个target成功。
 
 ### M1 — 产品仓库裁剪
 
@@ -122,7 +124,7 @@ M5冻结的是identity/ownership wire基线；最终0.1 remote exec protocol在M
 - 输入version与Cargo version一致；
 - 维护者分别构建并核验两个候选目标：`linux-x86_64`使用静态`x86_64-unknown-linux-musl` binary，并确认无program interpreter、动态依赖或`GLIBC_*`版本要求；`macos-aarch64`使用原生`aarch64-apple-darwin` binary；
 - preparation workflow在Ubuntu 20.04、glibc 2.31容器中运行精确的已暂存Linux候选并验证`--version`；
-- 为候选产物生成并复核SHA-256；
+- 候选产物包含`ego-browser-skill.tgz`，manifest提供其`skill_url`和SHA-256；为binary与skill archive生成并复核SHA-256；
 - 在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；
 - README只陈述已验证的候选范围和实际发布状态，不宣称尚未完成的自动化；
 - 实际发布前保持`distribution/latest.json`的`available: false`，installer仍不可用。
@@ -137,9 +139,9 @@ M5冻结的是identity/ownership wire基线；最终0.1 remote exec protocol在M
 
 - 将CHANGELOG中的`0.1.0`从Unreleased改为实际发布日期；
 - 创建与Cargo version一致的`v0.1.0` tag；
-- 创建GitHub Release并上传已验证的两个binary及SHA-256；
-- 将审核后的URL与SHA-256写入`distribution/latest.json`并设置`available: true`；
-- 在Linux x86_64与macOS arm64分别执行一次公开installer smoke。
+- 创建GitHub Release并上传已验证的两个binary、`ego-browser-skill.tgz`及包含三者的`SHA256SUMS`；
+- 将审核后的binary与skill URL及SHA-256写入`distribution/latest.json`并设置`available: true`；
+- 在Linux x86_64与macOS arm64分别执行一次公开installer smoke；Linux验证固定`skills@1.5.24`分发、覆盖更新和skill失败时保留已提交bridge并报告部分成功，并记录多target写入可能部分成功且exit 0不保证全部target成功；macOS保持binary-only。
 
 ## 推荐分支与提交顺序
 
@@ -177,6 +179,7 @@ git diff --check
 其他工作仅由真实需求驱动：
 
 - remote update；
+- bridge或skill的runtime updater（skill仅由Linux installer分发）；
 - 可配置并发额度和跨remote公平调度；
 - Homebrew等分发渠道；
 - Sigstore、attestation与SBOM；

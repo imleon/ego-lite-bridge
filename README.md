@@ -28,6 +28,7 @@ Prerequisites:
 - macOS with the real `ego-browser` available on `PATH`.
 - A Linux host reachable with non-interactive SSH authentication.
 - `~/.local/bin` on `PATH` on both machines.
+- On Linux, Node.js 22.20.0 or newer and `npm`/`npx` for Agent skill installation.
 
 Install the latest release on both the Mac and Linux host:
 
@@ -35,9 +36,19 @@ Install the latest release on both the Mac and Linux host:
 curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/install.sh | sh
 ```
 
-The installer verifies the binary against the release manifest's SHA-256 checksum. On Linux it also creates the `ego-browser` shim; on macOS it installs only `ego-lite-bridge`.
+The installer verifies the binary against the release manifest's SHA-256 checksum. On macOS it installs only `ego-lite-bridge`. The release also contains `ego-browser-skill.tgz`; on Linux, the installer downloads it from the manifest's `skill_url`, verifies its manifest SHA-256 checksum, extracts it, installs the binary and `ego-browser` shim, then internally runs this pinned command against the extracted local directory:
 
-To download and install manually instead, run the matching commands on each machine.
+```bash
+npx --yes skills@1.5.24 add /path/to/extracted/ego-browser --skill ego-browser --global --agent '*' --yes --copy
+```
+
+This uses the general-purpose Vercel skills CLI to globally install or overwrite the `ego-browser` skill for every supported Agent target it can write. Some targets do not support global or per-agent writes; the CLI may print errors for those targets and still exit 0, so a successful installer run does not guarantee that every target was updated. Rerunning the installer overwrites existing `ego-browser` skills and local changes for targets it writes.
+
+The distributed skill keeps the upstream general invocation guidance; only its installation reference is changed to cover Linux bridge troubleshooting. Calls still pass transparently through the Linux shim, while the browser continues to run on the Mac.
+
+The installer commits the verified bridge binary and shim before invoking the skills CLI. If skill installation then fails, the bridge remains installed and the installer exits nonzero with an explicit partial-success error. The CLI's writes across targets are not transactional: a failed run may have already overwritten some skills, and those changes cannot be rolled back automatically.
+
+To download and install manually instead, run the matching commands on each machine. These manual steps install the bridge binary and Linux shim only; they do not distribute the Agent skill.
 
 macOS arm64:
 

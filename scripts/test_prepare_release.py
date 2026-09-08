@@ -13,6 +13,7 @@ SCRIPT = Path(__file__).with_name("prepare_release.py")
 NAMES = (
     "ego-lite-bridge-linux-x86_64",
     "ego-lite-bridge-macos-aarch64",
+    "ego-browser-skill.tgz",
 )
 
 
@@ -30,10 +31,17 @@ class PrepareReleaseTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def run_script(
-        self, version: str = "0.1.0", assets: list[Path] | None = None
+        self,
+        version: str = "0.1.0",
+        assets: list[Path] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), version, *(str(path) for path in assets or self.assets)],
+            [
+                sys.executable,
+                str(SCRIPT),
+                version,
+                *(str(path) for path in assets or self.assets),
+            ],
             capture_output=True,
             text=True,
             check=False,
@@ -49,14 +57,16 @@ class PrepareReleaseTests(unittest.TestCase):
                 "product": "ego-lite-bridge",
                 "available": False,
                 "version": "0.1.0",
+                "skill_url": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.0/ego-browser-skill.tgz",
+                "skill_sha256": hashlib.sha256(self.assets[2].read_bytes()).hexdigest(),
                 "assets": {
                     target: "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.0/"
                     + name
-                    for name, target in zip(NAMES, ("linux-x86_64", "macos-aarch64"))
+                    for name, target in zip(NAMES[:2], ("linux-x86_64", "macos-aarch64"))
                 },
                 "sha256": {
                     target: hashlib.sha256(path.read_bytes()).hexdigest()
-                    for path, target in zip(self.assets, ("linux-x86_64", "macos-aarch64"))
+                    for path, target in zip(self.assets[:2], ("linux-x86_64", "macos-aarch64"))
                 },
             },
         )
@@ -70,17 +80,34 @@ class PrepareReleaseTests(unittest.TestCase):
             ("1٢.2.3", self.assets, "invalid semantic version"),
             ("1.2.3-1٢", self.assets, "invalid semantic version"),
             ("1.2.3-a.1٢", self.assets, "invalid semantic version"),
-            ("0.1.0", [self.assets[0]], "the following arguments are required"),
-            ("0.1.0", [self.assets[0], self.assets[0]], "duplicate asset"),
+            ("0.1.0", self.assets[:2], "the following arguments are required"),
+            (
+                "0.1.0",
+                [self.assets[0], self.assets[0], self.assets[2]],
+                "duplicate asset",
+            ),
         ]
 
         unknown = self.root / "unknown"
         unknown.write_bytes(b"unknown")
-        cases.append(("0.1.0", [self.assets[0], unknown], "unknown asset name"))
+        cases.append(
+            ("0.1.0", [self.assets[0], self.assets[1], unknown], "unknown asset name")
+        )
+        cases.append(
+            (
+                "0.1.0",
+                [self.assets[0], self.assets[1], self.root / "missing" / NAMES[2]],
+                "cannot inspect asset",
+            )
+        )
 
-        empty = self.root / NAMES[1]
+        empty_dir = self.root / "empty"
+        empty_dir.mkdir()
+        empty = empty_dir / NAMES[1]
         empty.write_bytes(b"")
-        cases.append(("0.1.0", self.assets, "asset is empty"))
+        cases.append(
+            ("0.1.0", [self.assets[0], empty, self.assets[2]], "asset is empty")
+        )
 
         for version, assets, error in cases:
             with self.subTest(version=version, assets=assets, error=error):
@@ -92,16 +119,15 @@ class PrepareReleaseTests(unittest.TestCase):
         directory = self.assets[1]
         directory.unlink()
         directory.mkdir()
-        result = self.run_script(assets=[self.assets[0], directory])
+        result = self.run_script(assets=[self.assets[0], directory, self.assets[2]])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not a regular file", result.stderr)
 
         directory.rmdir()
         directory.symlink_to(self.assets[0])
-        result = self.run_script(assets=[self.assets[0], directory])
+        result = self.run_script(assets=[self.assets[0], directory, self.assets[2]])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must not be a symlink", result.stderr)
-
 
 if __name__ == "__main__":
     unittest.main()

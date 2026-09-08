@@ -50,5 +50,5 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Test Unix installer
-        run: python3 -m unittest scripts.test_unix_installer
+      - name: Test Unix installer and vendored skill
+        run: python3 -m unittest scripts.test_unix_installer scripts.test_vendored_skill

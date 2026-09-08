@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a disabled release manifest from the two supported binaries."""
+"""Generate a disabled release manifest from the required release assets."""
 
 from __future__ import annotations
 
@@ -13,7 +13,9 @@ from pathlib import Path
 ASSETS = (
     "ego-lite-bridge-linux-x86_64",
     "ego-lite-bridge-macos-aarch64",
+    "ego-browser-skill.tgz",
 )
+SKILL_ASSET = "ego-browser-skill.tgz"
 SEMVER = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
@@ -36,7 +38,7 @@ def main() -> None:
         description="generate a disabled ego-lite-bridge release manifest"
     )
     parser.add_argument("version", help="strict semantic version without a leading v")
-    parser.add_argument("assets", nargs=2, type=Path, metavar="ASSET")
+    parser.add_argument("assets", nargs=3, type=Path, metavar="ASSET")
     args = parser.parse_args()
 
     if not SEMVER.fullmatch(args.version):
@@ -64,11 +66,15 @@ def main() -> None:
     if missing:
         parser.error(f"missing asset: {', '.join(sorted(missing))}")
 
-    targets = {name.removeprefix("ego-lite-bridge-"): name for name in ASSETS}
+    targets = {
+        name.removeprefix("ego-lite-bridge-"): name for name in ASSETS if name != SKILL_ASSET
+    }
     manifest = {
         "product": "ego-lite-bridge",
         "available": False,
         "version": args.version,
+        "skill_url": f"{RELEASE_BASE}/v{args.version}/{SKILL_ASSET}",
+        "skill_sha256": sha256(assets[SKILL_ASSET]),
         "assets": {
             target: f"{RELEASE_BASE}/v{args.version}/{name}"
             for target, name in targets.items()

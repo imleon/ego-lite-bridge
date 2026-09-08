@@ -99,6 +99,17 @@ remote retry <config-id>
 - broker在一条 SSH channel上路由最多8个并发请求；
 - Linux不运行真实浏览器，也不选择其他执行路径。
 
+### 4.4 Installer 分发
+
+- macOS installer只安装bridge binary；Linux installer安装binary和`ego-browser` shim，并要求Node.js 22.20.0或更高版本及`npm`/`npx`；
+- release包含`ego-browser-skill.tgz`；Linux installer从manifest的`skill_url`下载，按manifest中的SHA-256校验并解包；
+- Linux installer在解包后的本地skill目录固定调用`npx --yes skills@1.5.24 add /path/to/extracted/ego-browser --skill ego-browser --global --agent '*' --yes --copy`，通过通用Vercel skills CLI向所有Agent target全局安装或覆盖`ego-browser` skill；
+- skill保留上游通用调用内容，仅将installation reference改为Linux bridge故障排查；skill调用仍经Linux shim透明转发，真实浏览器仍在Mac执行；
+- 少数skills CLI target不支持global或per-agent写入；CLI可能打印单target错误却整体exit 0，因此不保证每个target成功；
+- 重跑installer会覆盖已写入target的现有`ego-browser` skill及本地修改；多target写入不是事务，失败时可能已经部分覆盖且无法自动回滚；
+- manifest、下载、checksum或archive验证失败时不提交bridge binary；验证完成后先原子提交binary与shim，再调用skills CLI，后者失败时保留可用bridge并以明确的部分成功错误退出；
+- 该能力只属于installer分发，不是runtime updater，不改变bridge协议或执行语义。
+
 ## 5. Daemon 生命周期
 
 ### 5.1 单实例与控制 socket
@@ -412,7 +423,7 @@ ego-lite-bridge doctor [config-id]
 - 非SSH transport；
 - Windows；
 - daemon GUI或TUI；
-- 自动更新；
+- bridge或skill的runtime自动更新；skill仅由Linux installer分发，重跑installer才会覆盖更新；
 - dashboard或metrics框架；
 - owner手工强制抢占；
 - hostname/IP/SSH alias规范化；
@@ -455,11 +466,11 @@ ego-lite-bridge doctor [config-id]
 
 ### 15.4 0.1发布验证
 
-- preparation-only `workflow_dispatch`在所选ref/commit的干净checkout上运行格式、Clippy `-D warnings`、Rust tests、installer tests和release preparation tests；不要求tag，也不发布release；
+- preparation-only `workflow_dispatch`在所选ref/commit的干净checkout上运行格式、Clippy `-D warnings`、Rust tests、installer tests和release preparation tests；不要求tag，也不发布release；release产物包含`ego-browser-skill.tgz`，manifest提供其`skill_url`和SHA-256；
 - 原生runner分别构建并验证`linux-x86_64`（静态`x86_64-unknown-linux-musl`、runner `x86_64`、ELF x86-64，无program interpreter、动态依赖或`GLIBC_*`版本要求）和`macos-aarch64`（原生`aarch64-apple-darwin`、runner `arm64`、Mach-O arm64）；
 - preparation workflow在Ubuntu 20.04、glibc 2.31容器中运行精确的已暂存Linux候选并验证`--version`；
 - 下载产物包含保持可执行权限的`tar.gz`候选bundle及其disabled manifest；
-- 维护者在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；
+- 维护者在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；Linux验证包含固定`skills@1.5.24`分发命令、覆盖更新行为和skill安装失败时保留已提交的bridge并明确报告部分成功，并记录skills CLI可能部分写入且exit 0不保证全部target成功；macOS保持binary-only；
 - 实际发布前`distribution/latest.json`保持`available: false`，工作流不更新release metadata。
 
 自动跨主机重复测试、主动remote diagnostics、真实网页smoke和24小时soak属于Post-0.1 hardening。这些后续自动化不改变或放宽本节定义的产品语义与安全边界。
