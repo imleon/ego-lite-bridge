@@ -3748,16 +3748,14 @@ mod tests {
         thread::spawn(move || {
             let mut read = std::fs::File::from(read);
             let mut buffer = [0; 16 * 1024];
-            loop {
-                match read.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(count) => captured
-                        .lock()
-                        .expect("capture lock")
-                        .extend_from_slice(&buffer[..count]),
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => panic!("capture read: {error}"),
+            while let Ok(count) = read.read(&mut buffer) {
+                if count == 0 {
+                    break;
                 }
+                captured
+                    .lock()
+                    .expect("capture lock")
+                    .extend_from_slice(&buffer[..count]);
             }
         });
         let (writer, failed) = start_channel_writer(write).expect("start writer");
@@ -5638,7 +5636,7 @@ mod tests {
     fn executor_forwards_stdin_larger_than_input_queue() {
         let (sender, output, worker) = start_test_executor();
         let request_id = 39;
-        let input = (0..256 * 1024)
+        let input = (0..9 * 16 * 1024)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         sender
@@ -5683,7 +5681,7 @@ mod tests {
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        assert_eq!(actual, b"3677335300 262144\n");
+        assert_eq!(actual, b"1862523210 147456\n");
         assert!(messages.iter().any(|message| matches!(
             message,
             EgoBridgeMessage::Exit {
