@@ -199,7 +199,11 @@ jobs:
             release-bundle/ego-lite-bridge-linux-x86_64 \
             release-bundle/ego-lite-bridge-macos-aarch64 \
             > latest.json
-          cp latest.json release-bundle/
+          (
+            cd release-bundle
+            sha256sum ego-lite-bridge-linux-x86_64 ego-lite-bridge-macos-aarch64 > SHA256SUMS
+          )
+          cp LICENSE latest.json release-bundle/
           tar -czf release-bundle.tar.gz release-bundle
           tar -tvzf release-bundle.tar.gz
 
@@ -209,5 +213,9 @@ jobs:
           name: release-bundle
           path: |
             release-bundle.tar.gz
+            release-bundle/ego-lite-bridge-linux-x86_64
+            release-bundle/ego-lite-bridge-macos-aarch64
+            release-bundle/SHA256SUMS
+            release-bundle/LICENSE
             latest.json
           if-no-files-found: error
