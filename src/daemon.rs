@@ -136,7 +136,7 @@ impl StartupCleanup {
         let error = if endpoint != self.expected_endpoint {
             Some("Linux endpoint identity changed during startup cleanup".to_owned())
         } else {
-            duplicate.map(|name| format!("endpoint already belongs to remote {name:?}"))
+            duplicate.map(|config_id| format!("endpoint already belongs to remote {config_id}"))
         };
         if let Some(error) = error {
             self.error = Some(error.clone());
@@ -502,39 +502,37 @@ impl DaemonActor {
                     .collect();
                 let _ = reply.send(control::Response::RemoteList(remotes));
             }
-            control::Request::RemoteStatus { selector } => {
+            control::Request::RemoteStatus { config_id } => {
+                if let Err(error) = validate_external_config_id(&config_id) {
+                    let _ = reply.send(actor_error(
+                        control::ErrorCode::InvalidArgument,
+                        error.to_string(),
+                    ));
+                    return;
+                }
                 let response = self
                     .config
-                    .remote_by_selector(&selector)
+                    .remote_by_id(&config_id)
                     .map(|record| control::Response::RemoteStatus(self.dto(record)))
                     .unwrap_or_else(|| {
                         actor_error(
                             control::ErrorCode::SelectorNotFound,
-                            format!("remote selector {selector:?} was not found"),
+                            format!("remote config ID {config_id} was not found"),
                         )
                     });
                 let _ = reply.send(response);
             }
-            control::Request::RemoteAdd { name, target } => self.add(name, target, reply),
-            control::Request::RemoteRetry { selector } => self.retry(&selector, reply),
-            control::Request::RemoteRemove { selector } => self.remove(&selector, reply),
+            control::Request::RemoteAdd { target } => self.add(target, reply),
+            control::Request::RemoteRetry { config_id } => self.retry(&config_id, reply),
+            control::Request::RemoteRemove { config_id } => self.remove(&config_id, reply),
         }
     }
 
-    fn add(&mut self, name: String, target: String, reply: Reply) {
-        if let Err(error) = config::validate_remote_name(&name)
-            .and_then(|()| config::validate_remote_target(&target))
-        {
+    fn add(&mut self, target: String, reply: Reply) {
+        if let Err(error) = config::validate_remote_target(&target) {
             let _ = reply.send(actor_error(
                 control::ErrorCode::InvalidArgument,
                 error.to_string(),
-            ));
-            return;
-        }
-        if self.config.remote_by_selector(&name).is_some() {
-            let _ = reply.send(actor_error(
-                control::ErrorCode::NameConflict,
-                format!("remote name {name:?} conflicts with an existing selector"),
             ));
             return;
         }
@@ -550,7 +548,6 @@ impl DaemonActor {
         };
         let record = config::RemoteRecord {
             config_id: id.clone(),
-            name,
             target,
             endpoint_id: None,
             lifecycle: config::Lifecycle::Pending,
@@ -585,16 +582,23 @@ impl DaemonActor {
         }
     }
 
-    fn retry(&mut self, selector: &str, reply: Reply) {
+    fn retry(&mut self, config_id: &str, reply: Reply) {
+        if let Err(error) = validate_external_config_id(config_id) {
+            let _ = reply.send(actor_error(
+                control::ErrorCode::InvalidArgument,
+                error.to_string(),
+            ));
+            return;
+        }
         let Some(index) = self
             .config
             .remotes
             .iter()
-            .position(|remote| remote.name == selector || remote.config_id == selector)
+            .position(|remote| remote.config_id == config_id)
         else {
             let _ = reply.send(actor_error(
                 control::ErrorCode::SelectorNotFound,
-                format!("remote selector {selector:?} was not found"),
+                format!("remote config ID {config_id} was not found"),
             ));
             return;
         };
@@ -641,23 +645,27 @@ impl DaemonActor {
             ));
             return;
         }
-        let remote = self
-            .config
-            .remote_by_selector(&id)
-            .expect("retry record exists");
+        let remote = self.config.remote_by_id(&id).expect("retry record exists");
         let _ = reply.send(control::Response::RemoteRetryAccepted(self.dto(remote)));
     }
 
-    fn remove(&mut self, selector: &str, reply: Reply) {
+    fn remove(&mut self, config_id: &str, reply: Reply) {
+        if let Err(error) = validate_external_config_id(config_id) {
+            let _ = reply.send(actor_error(
+                control::ErrorCode::InvalidArgument,
+                error.to_string(),
+            ));
+            return;
+        }
         let Some(index) = self
             .config
             .remotes
             .iter()
-            .position(|remote| remote.name == selector || remote.config_id == selector)
+            .position(|remote| remote.config_id == config_id)
         else {
             let _ = reply.send(actor_error(
                 control::ErrorCode::SelectorNotFound,
-                format!("remote selector {selector:?} was not found"),
+                format!("remote config ID {config_id} was not found"),
             ));
             return;
         };
@@ -749,7 +757,7 @@ impl DaemonActor {
     fn spawn_worker(&mut self, id: &str, operation: Option<Operation>) -> io::Result<()> {
         let record = self
             .config
-            .remote_by_selector(id)
+            .remote_by_id(id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "remote record disappeared"))?;
         let expected = record.endpoint_id.as_deref().map(parse_id).transpose()?;
         let retry_owner_conflict = matches!(
@@ -824,7 +832,7 @@ impl DaemonActor {
         if startup_cleanup {
             let expected = self
                 .config
-                .remote_by_selector(id)
+                .remote_by_id(id)
                 .and_then(|record| record.endpoint_id.as_deref());
             let duplicate = self.config.remote_by_endpoint_excluding(&endpoint, id);
             let mut transition = StartupCleanup {
@@ -833,7 +841,7 @@ impl DaemonActor {
                 error: None,
             };
             let rejection = transition
-                .identity(&endpoint, duplicate.map(|remote| remote.name.as_str()))
+                .identity(&endpoint, duplicate.map(|remote| remote.config_id.as_str()))
                 .err();
             if let Some(slot) = self.workers.get_mut(id) {
                 slot.runtime.identity(identity);
@@ -856,7 +864,7 @@ impl DaemonActor {
             }
             return;
         }
-        if !self.config.remote_by_selector(id).is_some_and(|record| {
+        if !self.config.remote_by_id(id).is_some_and(|record| {
             record.lifecycle != config::Lifecycle::Removing
                 && self
                     .workers
@@ -868,11 +876,11 @@ impl DaemonActor {
         let duplicate = self
             .config
             .remote_by_endpoint_excluding(&endpoint, id)
-            .map(|remote| (remote.name.clone(), remote.target.clone()));
-        if let Some((name, target)) = duplicate {
+            .map(|remote| (remote.config_id.clone(), remote.target.clone()));
+        if let Some((config_id, target)) = duplicate {
             let record_target = self
                 .config
-                .remote_by_selector(id)
+                .remote_by_id(id)
                 .map(|remote| remote.target.clone())
                 .unwrap_or_default();
             let code = if target == record_target {
@@ -882,7 +890,7 @@ impl DaemonActor {
             };
             if let Some(slot) = self.workers.get(id) {
                 let _ = slot.worker.approve(RemoteApproval::Reject(format!(
-                    "endpoint already belongs to remote {name:?}"
+                    "endpoint already belongs to remote {config_id}"
                 )));
             }
             if let Some(slot) = self.workers.get_mut(id) {
@@ -891,7 +899,7 @@ impl DaemonActor {
             self.fail_pending(
                 id,
                 code,
-                format!("endpoint already belongs to remote {name:?}"),
+                format!("endpoint already belongs to remote {config_id}"),
             );
             return;
         }
@@ -1041,7 +1049,7 @@ impl DaemonActor {
         }
         let pending = self
             .config
-            .remote_by_selector(id)
+            .remote_by_id(id)
             .is_some_and(|remote| remote.lifecycle == config::Lifecycle::Pending);
         if pending {
             self.fail_pending(id, control::ErrorCode::PermanentRemoteError, error);
@@ -1291,6 +1299,18 @@ fn unix_ms() -> u64 {
 #[cfg(target_os = "macos")]
 fn hex_id(bytes: [u8; 16]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(target_os = "macos")]
+fn validate_external_config_id(value: &str) -> io::Result<()> {
+    if config::valid_config_id(value) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote config ID must be 32-character lowercase hexadecimal",
+        ))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1605,7 +1625,6 @@ mod tests {
     fn runtime_dto_is_unknown_before_ready_and_populated_after_snapshot() {
         let record = config::RemoteRecord {
             config_id: "0123456789abcdef0123456789abcdef".into(),
-            name: "dev".into(),
             target: "dev.example".into(),
             endpoint_id: None,
             lifecycle: config::Lifecycle::Active,
@@ -1686,7 +1705,11 @@ mod tests {
             ready: false,
             error: None,
         };
-        assert!(conflict.identity(endpoint, Some("incumbent")).is_err());
+        let incumbent = "fedcba9876543210fedcba9876543210";
+        let error = conflict
+            .identity(endpoint, Some(incumbent))
+            .expect_err("duplicate endpoint");
+        assert!(error.contains(incumbent));
         assert!(
             !conflict.cleanup_confirmed(),
             "owner conflict retains tombstone"

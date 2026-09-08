@@ -7,7 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 const CONFIG_FILE: &str = "config.json";
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -32,21 +32,12 @@ impl Config {
             return Err(invalid_data("ego_browser_path must be absolute"));
         }
 
-        let mut selectors = HashSet::new();
+        let mut config_ids = HashSet::new();
         let mut endpoint_ids = HashSet::new();
         for remote in &self.remotes {
-            if remote.config_id.is_empty()
-                || matches!(remote.config_id.as_str(), "all" | "default")
-                || !selectors.insert(&remote.config_id)
-            {
+            if !valid_config_id(&remote.config_id) || !config_ids.insert(&remote.config_id) {
                 return Err(invalid_data(
-                    "remote config_id must be non-empty and unique across selectors",
-                ));
-            }
-            validate_remote_name(&remote.name).map_err(|error| invalid_data(error.to_string()))?;
-            if !selectors.insert(&remote.name) {
-                return Err(invalid_data(
-                    "remote name must be unique across name and config_id selectors",
+                    "remote config_id must be unique 32-character lowercase hexadecimal",
                 ));
             }
             validate_remote_target(&remote.target)
@@ -94,10 +85,10 @@ impl Config {
             .collect()
     }
 
-    pub(crate) fn remote_by_selector(&self, selector: &str) -> Option<&RemoteRecord> {
+    pub(crate) fn remote_by_id(&self, config_id: &str) -> Option<&RemoteRecord> {
         self.remotes
             .iter()
-            .find(|remote| remote.name == selector || remote.config_id == selector)
+            .find(|remote| remote.config_id == config_id)
     }
 
     // Used by the M6 actor when a pending worker reports its endpoint identity.
@@ -114,22 +105,6 @@ impl Config {
     }
 }
 
-pub(crate) fn validate_remote_name(name: &str) -> io::Result<()> {
-    if !(1..=64).contains(&name.len())
-        || name.starts_with('.')
-        || matches!(name, "all" | "default")
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "remote name must be 1-64 ASCII letters, digits, '-', '_' or '.', must not start with '.', and must not be reserved",
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_remote_target(target: &str) -> io::Result<()> {
     if target.is_empty()
         || target.starts_with('-')
@@ -144,8 +119,6 @@ pub(crate) fn validate_remote_target(target: &str) -> io::Result<()> {
     Ok(())
 }
 
-// Generated-ID shape check for the M6 actor; schema v1 still accepts legacy nonempty IDs.
-#[allow(dead_code)]
 pub(crate) fn valid_config_id(value: &str) -> bool {
     value.len() == 32
         && value
@@ -171,7 +144,6 @@ pub fn generate_config_id() -> io::Result<String> {
 #[serde(deny_unknown_fields)]
 pub struct RemoteRecord {
     pub config_id: String,
-    pub name: String,
     pub target: String,
     pub endpoint_id: Option<String>,
     pub lifecycle: Lifecycle,
@@ -374,15 +346,14 @@ mod tests {
 
     fn remote(
         config_id: &str,
-        name: &str,
+        target: &str,
         lifecycle: Lifecycle,
         observed_state: ObservedState,
     ) -> RemoteRecord {
         RemoteRecord {
             config_id: config_id.into(),
-            name: name.into(),
-            target: format!("{name}.example"),
-            endpoint_id: Some(format!("{:032x}", name.len())),
+            target: target.into(),
+            endpoint_id: Some(format!("{:032x}", target.len())),
             lifecycle,
             observed_state,
             state_changed_unix_ms: 123,
@@ -430,9 +401,9 @@ mod tests {
         let path = directory.0.join(CONFIG_FILE);
 
         for json in [
-            r#"{"schema_version":1,"ego_browser_path":"/ego-browser","daemon_stopping":false,"remotes":[],"extra":true}"#,
-            r#"{"schema_version":2,"ego_browser_path":"/ego-browser","daemon_stopping":false,"remotes":[]}"#,
-            r#"{"schema_version":1,"ego_browser_path":"/ego-browser","daemon_stopping":false,"remotes":[{"config_id":"id","name":"name","target":"host","endpoint_id":null,"lifecycle":"unknown","observed_state":"connecting","state_changed_unix_ms":0,"last_error":null}]}"#,
+            r#"{"schema_version":2,"ego_browser_path":"/ego-browser","daemon_stopping":false,"remotes":[],"extra":true}"#,
+            r#"{"schema_version":1,"ego_browser_path":"/ego-browser","daemon_stopping":false,"remotes":[]}"#,
+            r#"{"schema_version":2,"ego_browser_path":"/ego-browser","daemon_stopping":false,"remotes":[{"config_id":"0123456789abcdef0123456789abcdef","target":"host","endpoint_id":null,"lifecycle":"unknown","observed_state":"connecting","state_changed_unix_ms":0,"last_error":null}]}"#,
         ] {
             fs::write(&path, json).expect("write invalid config");
             assert_eq!(
@@ -445,26 +416,29 @@ mod tests {
     #[test]
     fn validation_rejects_invalid_remote_fields_and_state() {
         let mut value = config();
+        for config_id in [
+            "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "ABCDEF0123456789ABCDEF0123456789",
+            "g0000000000000000000000000000000",
+        ] {
+            value.remotes[0].config_id = config_id.into();
+            assert!(
+                value.validate().is_err(),
+                "accepted invalid config ID {config_id:?}"
+            );
+        }
+        value.remotes[0].config_id = "00000000000000000000000000000001".into();
         value.remotes.push(remote(
-            "00000000000000000000000000000002",
             "00000000000000000000000000000001",
+            "duplicate.example",
             Lifecycle::Active,
             ObservedState::Connected,
         ));
-        assert!(
-            value.validate().is_err(),
-            "selector namespaces must not overlap"
-        );
+        assert!(value.validate().is_err(), "accepted duplicate config ID");
 
         value.remotes.pop();
-        for name in ["", ".hidden", "all", "default", "space name", "é"] {
-            value.remotes[0].name = name.into();
-            assert!(value.validate().is_err(), "accepted invalid name {name:?}");
-        }
-        value.remotes[0].name = "a".repeat(65);
-        assert!(value.validate().is_err());
-
-        value.remotes[0].name = "valid.name_1-2".into();
         value.remotes[0].target = "-oProxyCommand=x".into();
         assert!(value.validate().is_err());
 
@@ -478,13 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_name_target_id_and_lookup_helpers() {
-        for name in ["dev", "dev.linux_1-2", "A"] {
-            validate_remote_name(name).expect("valid name");
-        }
-        for name in ["", ".hidden", "all", "default", "space name", "é"] {
-            assert!(validate_remote_name(name).is_err(), "accepted {name:?}");
-        }
+    fn strict_target_id_and_lookup_helpers() {
         for target in ["host", "user@host", "ssh-alias"] {
             validate_remote_target(target).expect("valid target");
         }
@@ -509,6 +477,8 @@ mod tests {
         assert_ne!(first, second);
         for invalid in [
             "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
             "ABCDEF0123456789ABCDEF0123456789",
             "g0000000000000000000000000000000",
         ] {
@@ -520,7 +490,6 @@ mod tests {
         let endpoint = value.remotes[0].endpoint_id.clone().expect("endpoint");
         value.remotes.push(RemoteRecord {
             config_id: pending_id.into(),
-            name: "pending".into(),
             target: "alias".into(),
             endpoint_id: Some(endpoint.clone()),
             lifecycle: Lifecycle::Pending,
@@ -528,9 +497,9 @@ mod tests {
             state_changed_unix_ms: 0,
             last_error: None,
         });
-        assert_eq!(value.remote_by_selector("one"), Some(&value.remotes[0]));
+        assert_eq!(value.remote_by_id("one"), None);
         assert_eq!(
-            value.remote_by_selector("00000000000000000000000000000001"),
+            value.remote_by_id("00000000000000000000000000000001"),
             Some(&value.remotes[0])
         );
         assert_eq!(

@@ -20,11 +20,11 @@ Mac 用户只管理一个后台服务，并通过 CLI 管理 remote：
 ego-lite-bridge start
 ego-lite-bridge stop
 ego-lite-bridge status
-ego-lite-bridge remote add dev-linux gaolei.veew@linux-a
+ego-lite-bridge remote add gaolei.veew@linux-a
 ego-lite-bridge remote list
-ego-lite-bridge remote status dev-linux
-ego-lite-bridge remote retry dev-linux
-ego-lite-bridge remote remove dev-linux
+ego-lite-bridge remote status 0123456789abcdef0123456789abcdef
+ego-lite-bridge remote retry 0123456789abcdef0123456789abcdef
+ego-lite-bridge remote remove 0123456789abcdef0123456789abcdef
 ```
 
 Linux 用户继续按需运行：
@@ -83,11 +83,11 @@ CLI 只通过本机 control socket操作 daemon，不直接修改配置或持有
 start
 stop
 status
-remote add <name> <ssh-target>
+remote add <ssh-target>
 remote list
-remote status <name-or-id>
-remote remove <name-or-id>
-remote retry <name-or-id>
+remote status <config-id>
+remote remove <config-id>
+remote retry <config-id>
 ```
 
 0.1 不提供交互式 TUI或 GUI管理面。
@@ -142,14 +142,13 @@ LaunchAgent不得依赖交互式shell的`PATH`。`start`应解析并保存`ego-b
 
 ## 6. Remote 管理与持久化
 
-### 6.1 Remote 名称与 target
+### 6.1 Config ID 与 target
 
-Remote name：
+Config ID：
 
-- 1–64个ASCII字母、数字、`-`、`_`或`.`；
-- 不允许以`.`开头；
-- 不允许`all`、`default`等保留名；
-- 在同一daemon配置中唯一。
+- 添加remote时生成的32字符小写十六进制稳定ID；
+- `doctor`、`remote status`、`remote retry`和`remote remove`只接受完整config ID；
+- 不支持短前缀、名称、selector alias、迁移或fallback。
 
 SSH target：
 
@@ -163,8 +162,7 @@ SSH target：
 
 每个remote记录：
 
-- `config_id`：Mac本地稳定记录ID；
-- `name`：用户指定名称；
+- `config_id`：Mac本地生成的32字符小写十六进制稳定记录ID；
 - `target`：原始OpenSSH target；
 - `endpoint_id`：成功识别后记录的Linux endpoint identity；
 - `lifecycle`：`pending`、`active`或`removing`；
@@ -176,12 +174,12 @@ SSH target：
 ### 6.3 添加 remote
 
 ```bash
-ego-lite-bridge remote add <name> <ssh-target>
+ego-lite-bridge remote add <ssh-target>
 ```
 
 流程：
 
-1. 验证name和target；
+1. 验证target并生成config ID；
 2. 原子写入一条`lifecycle=pending`的remote记录；
 3. 在30秒总deadline内建立SSH并验证remote bridge、protocol/capabilities；
 4. 读取Linux endpoint identity并检查重复；
@@ -190,7 +188,7 @@ ego-lite-bridge remote add <name> <ssh-target>
 
 命令成功必须表示端到端ready。30秒内允许按统一backoff重试SSH临时失败；deadline到达后回滚已获取的运行态并删除pending记录，命令明确失败。CLI连接在命令执行期间断开时，daemon继续该操作直到成功或deadline，不因客户端消失留下未定义状态；结果可通过`remote status`查询。若daemon崩溃，重启后先清理pending记录可能遗留的ownership，再删除记录，不自动转为active。
 
-### 6.4 Host alias 与 endpoint 去重
+### 6.4 Endpoint 去重
 
 不得用target字符串、DNS结果、IP或host key单独判断是否为同一endpoint。
 
@@ -210,8 +208,7 @@ Linux bridge为当前UID持久保存随机endpoint ID：
 判定：
 
 - 相同endpoint、相同target：返回already exists；
-- 相同endpoint、不同target：报告现有remote及两个target，不静默替换；
-- 不同endpoint、相同name：拒绝名称冲突；
+- 相同endpoint、不同target：报告现有remote config ID及两个target，不静默替换；
 - target变更需要未来显式`remote update`，0.1不提供隐式替换。
 
 ### 6.5 Remove 与 retry
@@ -345,9 +342,10 @@ broker socket路径改为：
 
 - 目录`0700`，配置和socket仅当前用户可访问；
 - daemon是配置唯一writer；
-- 配置写入使用同目录临时文件、flush、fsync和原子rename，并包含schema version；
-- 未知或损坏schema明确失败，不猜测修复；
-- CLI与daemon使用独立、版本化、长度限制的本机控制协议；
+- 配置schema固定为v2；持久remote模型包含`config_id`、`target`、`endpoint_id`、`lifecycle`、`observed_state`、`state_changed_unix_ms`和`last_error`；
+- 配置写入使用同目录临时文件、flush、fsync和原子rename；
+- 未知、旧版或损坏schema明确失败，不迁移、不猜测修复；
+- CLI与daemon使用独立、版本为v3、长度限制的本机控制协议；
 - 控制协议不复用远程exec协议，也不能传递任意shell命令。
 
 ## 11. 日志与敏感数据
@@ -388,12 +386,14 @@ broker socket路径改为：
 ```bash
 ego-lite-bridge status
 ego-lite-bridge remote list
-ego-lite-bridge remote status <name-or-id>
-ego-lite-bridge doctor [name-or-id]
+ego-lite-bridge remote status <config-id>
+ego-lite-bridge doctor [config-id]
 ```
 
-- status展示daemon和持久remote的desired/observed state；
-- remote status展示最近错误、重连状态、protocol/capabilities和请求容量；
+- status逐个展示remote的config ID和desired/observed state；
+- `remote add`、`remote list`和`remote retry`输出config ID、target及desired/observed state，不输出name；
+- remote status展示config ID、target、最近错误、重连状态、protocol/capabilities和请求容量，不输出name；
+- `doctor`、`remote status`、`remote retry`和`remote remove`只接受完整32字符小写十六进制config ID；
 - M7 doctor只读检查Mac本地LaunchAgent、daemon和配置中的绝对`ego-browser`路径；对remote检查持久配置中endpoint identity是否存在、desired/observed state，以及daemon当前worker快照中的已知handshake、请求容量和重连错误；
 - M7不验证live endpoint identity是否与持久值匹配；无法证明的主动remote检查明确输出`NOT CHECKED`，不伪装为健康；
 - M7 doctor不新建SSH连接，不主动检查Linux binary、endpoint identity文件或运行目录/socket权限，也不执行端到端probe；这些live检查和probe属于Post-0.1 hardening；

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 const MAX_FRAME_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -14,7 +14,6 @@ const MAX_FRAME_SIZE: usize = 64 * 1024;
 pub(crate) enum ErrorCode {
     InvalidArgument,
     SelectorNotFound,
-    NameConflict,
     EndpointExists,
     EndpointAliasConflict,
     InvalidState,
@@ -30,7 +29,6 @@ impl fmt::Display for ErrorCode {
         let code = match self {
             Self::InvalidArgument => "invalid_argument",
             Self::SelectorNotFound => "selector_not_found",
-            Self::NameConflict => "name_conflict",
             Self::EndpointExists => "endpoint_exists",
             Self::EndpointAliasConflict => "endpoint_alias_conflict",
             Self::InvalidState => "invalid_state",
@@ -53,7 +51,6 @@ pub(crate) enum DaemonState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RemoteDto {
     pub(crate) config_id: String,
-    pub(crate) name: String,
     pub(crate) target: String,
     pub(crate) endpoint_id: Option<String>,
     pub(crate) lifecycle: crate::config::Lifecycle,
@@ -74,7 +71,6 @@ impl RemoteDto {
     pub(crate) fn persisted(record: &crate::config::RemoteRecord) -> Self {
         Self {
             config_id: record.config_id.clone(),
-            name: record.name.clone(),
             target: record.target.clone(),
             endpoint_id: record.endpoint_id.clone(),
             lifecycle: record.lifecycle,
@@ -95,11 +91,11 @@ impl RemoteDto {
 pub(crate) enum Request {
     Status,
     Shutdown,
-    RemoteAdd { name: String, target: String },
+    RemoteAdd { target: String },
     RemoteList,
-    RemoteStatus { selector: String },
-    RemoteRetry { selector: String },
-    RemoteRemove { selector: String },
+    RemoteStatus { config_id: String },
+    RemoteRetry { config_id: String },
+    RemoteRemove { config_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -264,7 +260,6 @@ mod tests {
     fn remote() -> RemoteDto {
         RemoteDto {
             config_id: "0123456789abcdef0123456789abcdef".into(),
-            name: "dev".into(),
             target: "user@host".into(),
             endpoint_id: Some("fedcba9876543210fedcba9876543210".into()),
             lifecycle: Lifecycle::Active,
@@ -324,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn all_v2_requests_and_responses_round_trip() {
+    fn all_v3_requests_and_responses_round_trip() {
         let remote = remote();
         for (request_message, response) in [
             (
@@ -342,7 +337,6 @@ mod tests {
             ),
             (
                 Request::RemoteAdd {
-                    name: "dev".into(),
                     target: "user@host".into(),
                 },
                 Response::RemoteAdded(remote.clone()),
@@ -353,19 +347,19 @@ mod tests {
             ),
             (
                 Request::RemoteStatus {
-                    selector: "dev".into(),
+                    config_id: remote.config_id.clone(),
                 },
                 Response::RemoteStatus(remote.clone()),
             ),
             (
                 Request::RemoteRetry {
-                    selector: "dev".into(),
+                    config_id: remote.config_id.clone(),
                 },
                 Response::RemoteRetryAccepted(remote.clone()),
             ),
             (
                 Request::RemoteRemove {
-                    selector: "dev".into(),
+                    config_id: remote.config_id.clone(),
                 },
                 Response::RemoteRemoved {
                     config_id: remote.config_id.clone(),
@@ -387,16 +381,16 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(ControlError::VersionMismatch {
-                    expected: 2,
-                    received: 1
+                    expected: 3,
+                    received: 2
                 })
             ));
         });
 
-        write(&mut client, &Message::ClientHello { version: 1 }).expect("write hello");
+        write(&mut client, &Message::ClientHello { version: 2 }).expect("write hello");
         assert!(matches!(
             read(&mut client).expect("read server hello"),
-            Message::ServerHello { version: 2 }
+            Message::ServerHello { version: 3 }
         ));
         drop(client);
         server.join().expect("server thread");
@@ -406,7 +400,7 @@ mod tests {
     fn oversized_and_trailing_frames_are_rejected() {
         for bytes in [(MAX_FRAME_SIZE as u32 + 1).to_le_bytes().to_vec(), {
             let mut frame = Vec::new();
-            crate::framing::write_message(&mut frame, &Message::ClientHello { version: 2 })
+            crate::framing::write_message(&mut frame, &Message::ClientHello { version: 3 })
                 .expect("encode hello");
             let length = u32::from_le_bytes(frame[..4].try_into().expect("frame prefix")) + 1;
             frame[..4].copy_from_slice(&length.to_le_bytes());

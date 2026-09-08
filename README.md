@@ -42,7 +42,7 @@ On the Mac, start the daemon and add the remote:
 
 ```bash
 ego-lite-bridge start
-ego-lite-bridge remote add dev-linux user@linux-host
+ego-lite-bridge remote add user@linux-host
 ```
 
 Then, on Linux, use the shim as if `ego-browser` were local:
@@ -61,16 +61,16 @@ Run these control commands on macOS:
 | Command | Purpose | Successful output |
 | --- | --- | --- |
 | `ego-lite-bridge start` | Start the per-user daemon; it is safe to run when already started. | `ego-lite-bridge started` or `ego-lite-bridge is running` |
-| `ego-lite-bridge status` | Show daemon health plus each remote's desired and observed state. | `daemon=running remotes=<n>`, followed by `<name> desired=<state> observed=<state>` per remote |
-| `ego-lite-bridge doctor [name-or-config-id]` | Check the local Mac environment and the daemon's current snapshot of all remotes, or one selected remote. | `PASS`, `FAIL`, and `NOT CHECKED` records described below |
-| `ego-lite-bridge remote add <name> <ssh-target>` | Add a remote and wait until its broker is ready. | `<config-id>\t<name>\t<ssh-target>\tdesired=active observed=connected` |
-| `ego-lite-bridge remote list` | List all configured remotes. | `<config-id>\t<name>\t<ssh-target>\tdesired=<state> observed=<state>` per remote; no output when empty |
-| `ego-lite-bridge remote status <name-or-config-id>` | Show the fields listed at right for one remote. | Labeled lines: `config-id`, `name`, `target`, `desired`, `observed`, `state-changed-unix-ms`, `last-error`, `protocol-version`, `capabilities`, `reconnect-attempt`, `reconnect-at-unix-ms`, and `active-requests` |
-| `ego-lite-bridge remote retry <name-or-config-id>` | Retry a remote currently in `active/error`. | The `remote list` record for the updated remote |
-| `ego-lite-bridge remote remove <name-or-config-id>` | Remove a remote and clean up its worker. | `removed <config-id>` |
+| `ego-lite-bridge status` | Show daemon health plus each remote's desired and observed state. | `daemon=running remotes=<n>`, followed by `<config-id> desired=<state> observed=<state>` per remote |
+| `ego-lite-bridge doctor [config-id]` | Check the local Mac environment and the daemon's current snapshot of all remotes, or one selected remote. | `PASS`, `FAIL`, and `NOT CHECKED` records described below |
+| `ego-lite-bridge remote add <ssh-target>` | Add a remote and wait until its broker is ready. | `<config-id>\t<ssh-target>\tdesired=active observed=connected` |
+| `ego-lite-bridge remote list` | List all configured remotes. | `<config-id>\t<ssh-target>\tdesired=<state> observed=<state>` per remote; no output when empty |
+| `ego-lite-bridge remote status <config-id>` | Show the fields listed at right for one remote. | Labeled lines: `config-id`, `target`, `desired`, `observed`, `state-changed-unix-ms`, `last-error`, `protocol-version`, `capabilities`, `reconnect-attempt`, `reconnect-at-unix-ms`, and `active-requests` |
+| `ego-lite-bridge remote retry <config-id>` | Retry a remote currently in `active/error`. | The `remote list` record for the updated remote |
+| `ego-lite-bridge remote remove <config-id>` | Remove a remote and clean up its worker. | `removed <config-id>` |
 | `ego-lite-bridge stop` | Stop the daemon and its workers. | `ego-lite-bridge stopped` (or `is stopped` if already stopped) |
 
-Desired states are `pending`, `active`, and `removing`; observed states are `connecting`, `connected`, `reconnecting`, `error`, and `removing`. Unknown unavailable detail is printed as `unknown`. `active-requests` is `<active>/<capacity>`. Names and config IDs are accepted wherever `<name-or-config-id>` appears.
+Desired states are `pending`, `active`, and `removing`; observed states are `connecting`, `connected`, `reconnecting`, `error`, and `removing`. Unknown unavailable detail is printed as `unknown`. `active-requests` is `<active>/<capacity>`. Every `[config-id]` or `<config-id>` selector must be the full 32-character lowercase hexadecimal ID printed by `remote add` or `remote list`; short prefixes, names, selector aliases, migration, and fallback are not supported.
 
 `doctor` is read-only. In M7 it checks whether the LaunchAgent is loaded, the daemon is running, and the configured absolute `ego-browser` path is valid. For each remote, it checks persisted endpoint identity presence and desired/observed state, plus handshake, capacity, and reconnect/error data from the daemon's **current worker snapshot**. It does not verify that the live endpoint identity matches the persisted value. `PASS` means that check is healthy in the inspected local state or snapshot; `FAIL` means an environment, daemon, selector, or snapshot check failed; `NOT CHECKED` explicitly means M7 did not open a new SSH connection or verify live endpoint identity, Linux socket permissions, or end-to-end execution. Those active remote checks are planned for post-0.1 hardening. Exit status is 0 when no check fails, 1 when any check fails, and 2 for invalid `doctor` syntax. `doctor` never repairs, installs, or changes configuration.
 
@@ -119,7 +119,7 @@ Ensure `~/.local/bin` is on `PATH`. The release installer in `distribution/insta
 
 ## Troubleshooting
 
-- **`ego-browser bridge is not connected`**: run `ego-lite-bridge start` and `ego-lite-bridge remote add <name> user@linux-host` on the Mac.
+- **`ego-browser bridge is not connected`**: run `ego-lite-bridge start` and `ego-lite-bridge remote add user@linux-host` on the Mac.
 - **SSH repeatedly reconnects**: verify `ssh user@linux-host true` succeeds without a password or confirmation prompt. The bridge uses SSH batch mode.
 - **Remote binary is missing**: install an executable at `~/.local/bin/ego-lite-bridge` on Linux.
 - **`ego-browser` is not found on Linux**: create the symlink above and add `~/.local/bin` to `PATH`.

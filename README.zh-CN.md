@@ -42,7 +42,7 @@ ln -sf ego-lite-bridge ~/.local/bin/ego-browser
 
 ```bash
 ego-lite-bridge start
-ego-lite-bridge remote add dev-linux user@linux-host
+ego-lite-bridge remote add user@linux-host
 ```
 
 然后在 Linux 像使用本地命令一样调用：
@@ -61,16 +61,16 @@ daemon 会在短暂的 SSH 或网络故障后自动重连。
 | 命令 | 用途 | 成功输出 |
 | --- | --- | --- |
 | `ego-lite-bridge start` | 启动用户级 daemon；重复运行安全。 | `ego-lite-bridge started`，已启动时为 `ego-lite-bridge is running` |
-| `ego-lite-bridge status` | 显示 daemon 健康状态，以及每个 remote 的 desired/observed 状态。 | `daemon=running remotes=<数量>`，随后每个 remote 一行 `<名称> desired=<状态> observed=<状态>` |
-| `ego-lite-bridge doctor [名称或配置ID]` | 检查 Mac 本地环境，以及 daemon 中全部 remote 或指定 remote 的当前快照。 | 下文说明的 `PASS`、`FAIL` 和 `NOT CHECKED` 记录 |
-| `ego-lite-bridge remote add <名称> <SSH-target>` | 添加 remote，并等待其 broker ready。 | `<配置ID>\t<名称>\t<SSH-target>\tdesired=active observed=connected` |
-| `ego-lite-bridge remote list` | 列出全部已配置 remote。 | 每个 remote 一行 `<配置ID>\t<名称>\t<SSH-target>\tdesired=<状态> observed=<状态>`；空列表无输出 |
-| `ego-lite-bridge remote status <名称或配置ID>` | 显示右侧所列的 remote 字段。 | 带标签的多行输出：`config-id`、`name`、`target`、`desired`、`observed`、`state-changed-unix-ms`、`last-error`、`protocol-version`、`capabilities`、`reconnect-attempt`、`reconnect-at-unix-ms` 和 `active-requests` |
-| `ego-lite-bridge remote retry <名称或配置ID>` | 重试当前处于 `active/error` 的 remote。 | 更新后 remote 的 `remote list` 记录 |
-| `ego-lite-bridge remote remove <名称或配置ID>` | 删除 remote 并清理其 worker。 | `removed <配置ID>` |
+| `ego-lite-bridge status` | 显示 daemon 健康状态，以及每个 remote 的 desired/observed 状态。 | `daemon=running remotes=<数量>`，随后每个 remote 一行 `<配置ID> desired=<状态> observed=<状态>` |
+| `ego-lite-bridge doctor [配置ID]` | 检查 Mac 本地环境，以及 daemon 中全部 remote 或指定 remote 的当前快照。 | 下文说明的 `PASS`、`FAIL` 和 `NOT CHECKED` 记录 |
+| `ego-lite-bridge remote add <SSH-target>` | 添加 remote，并等待其 broker ready。 | `<配置ID>\t<SSH-target>\tdesired=active observed=connected` |
+| `ego-lite-bridge remote list` | 列出全部已配置 remote。 | 每个 remote 一行 `<配置ID>\t<SSH-target>\tdesired=<状态> observed=<状态>`；空列表无输出 |
+| `ego-lite-bridge remote status <配置ID>` | 显示右侧所列的 remote 字段。 | 带标签的多行输出：`config-id`、`target`、`desired`、`observed`、`state-changed-unix-ms`、`last-error`、`protocol-version`、`capabilities`、`reconnect-attempt`、`reconnect-at-unix-ms` 和 `active-requests` |
+| `ego-lite-bridge remote retry <配置ID>` | 重试当前处于 `active/error` 的 remote。 | 更新后 remote 的 `remote list` 记录 |
+| `ego-lite-bridge remote remove <配置ID>` | 删除 remote 并清理其 worker。 | `removed <配置ID>` |
 | `ego-lite-bridge stop` | 停止 daemon 及其 worker。 | `ego-lite-bridge stopped`，已停止时为 `ego-lite-bridge is stopped` |
 
-Desired 状态为 `pending`、`active` 和 `removing`；observed 状态为 `connecting`、`connected`、`reconnecting`、`error` 和 `removing`。当前无法获得的详情显示为 `unknown`；`active-requests` 格式为 `<活跃数>/<容量>`。所有 `<名称或配置ID>` 参数都接受 remote 名称或配置 ID。
+Desired 状态为 `pending`、`active` 和 `removing`；observed 状态为 `connecting`、`connected`、`reconnecting`、`error` 和 `removing`。当前无法获得的详情显示为 `unknown`；`active-requests` 格式为 `<活跃数>/<容量>`。所有 `[配置ID]` 或 `<配置ID>` selector 都必须是 `remote add` 或 `remote list` 输出的完整 32 字符小写十六进制 ID；不支持短前缀、名称、selector alias、迁移或 fallback。
 
 `doctor` 是只读命令。M7 检查 LaunchAgent 是否 loaded、daemon 是否 running，以及配置中的 `ego-browser` 绝对路径是否有效。对每个 remote，它检查持久配置中 endpoint identity 是否存在、desired/observed 状态，以及 daemon **当前 worker 快照**中的 handshake、容量和重连/错误信息；不验证 live endpoint identity 是否与持久值匹配。`PASS` 表示被检查的本地状态或快照健康；`FAIL` 表示环境、daemon、selector 或快照检查失败；`NOT CHECKED` 明确表示 M7 没有新建 SSH 连接，也没有验证 live endpoint identity、Linux socket 权限或端到端执行。这些主动 remote 检查计划在 Post-0.1 hardening 中完成。没有 `FAIL` 时退出状态为 0，存在任一 `FAIL` 时为 1，`doctor` 语法无效时为 2。`doctor` 不修复、不安装，也不修改配置。
 
@@ -119,7 +119,7 @@ ln -sf ego-lite-bridge ~/.local/bin/ego-browser
 
 ## 故障排查
 
-- **`ego-browser bridge is not connected`**：在 Mac 运行 `ego-lite-bridge start` 和 `ego-lite-bridge remote add <name> user@linux-host`。
+- **`ego-browser bridge is not connected`**：在 Mac 运行 `ego-lite-bridge start` 和 `ego-lite-bridge remote add user@linux-host`。
 - **SSH 反复重连**：确认 `ssh user@linux-host true` 无需密码或确认即可成功；bridge 使用 SSH batch mode。
 - **远端二进制缺失**：在 Linux 的 `~/.local/bin/ego-lite-bridge` 安装可执行文件。
 - **Linux 找不到 `ego-browser`**：创建上述软链接，并将 `~/.local/bin` 加入 `PATH`。
