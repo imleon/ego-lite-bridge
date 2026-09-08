@@ -1,7 +1,13 @@
 {
   "product": "ego-lite-bridge",
-  "available": false,
+  "available": true,
   "version": "0.1.0",
-  "assets": {},
-  "sha256": {}
+  "assets": {
+    "linux-x86_64": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.0/ego-lite-bridge-linux-x86_64",
+    "macos-aarch64": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.0/ego-lite-bridge-macos-aarch64"
+  },
+  "sha256": {
+    "linux-x86_64": "49c102622fe0f05aeb58b071b21cd2d001de44be117de6f08874b6fa1297b781",
+    "macos-aarch64": "72863ed8d8334c2d9e3402d0378aa97e9cf6951bd2649b63176a49dcc5df6817"
+  }
 }
