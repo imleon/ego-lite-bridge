@@ -3748,14 +3748,16 @@ mod tests {
         thread::spawn(move || {
             let mut read = std::fs::File::from(read);
             let mut buffer = [0; 16 * 1024];
-            while let Ok(count) = read.read(&mut buffer) {
-                if count == 0 {
-                    break;
+            loop {
+                match read.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => captured
+                        .lock()
+                        .expect("capture lock")
+                        .extend_from_slice(&buffer[..count]),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("capture read: {error}"),
                 }
-                captured
-                    .lock()
-                    .expect("capture lock")
-                    .extend_from_slice(&buffer[..count]);
             }
         });
         let (writer, failed) = start_channel_writer(write).expect("start writer");
