@@ -5581,7 +5581,7 @@ mod tests {
                 request_id,
                 argv: vec![
                     b"-c".to_vec(),
-                    b"dd if=/dev/zero bs=16384 count=1 2>/dev/null; dd if=/dev/zero bs=16384 count=1 2>/dev/null | tr '\\000' '\\377'; dd if=/dev/zero bs=16384 count=1 2>/dev/null | tr '\\000' '\\200'"
+                    b"LC_ALL=C; export LC_ALL; dd if=/dev/zero bs=16384 count=1 2>/dev/null; dd if=/dev/zero bs=16384 count=1 2>/dev/null | tr '\\000' '\\377'; dd if=/dev/zero bs=16384 count=1 2>/dev/null | tr '\\000' '\\200'"
                         .to_vec(),
                 ],
             }))
