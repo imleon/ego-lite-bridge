@@ -121,14 +121,18 @@ main() {
     # install
     chmod +x "$STAGED_BINARY"
     validate_install_paths
+    trap '' PIPE
+    CREATED_SHIM=false
     if [ "$os" = "linux" ] && [ ! -L "$SHIM" ]; then
         ln -s "$BIN" "$SHIM"
-        log "created ego-browser shim at ${SHIM}"
+        CREATED_SHIM=true
     fi
-    trap '' PIPE
     mv "$STAGED_BINARY" "${INSTALL_DIR}/${BIN}"
     set +e
 
+    if [ "$CREATED_SHIM" = true ]; then
+        log "created ego-browser shim at ${SHIM}"
+    fi
     log "installed ${BIN} to ${INSTALL_DIR}/${BIN}"
 
     # check PATH
@@ -162,7 +166,11 @@ validate_install_paths() {
         if [ -d "$SHIM" ]; then
             err "shim path is a directory: ${SHIM}"
         fi
-        if [ ! -L "$SHIM" ] || [ "$(readlink "$SHIM")" != "$BIN" ]; then
+        if [ ! -L "$SHIM" ]; then
+            err "shim path is not a symlink to ${BIN}: ${SHIM}"
+        fi
+        SHIM_TARGET="$(readlink -n "$SHIM"; printf x)"
+        if [ "$SHIM_TARGET" != "${BIN}x" ]; then
             err "shim path is not a symlink to ${BIN}: ${SHIM}"
         fi
     fi

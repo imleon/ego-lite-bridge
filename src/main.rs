@@ -27,7 +27,7 @@ mod macos_process;
 #[cfg(target_os = "macos")]
 mod managed_ssh;
 
-const USAGE: &str = "ego-lite-bridge — headless reverse remote exec bridge for ego-browser\n\nUsage:\n  ego-lite-bridge start\n  ego-lite-bridge stop\n  ego-lite-bridge status\n  ego-lite-bridge doctor [name-or-config-id]\n  ego-lite-bridge remote add <name> <target>\n  ego-lite-bridge remote list\n  ego-lite-bridge remote status <name-or-config-id>\n  ego-lite-bridge remote retry <name-or-config-id>\n  ego-lite-bridge remote remove <name-or-config-id>\n  ego-lite-bridge --help\n  ego-lite-bridge --version";
+const USAGE: &str = "ego-lite-bridge — headless reverse remote exec bridge for ego-browser\n\nUsage:\n  ego-lite-bridge start\n  ego-lite-bridge stop\n  ego-lite-bridge status\n  ego-lite-bridge doctor [config-id]\n  ego-lite-bridge remote add <target>\n  ego-lite-bridge remote list\n  ego-lite-bridge remote status <config-id>\n  ego-lite-bridge remote retry <config-id>\n  ego-lite-bridge remote remove <config-id>\n  ego-lite-bridge --help\n  ego-lite-bridge --version";
 #[cfg(any(target_os = "macos", test))]
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "macos", test))]
@@ -282,7 +282,7 @@ fn run_doctor(args: &[OsString]) -> io::Result<i32> {
             Some(selector) => control_request(
                 &paths.control_socket,
                 control::Request::RemoteStatus {
-                    selector: selector.into(),
+                    config_id: selector.into(),
                 },
             ),
             None => control_request(&paths.control_socket, control::Request::RemoteList),
@@ -352,11 +352,17 @@ fn validate_existing_application_directory(path: &Path) -> io::Result<&Path> {
 fn doctor_selector(args: &[OsString]) -> Result<Option<&str>, &'static str> {
     match args {
         [] => Ok(None),
-        [selector] => selector
-            .to_str()
-            .map(Some)
-            .ok_or("remote selector is not valid UTF-8"),
-        _ => Err("doctor accepts at most one remote selector"),
+        [config_id] => {
+            let config_id = config_id
+                .to_str()
+                .ok_or("remote config ID is not valid UTF-8")?;
+            if config::valid_config_id(config_id) {
+                Ok(Some(config_id))
+            } else {
+                Err("remote config ID must be 32-character lowercase hexadecimal")
+            }
+        }
+        _ => Err("doctor accepts at most one remote config ID"),
     }
 }
 
@@ -367,7 +373,7 @@ fn check(scope: &str, passed: bool, detail: &str) -> String {
 
 #[cfg(any(target_os = "macos", test))]
 fn remote_checks(remote: &control::RemoteDto, checks: &mut Vec<String>) {
-    let scope = format!("remote.{}", remote.name);
+    let scope = format!("remote.{}", remote.config_id);
     let connected = remote.lifecycle == config::Lifecycle::Active
         && remote.observed_state == config::ObservedState::Connected;
     checks.push(check(
@@ -501,36 +507,32 @@ fn run_remote(args: &[OsString]) -> io::Result<i32> {
 #[cfg(any(target_os = "macos", test))]
 fn remote_request(args: &[OsString]) -> Result<Option<(control::Request, Duration)>, String> {
     let request = match args {
-        [command, name, target] if command == "add" => {
-            let name = remote_argument(name, "remote name")?;
+        [command, target] if command == "add" => {
             let target = remote_argument(target, "remote target")?;
-            config::validate_remote_name(name)
-                .and_then(|()| config::validate_remote_target(target))
-                .map_err(|error| error.to_string())?;
+            config::validate_remote_target(target).map_err(|error| error.to_string())?;
             (
                 control::Request::RemoteAdd {
-                    name: name.into(),
                     target: target.into(),
                 },
                 ADD_TIMEOUT,
             )
         }
         [command] if command == "list" => (control::Request::RemoteList, CONTROL_TIMEOUT),
-        [command, selector] if command == "status" => (
+        [command, config_id] if command == "status" => (
             control::Request::RemoteStatus {
-                selector: remote_argument(selector, "remote selector")?.into(),
+                config_id: remote_config_id(config_id)?.into(),
             },
             CONTROL_TIMEOUT,
         ),
-        [command, selector] if command == "retry" => (
+        [command, config_id] if command == "retry" => (
             control::Request::RemoteRetry {
-                selector: remote_argument(selector, "remote selector")?.into(),
+                config_id: remote_config_id(config_id)?.into(),
             },
             CONTROL_TIMEOUT,
         ),
-        [command, selector] if command == "remove" => (
+        [command, config_id] if command == "remove" => (
             control::Request::RemoteRemove {
-                selector: remote_argument(selector, "remote selector")?.into(),
+                config_id: remote_config_id(config_id)?.into(),
             },
             CLEANUP_TIMEOUT,
         ),
@@ -544,6 +546,16 @@ fn remote_argument<'a>(value: &'a OsStr, description: &str) -> Result<&'a str, S
     value
         .to_str()
         .ok_or_else(|| format!("{description} is not valid UTF-8"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn remote_config_id(value: &OsStr) -> Result<&str, String> {
+    let value = remote_argument(value, "remote config ID")?;
+    if config::valid_config_id(value) {
+        Ok(value)
+    } else {
+        Err("remote config ID must be 32-character lowercase hexadecimal".into())
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -562,7 +574,7 @@ fn status_lines(
     lines.extend(remotes.iter().map(|remote| {
         format!(
             "{} desired={} observed={}",
-            remote.name,
+            remote.config_id,
             lifecycle(remote.lifecycle),
             observed_state(remote.observed_state)
         )
@@ -601,9 +613,8 @@ fn daemon_state(value: control::DaemonState) -> &'static str {
 #[cfg(target_os = "macos")]
 fn print_remote_list(remote: &control::RemoteDto) {
     println!(
-        "{}\t{}\t{}\tdesired={} observed={}",
+        "{}\t{}\tdesired={} observed={}",
         remote.config_id,
-        remote.name,
         remote.target,
         lifecycle(remote.lifecycle),
         observed_state(remote.observed_state)
@@ -613,7 +624,6 @@ fn print_remote_list(remote: &control::RemoteDto) {
 #[cfg(target_os = "macos")]
 fn print_remote_status(remote: &control::RemoteDto) {
     println!("config-id: {}", remote.config_id);
-    println!("name: {}", remote.name);
     println!("target: {}", remote.target);
     println!("desired: {}", lifecycle(remote.lifecycle));
     println!("observed: {}", observed_state(remote.observed_state));
@@ -805,14 +815,37 @@ mod tests {
     }
 
     #[test]
+    fn remote_parser_accepts_target_only_add_and_full_ids_only() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert!(matches!(
+            remote_request(&["add".into(), "user@host".into()]),
+            Ok(Some((control::Request::RemoteAdd { target }, ADD_TIMEOUT))) if target == "user@host"
+        ));
+        for command in ["status", "retry", "remove"] {
+            assert!(remote_request(&[command.into(), id.into()]).is_ok());
+            for invalid in [
+                "dev",
+                "0123456789abcdef",
+                "ABCDEF0123456789ABCDEF0123456789",
+            ] {
+                assert!(remote_request(&[command.into(), invalid.into()]).is_err());
+            }
+        }
+        assert!(
+            remote_request(&["add".into(), "dev".into(), "user@host".into()])
+                .expect("old add syntax is not an argument error")
+                .is_none()
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn remote_parser_rejects_non_utf8_as_usage_error() {
         use std::os::unix::ffi::OsStringExt;
 
         let invalid = OsString::from_vec(vec![0xff]);
         for args in [
-            vec!["add".into(), invalid.clone(), "user@host".into()],
-            vec!["add".into(), "dev".into(), invalid.clone()],
+            vec!["add".into(), invalid.clone()],
             vec!["status".into(), invalid.clone()],
             vec!["retry".into(), invalid.clone()],
             vec!["remove".into(), invalid],
@@ -824,7 +857,6 @@ mod tests {
     fn remote() -> control::RemoteDto {
         control::RemoteDto {
             config_id: "0123456789abcdef0123456789abcdef".into(),
-            name: "dev".into(),
             target: "user@host".into(),
             endpoint_id: Some("fedcba9876543210fedcba9876543210".into()),
             lifecycle: config::Lifecycle::Active,
@@ -857,7 +889,7 @@ mod tests {
             ),
             Ok(vec![
                 "daemon=running remotes=1".into(),
-                "dev desired=active observed=connected".into()
+                "0123456789abcdef0123456789abcdef desired=active observed=connected".into()
             ])
         );
         assert!(status_lines(
@@ -872,9 +904,17 @@ mod tests {
     }
 
     #[test]
-    fn doctor_parser_accepts_zero_or_one_utf8_selector() {
+    fn doctor_parser_accepts_zero_or_one_full_config_id() {
+        let id = "0123456789abcdef0123456789abcdef";
         assert_eq!(doctor_selector(&[]), Ok(None));
-        assert_eq!(doctor_selector(&["dev".into()]), Ok(Some("dev")));
+        assert_eq!(doctor_selector(&[id.into()]), Ok(Some(id)));
+        for invalid in [
+            "dev",
+            "0123456789abcdef",
+            "ABCDEF0123456789ABCDEF0123456789",
+        ] {
+            assert!(doctor_selector(&[invalid.into()]).is_err());
+        }
         assert!(doctor_selector(&["a".into(), "b".into()]).is_err());
         #[cfg(unix)]
         {
@@ -888,16 +928,15 @@ mod tests {
         let mut checks = Vec::new();
         remote_checks(&remote(), &mut checks);
         assert!(checks.iter().any(|line| {
-            line == "PASS remote.dev.state: daemon snapshot desired=active observed=connected"
+            line == "PASS remote.0123456789abcdef0123456789abcdef.state: daemon snapshot desired=active observed=connected"
         }));
-        assert!(checks
-            .iter()
-            .any(|line| line == "PASS remote.dev.configured_identity: present"));
-        assert!(checks
-            .iter()
-            .any(|line| line.starts_with("PASS remote.dev.handshake: currently known v2")));
+        assert!(checks.iter().any(|line| line
+            == "PASS remote.0123456789abcdef0123456789abcdef.configured_identity: present"));
         assert!(checks.iter().any(|line| line.starts_with(
-            "NOT CHECKED remote.dev.live_endpoint: no new SSH, socket permission check"
+            "PASS remote.0123456789abcdef0123456789abcdef.handshake: currently known v3"
+        )));
+        assert!(checks.iter().any(|line| line.starts_with(
+            "NOT CHECKED remote.0123456789abcdef0123456789abcdef.live_endpoint: no new SSH, socket permission check"
         )));
         assert!(!checks.iter().any(|line| line.starts_with("FAIL ")));
 
@@ -909,13 +948,14 @@ mod tests {
         unhealthy.reconnect_attempt = Some(2);
         remote_checks(&unhealthy, &mut checks);
         assert!(checks.iter().any(|line| {
-            line == "FAIL remote.dev.state: daemon snapshot desired=active observed=reconnecting"
+            line == "FAIL remote.0123456789abcdef0123456789abcdef.state: daemon snapshot desired=active observed=reconnecting"
         }));
         assert!(checks
             .iter()
-            .any(|line| line == "FAIL remote.dev.capacity: unknown active"));
+            .any(|line| line
+                == "FAIL remote.0123456789abcdef0123456789abcdef.capacity: unknown active"));
         assert!(checks.iter().any(|line| {
-            line == "FAIL remote.dev.reconnect: attempt=2 at=unknown error=channel lost"
+            line == "FAIL remote.0123456789abcdef0123456789abcdef.reconnect: attempt=2 at=unknown error=channel lost"
         }));
     }
 

@@ -20,11 +20,11 @@ Mac 用户只管理一个后台服务，并通过 CLI 管理 remote：
 ego-lite-bridge start
 ego-lite-bridge stop
 ego-lite-bridge status
-ego-lite-bridge remote add dev-linux gaolei.veew@linux-a
+ego-lite-bridge remote add gaolei.veew@linux-a
 ego-lite-bridge remote list
-ego-lite-bridge remote status dev-linux
-ego-lite-bridge remote retry dev-linux
-ego-lite-bridge remote remove dev-linux
+ego-lite-bridge remote status 0123456789abcdef0123456789abcdef
+ego-lite-bridge remote retry 0123456789abcdef0123456789abcdef
+ego-lite-bridge remote remove 0123456789abcdef0123456789abcdef
 ```
 
 Linux 用户继续按需运行：
@@ -38,7 +38,7 @@ ego-browser <args...>
 - argv，包括 Unix 非 UTF-8 参数；
 - binary-safe stdin、stdout、stderr；
 - stdin EOF；
-- exit code，以及 Mac child 因 signal 终止时的 signal；
+- exit code，以及 Mac child 因 signal 终止时的 canonical signal name；
 - spawn、协议和连接错误；
 - request 级取消。
 
@@ -83,11 +83,11 @@ CLI 只通过本机 control socket操作 daemon，不直接修改配置或持有
 start
 stop
 status
-remote add <name> <ssh-target>
+remote add <ssh-target>
 remote list
-remote status <name-or-id>
-remote remove <name-or-id>
-remote retry <name-or-id>
+remote status <config-id>
+remote remove <config-id>
+remote retry <config-id>
 ```
 
 0.1 不提供交互式 TUI或 GUI管理面。
@@ -142,14 +142,13 @@ LaunchAgent不得依赖交互式shell的`PATH`。`start`应解析并保存`ego-b
 
 ## 6. Remote 管理与持久化
 
-### 6.1 Remote 名称与 target
+### 6.1 Config ID 与 target
 
-Remote name：
+Config ID：
 
-- 1–64个ASCII字母、数字、`-`、`_`或`.`；
-- 不允许以`.`开头；
-- 不允许`all`、`default`等保留名；
-- 在同一daemon配置中唯一。
+- 添加remote时生成的32字符小写十六进制稳定ID；
+- `doctor`、`remote status`、`remote retry`和`remote remove`只接受完整config ID；
+- 不支持短前缀、名称、selector alias、迁移或fallback。
 
 SSH target：
 
@@ -163,8 +162,7 @@ SSH target：
 
 每个remote记录：
 
-- `config_id`：Mac本地稳定记录ID；
-- `name`：用户指定名称；
+- `config_id`：Mac本地生成的32字符小写十六进制稳定记录ID；
 - `target`：原始OpenSSH target；
 - `endpoint_id`：成功识别后记录的Linux endpoint identity；
 - `lifecycle`：`pending`、`active`或`removing`；
@@ -176,12 +174,12 @@ SSH target：
 ### 6.3 添加 remote
 
 ```bash
-ego-lite-bridge remote add <name> <ssh-target>
+ego-lite-bridge remote add <ssh-target>
 ```
 
 流程：
 
-1. 验证name和target；
+1. 验证target并生成config ID；
 2. 原子写入一条`lifecycle=pending`的remote记录；
 3. 在30秒总deadline内建立SSH并验证remote bridge、protocol/capabilities；
 4. 读取Linux endpoint identity并检查重复；
@@ -190,7 +188,7 @@ ego-lite-bridge remote add <name> <ssh-target>
 
 命令成功必须表示端到端ready。30秒内允许按统一backoff重试SSH临时失败；deadline到达后回滚已获取的运行态并删除pending记录，命令明确失败。CLI连接在命令执行期间断开时，daemon继续该操作直到成功或deadline，不因客户端消失留下未定义状态；结果可通过`remote status`查询。若daemon崩溃，重启后先清理pending记录可能遗留的ownership，再删除记录，不自动转为active。
 
-### 6.4 Host alias 与 endpoint 去重
+### 6.4 Endpoint 去重
 
 不得用target字符串、DNS结果、IP或host key单独判断是否为同一endpoint。
 
@@ -210,8 +208,7 @@ Linux bridge为当前UID持久保存随机endpoint ID：
 判定：
 
 - 相同endpoint、相同target：返回already exists；
-- 相同endpoint、不同target：报告现有remote及两个target，不静默替换；
-- 不同endpoint、相同name：拒绝名称冲突；
+- 相同endpoint、不同target：报告现有remote config ID及两个target，不静默替换；
 - target变更需要未来显式`remote update`，0.1不提供隐式替换。
 
 ### 6.5 Remove 与 retry
@@ -345,8 +342,9 @@ broker socket路径改为：
 
 - 目录`0700`，配置和socket仅当前用户可访问；
 - daemon是配置唯一writer；
-- 配置写入使用同目录临时文件、flush、fsync和原子rename，并包含schema version；
-- 未知或损坏schema明确失败，不猜测修复；
+- 配置schema固定为v2；持久remote模型包含`config_id`、`target`、`endpoint_id`、`lifecycle`、`observed_state`、`state_changed_unix_ms`和`last_error`；
+- 配置写入使用同目录临时文件、flush、fsync和原子rename；
+- 未知、旧版或损坏schema明确失败，不迁移、不猜测修复；
 - CLI与daemon使用独立、版本化、长度限制的本机控制协议；
 - 控制协议不复用远程exec协议，也不能传递任意shell命令。
 
@@ -373,14 +371,16 @@ broker socket路径改为：
 
 ## 12. 协议要求
 
-正式0.1采用包含endpoint identity与ownership语义的protocol v2：
+正式0.1采用包含endpoint identity、ownership和portable exit signal语义的remote exec protocol v3；remote name移除导致wire shape变化，本地control protocol独立升级为v3：
 
-- exact-version和exact-capability匹配；
-- 不支持v1 fallback或静默降级；
+- exact-version和exact-capability匹配，不支持remote exec v2 fallback或静默降级；
+- child exit signal在wire上使用canonical名称，不使用平台signal number或enum ordinal；
+- replay白名单为`SIGHUP`、`SIGINT`、`SIGQUIT`、`SIGILL`、`SIGTRAP`、`SIGABRT`、`SIGFPE`、`SIGKILL`、`SIGBUS`、`SIGSEGV`、`SIGSYS`、`SIGPIPE`、`SIGALRM`、`SIGTERM`、`SIGUSR1`、`SIGUSR2`、`SIGVTALRM`、`SIGPROF`、`SIGXCPU`和`SIGXFSZ`；停止、继续、窗口/child通知及平台专有signal不进入白名单；
+- Mac child以白名单外signal退出时返回request-scoped error，不发送原始number、不猜测、不降级；收到未知wire signal name视为protocol error并关闭不可信channel；
 - Mac owner identity必须在candidate broker触碰现有socket之前交换；
 - ownership确定后broker返回明确ready或owner-conflict；
 - takeover、liveness probe和ack使用framed protocol，不解析日志；
-- v2 golden fixture覆盖全部消息和仲裁状态；
+- v3 golden fixture覆盖全部消息和仲裁状态，并包含canonical signal name；
 - wire shape变化必须显式升级版本和fixture。
 
 ## 13. Status 与 Doctor
@@ -388,12 +388,14 @@ broker socket路径改为：
 ```bash
 ego-lite-bridge status
 ego-lite-bridge remote list
-ego-lite-bridge remote status <name-or-id>
-ego-lite-bridge doctor [name-or-id]
+ego-lite-bridge remote status <config-id>
+ego-lite-bridge doctor [config-id]
 ```
 
-- status展示daemon和持久remote的desired/observed state；
-- remote status展示最近错误、重连状态、protocol/capabilities和请求容量；
+- status逐个展示remote的config ID和desired/observed state；
+- `remote add`、`remote list`和`remote retry`输出config ID、target及desired/observed state，不输出name；
+- remote status展示config ID、target、最近错误、重连状态、protocol/capabilities和请求容量，不输出name；
+- `doctor`、`remote status`、`remote retry`和`remote remove`只接受完整32字符小写十六进制config ID；
 - M7 doctor只读检查Mac本地LaunchAgent、daemon和配置中的绝对`ego-browser`路径；对remote检查持久配置中endpoint identity是否存在、desired/observed state，以及daemon当前worker快照中的已知handshake、请求容量和重连错误；
 - M7不验证live endpoint identity是否与持久值匹配；无法证明的主动remote检查明确输出`NOT CHECKED`，不伪装为健康；
 - M7 doctor不新建SSH连接，不主动检查Linux binary、endpoint identity文件或运行目录/socket权限，也不执行端到端probe；这些live检查和probe属于Post-0.1 hardening；
@@ -466,11 +468,11 @@ ego-lite-bridge doctor [name-or-id]
 
 当前`serve <linux-host>`是开发入口，不是0.1最终控制面。在daemon与Remote CRUD整体可用前保留该入口，避免中间版本不可用；最终切换时删除公开入口或改为明确内部命令，不保留静默兼容别名。
 
-protocol v2升级顺序：
+remote exec protocol v2→v3升级顺序：
 
-1. 停止现有v1 Mac supervisor；
-2. 更新Linux binary；
-3. 更新并启动v2 Mac daemon；
-4. 通过`remote add`建立配置。
+1. 停止现有v2 Mac daemon，确保其不再持有remote owner claim；
+2. 更新Linux binary至v3；
+3. 更新并启动v3 Mac daemon；
+4. 确认remote status和doctor报告protocol v3，再恢复调用。
 
-不得在v1 Linux broker仍运行时直接用v2 Mac尝试接管。正式0.1只承诺daemon架构和protocol v2，不承诺开发阶段v1兼容。
+不得让v2和v3组件混用或并行接管；版本不匹配必须明确失败，不得fallback。正式0.1只承诺daemon架构、remote exec protocol v3和本地control protocol v3；两种v3协议独立版本化，不得混为同一协议。配置schema为v2，不提供旧schema迁移。

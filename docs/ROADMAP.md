@@ -40,8 +40,8 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 实现：
 
 - 用户级LaunchAgent及`start/stop/status`；
-- 私有control socket、版本化协议、peer eUID验证和stale socket安全清理；
-- daemon单写者配置store、schema version、fsync和原子rename；
+- 私有control socket、本地control protocol v3、peer eUID验证和stale socket安全清理；
+- daemon单写者配置store、config schema v2、fsync和原子rename；旧schema明确失败且不迁移；
 - pending/active/removing生命周期及重启reconcile；
 - `start`捕获并验证`ego-browser`绝对路径；
 - 定义并单测bounded shutdown协调器：5秒grace、10秒总deadline；
@@ -70,6 +70,8 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 
 验收：alias identity、live owner拒绝、dead owner接管、网络分区恢复、多claimant、私有socket创建和日志sentinel测试通过。
 
+M5冻结的是identity/ownership wire基线；最终0.1 remote exec protocol在M8升级为v3，不保留v2 fallback。
+
 边界：ownership只fence Linux新请求入口；不承诺瞬时终止网络分区另一侧已运行的Mac child。
 
 ### M6 — Remote CRUD与RemoteWorker接入（已完成）
@@ -81,13 +83,15 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 实现：
 
 - `remote add/list/status/remove/retry`；
-- name和SSH target严格语法；
+- `remote add <ssh-target>`只接受一个target参数并生成完整32字符小写十六进制config ID；
+- doctor/status/retry/remove只接受完整config ID，不支持短前缀、名称、selector alias、迁移或fallback；
+- list/add/retry输出config ID、target和状态，status detail不输出name；
 - add采用pending-first，成功ready后提交active；
 - remove先持久化removing tombstone再清理；
 - daemon启动时reconcile pending和tombstone；
 - 将当前`run_serve`封装为daemon RemoteWorker；
 - SSH 255统一按临时session失败重试，协议不匹配、127和owner conflict进入error；
-- endpoint alias重复、name冲突和owner conflict返回明确错误；
+- endpoint alias重复和owner conflict返回明确错误；
 - M6完成后删除公开`serve`入口或改为明确内部命令。
 
 验收：一台Mac同时服务至少两个Linux；重复endpoint不产生第二配置；失败add无残留claim；pending/removing记录不因崩溃变为active；一个remote故障不影响其他remote；stop强制清理和daemon全局process/payload上限通过真实RemoteWorker E2E。
@@ -96,8 +100,8 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 
 状态：代码、本地自动化及真实Mac/Linux手动E2E均已通过。
 
-- daemon及remote desired/observed状态；
-- remote status展示错误、重连、protocol/capabilities和请求容量；
+- daemon及remote config ID、desired/observed状态；
+- remote status展示config ID、target、错误、重连、protocol/capabilities和请求容量，不输出name；
 - doctor只读检查Mac本地LaunchAgent、绝对`ego-browser`和daemon当前worker快照；
 - 未主动检查的SSH、Linux binary、endpoint identity文件、运行目录/socket权限和end-to-end probe明确显示`NOT CHECKED`，归入Post-0.1 hardening；
 - exit code：0无失败、1环境、daemon、selector或快照异常、2用法错误；
@@ -122,6 +126,8 @@ M4–M6放在同一长期feature分支中实现，按下面的内部提交边界
 - 在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；
 - README只陈述已验证的候选范围和实际发布状态，不宣称尚未完成的自动化；
 - 实际发布前保持`distribution/latest.json`的`available: false`，installer仍不可用。
+
+发布准备同时将remote exec protocol升级为v3：child exit signal使用canonical signal name白名单，unsupported child signal返回request error，未知wire signal视为protocol error；v2/v3 exact-version mismatch明确失败且无fallback。升级时先停止v2 Mac daemon，再更新Linux binary，最后启动v3 Mac daemon并通过status/doctor确认。remote name移除造成独立的本地wire shape变化，因此本地control protocol也升级为v3；config schema保持独立的v2，不迁移旧schema，不得混淆三个版本。
 
 候选产物准备完成不等于已经发布。
 
@@ -170,7 +176,7 @@ git diff --check
 
 其他工作仅由真实需求驱动：
 
-- remote update/rename；
+- remote update；
 - 可配置并发额度和跨remote公平调度；
 - Homebrew等分发渠道；
 - Sigstore、attestation与SBOM；

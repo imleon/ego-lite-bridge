@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const PROTOCOL_VERSION: u32 = 3;
 const CAPABILITY_BINARY_ARGV: u64 = 1 << 0;
 const CAPABILITY_STDIO_STREAMS: u64 = 1 << 1;
 const CAPABILITY_REQUEST_CANCEL: u64 = 1 << 2;
@@ -108,6 +108,169 @@ enum TakeoverStatus {
     Retry,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExitSignal {
+    Hup,
+    Int,
+    Quit,
+    Ill,
+    Trap,
+    Abrt,
+    Fpe,
+    Kill,
+    Bus,
+    Segv,
+    Sys,
+    Pipe,
+    Alrm,
+    Term,
+    Usr1,
+    Usr2,
+    Vtalrm,
+    Prof,
+    Xcpu,
+    Xfsz,
+}
+
+impl ExitSignal {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Hup => "SIGHUP",
+            Self::Int => "SIGINT",
+            Self::Quit => "SIGQUIT",
+            Self::Ill => "SIGILL",
+            Self::Trap => "SIGTRAP",
+            Self::Abrt => "SIGABRT",
+            Self::Fpe => "SIGFPE",
+            Self::Kill => "SIGKILL",
+            Self::Bus => "SIGBUS",
+            Self::Segv => "SIGSEGV",
+            Self::Sys => "SIGSYS",
+            Self::Pipe => "SIGPIPE",
+            Self::Alrm => "SIGALRM",
+            Self::Term => "SIGTERM",
+            Self::Usr1 => "SIGUSR1",
+            Self::Usr2 => "SIGUSR2",
+            Self::Vtalrm => "SIGVTALRM",
+            Self::Prof => "SIGPROF",
+            Self::Xcpu => "SIGXCPU",
+            Self::Xfsz => "SIGXFSZ",
+        }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn from_raw(signal: i32) -> Option<Self> {
+        match signal {
+            libc::SIGHUP => Some(Self::Hup),
+            libc::SIGINT => Some(Self::Int),
+            libc::SIGQUIT => Some(Self::Quit),
+            libc::SIGILL => Some(Self::Ill),
+            libc::SIGTRAP => Some(Self::Trap),
+            libc::SIGABRT => Some(Self::Abrt),
+            libc::SIGFPE => Some(Self::Fpe),
+            libc::SIGKILL => Some(Self::Kill),
+            libc::SIGBUS => Some(Self::Bus),
+            libc::SIGSEGV => Some(Self::Segv),
+            libc::SIGSYS => Some(Self::Sys),
+            libc::SIGPIPE => Some(Self::Pipe),
+            libc::SIGALRM => Some(Self::Alrm),
+            libc::SIGTERM => Some(Self::Term),
+            libc::SIGUSR1 => Some(Self::Usr1),
+            libc::SIGUSR2 => Some(Self::Usr2),
+            libc::SIGVTALRM => Some(Self::Vtalrm),
+            libc::SIGPROF => Some(Self::Prof),
+            libc::SIGXCPU => Some(Self::Xcpu),
+            libc::SIGXFSZ => Some(Self::Xfsz),
+            _ => None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn into_raw(self) -> i32 {
+        match self {
+            Self::Hup => libc::SIGHUP,
+            Self::Int => libc::SIGINT,
+            Self::Quit => libc::SIGQUIT,
+            Self::Ill => libc::SIGILL,
+            Self::Trap => libc::SIGTRAP,
+            Self::Abrt => libc::SIGABRT,
+            Self::Fpe => libc::SIGFPE,
+            Self::Kill => libc::SIGKILL,
+            Self::Bus => libc::SIGBUS,
+            Self::Segv => libc::SIGSEGV,
+            Self::Sys => libc::SIGSYS,
+            Self::Pipe => libc::SIGPIPE,
+            Self::Alrm => libc::SIGALRM,
+            Self::Term => libc::SIGTERM,
+            Self::Usr1 => libc::SIGUSR1,
+            Self::Usr2 => libc::SIGUSR2,
+            Self::Vtalrm => libc::SIGVTALRM,
+            Self::Prof => libc::SIGPROF,
+            Self::Xcpu => libc::SIGXCPU,
+            Self::Xfsz => libc::SIGXFSZ,
+        }
+    }
+}
+
+impl Serialize for ExitSignal {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExitSignal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        match name.as_str() {
+            "SIGHUP" => Ok(Self::Hup),
+            "SIGINT" => Ok(Self::Int),
+            "SIGQUIT" => Ok(Self::Quit),
+            "SIGILL" => Ok(Self::Ill),
+            "SIGTRAP" => Ok(Self::Trap),
+            "SIGABRT" => Ok(Self::Abrt),
+            "SIGFPE" => Ok(Self::Fpe),
+            "SIGKILL" => Ok(Self::Kill),
+            "SIGBUS" => Ok(Self::Bus),
+            "SIGSEGV" => Ok(Self::Segv),
+            "SIGSYS" => Ok(Self::Sys),
+            "SIGPIPE" => Ok(Self::Pipe),
+            "SIGALRM" => Ok(Self::Alrm),
+            "SIGTERM" => Ok(Self::Term),
+            "SIGUSR1" => Ok(Self::Usr1),
+            "SIGUSR2" => Ok(Self::Usr2),
+            "SIGVTALRM" => Ok(Self::Vtalrm),
+            "SIGPROF" => Ok(Self::Prof),
+            "SIGXCPU" => Ok(Self::Xcpu),
+            "SIGXFSZ" => Ok(Self::Xfsz),
+            _ => Err(serde::de::Error::unknown_variant(
+                &name,
+                &[
+                    "SIGHUP",
+                    "SIGINT",
+                    "SIGQUIT",
+                    "SIGILL",
+                    "SIGTRAP",
+                    "SIGABRT",
+                    "SIGFPE",
+                    "SIGKILL",
+                    "SIGBUS",
+                    "SIGSEGV",
+                    "SIGSYS",
+                    "SIGPIPE",
+                    "SIGALRM",
+                    "SIGTERM",
+                    "SIGUSR1",
+                    "SIGUSR2",
+                    "SIGVTALRM",
+                    "SIGPROF",
+                    "SIGXCPU",
+                    "SIGXFSZ",
+                ],
+            )),
+        }
+    }
+}
+
 #[derive(PartialEq, Eq, Serialize, Deserialize)]
 enum EgoBridgeMessage {
     Hello {
@@ -158,7 +321,7 @@ enum EgoBridgeMessage {
     Exit {
         request_id: u64,
         code: Option<i32>,
-        signal: Option<i32>,
+        signal: Option<ExitSignal>,
     },
     Error {
         request_id: u64,
@@ -2436,19 +2599,8 @@ where
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn replay_signal(signal: i32) -> io::Result<i32> {
-    if signal <= 0
-        || matches!(
-            signal,
-            libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
-        )
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("cannot replay signal {signal}"),
-        ));
-    }
-
+fn replay_signal(exit_signal: ExitSignal) -> io::Result<i32> {
+    let signal = exit_signal.into_raw();
     if signal != libc::SIGKILL {
         // SAFETY: zeroed sigaction is initialized below before installation.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -3389,7 +3541,7 @@ fn execute_request_inner(
         stdout?;
         stderr?;
         stdin.map_err(RequestExecutionError::Local)?;
-        let (code, signal) = exit_status(status);
+        let (code, signal) = exit_status(status).map_err(RequestExecutionError::Local)?;
         if request_error
             .lock()
             .map_err(|_| {
@@ -3548,15 +3700,26 @@ fn join_request_worker(
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn exit_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
+fn exit_status(status: ExitStatus) -> io::Result<(Option<i32>, Option<ExitSignal>)> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt as _;
-        (status.code(), status.signal())
+        let signal = status
+            .signal()
+            .map(|signal| {
+                ExitSignal::from_raw(signal).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("ego-browser exited with unsupported signal {signal}"),
+                    )
+                })
+            })
+            .transpose()?;
+        Ok((status.code(), signal))
     }
     #[cfg(not(unix))]
     {
-        (status.code().or(Some(1)), None)
+        Ok((status.code().or(Some(1)), None))
     }
 }
 
@@ -3729,7 +3892,7 @@ mod tests {
         writer.shutdown().expect("join writer");
     }
 
-    fn protocol_v2_messages() -> Vec<EgoBridgeMessage> {
+    fn protocol_v3_messages() -> Vec<EgoBridgeMessage> {
         let mut messages = vec![
             hello(TEST_ENDPOINT_ID),
             welcome(TEST_OWNER_ID, None),
@@ -3782,7 +3945,7 @@ mod tests {
             EgoBridgeMessage::Exit {
                 request_id: 43,
                 code: None,
-                signal: Some(15),
+                signal: Some(ExitSignal::Bus),
             },
             EgoBridgeMessage::Error {
                 request_id: 42,
@@ -3794,11 +3957,11 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v2_golden_fixture() {
-        let fixture = include_bytes!("../tests/fixtures/ego_bridge_v2.bin");
+    fn protocol_v3_golden_fixture() {
+        let fixture = include_bytes!("../tests/fixtures/ego_bridge_v3.bin");
         let mut input = io::Cursor::new(fixture.as_slice());
 
-        for expected in protocol_v2_messages() {
+        for expected in protocol_v3_messages() {
             let start = input.position() as usize;
             let decoded = read_message(&mut input).expect("decode fixture message");
             let end = input.position() as usize;
@@ -4189,7 +4352,7 @@ mod tests {
                     0
                 );
             }
-            let error = replay_signal(libc::SIGPIPE).expect_err("signal must terminate helper");
+            let error = replay_signal(ExitSignal::Pipe).expect_err("signal must terminate helper");
             panic!("{error}");
         }
 
@@ -4207,20 +4370,45 @@ mod tests {
     }
 
     #[test]
-    fn shim_rejects_invalid_and_stop_exit_signals() {
-        for signal in [
-            0,
-            -1,
-            i32::MAX,
-            libc::SIGSTOP,
-            libc::SIGTSTP,
-            libc::SIGTTIN,
-            libc::SIGTTOU,
+    fn exit_signals_use_canonical_names_and_local_numbers() {
+        for (signal, name, raw) in [
+            (ExitSignal::Bus, "SIGBUS", libc::SIGBUS),
+            (ExitSignal::Usr1, "SIGUSR1", libc::SIGUSR1),
         ] {
-            let error = replay_signal(signal).expect_err("reject signal");
-            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-            assert!(error.to_string().contains(&signal.to_string()));
+            let encoded = bincode::serde::encode_to_vec(signal, bincode::config::standard())
+                .expect("encode signal");
+            let expected = bincode::serde::encode_to_vec(name, bincode::config::standard())
+                .expect("encode name");
+            assert_eq!(encoded, expected);
+            assert_eq!(ExitSignal::from_raw(raw), Some(signal));
+            assert_eq!(signal.into_raw(), raw);
         }
+    }
+
+    #[test]
+    fn exit_signal_deserialization_rejects_unknown_name_and_raw_number() {
+        for encoded in [
+            bincode::serde::encode_to_vec("SIGSTOP", bincode::config::standard())
+                .expect("encode unknown name"),
+            bincode::serde::encode_to_vec(libc::SIGTERM, bincode::config::standard())
+                .expect("encode raw number"),
+        ] {
+            assert!(bincode::serde::decode_from_slice::<ExitSignal, _>(
+                &encoded,
+                bincode::config::standard()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn unsupported_child_signal_is_request_local_error() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let status = ExitStatus::from_raw(libc::SIGSTOP);
+        let error = exit_status(status).expect_err("reject unsupported child signal");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unsupported signal"));
     }
 
     #[test]
@@ -4827,7 +5015,7 @@ mod tests {
             .send(Ok(EgoBridgeMessage::Exit {
                 request_id: 20,
                 code: None,
-                signal: Some(15),
+                signal: Some(ExitSignal::Term),
             }))
             .expect("first exit");
         remote
@@ -5381,22 +5569,82 @@ mod tests {
     }
 
     #[test]
-    fn executor_roundtrips_stdin_larger_than_input_queue() {
+    fn executor_forwards_multiframe_arbitrary_binary_stdout_exactly() {
+        let mut expected = vec![0; 16 * 1024];
+        expected.extend(vec![0xff; 16 * 1024]);
+        expected.extend(vec![0x80; 16 * 1024]);
+
         let (sender, output, worker) = start_test_executor();
-        let request_id = 39;
-        let input = (0..256 * 1024)
-            .map(|index| (index % 251) as u8)
-            .collect::<Vec<_>>();
+        let request_id = 38;
         sender
             .send(Ok(EgoBridgeMessage::Open {
                 request_id,
                 argv: vec![
                     b"-c".to_vec(),
-                    b"tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; cat >\"$tmp\"; cat \"$tmp\""
+                    b"LC_ALL=C; export LC_ALL; dd if=/dev/zero bs=16384 count=1 2>/dev/null; dd if=/dev/zero bs=16384 count=1 2>/dev/null | tr '\\000' '\\377'; dd if=/dev/zero bs=16384 count=1 2>/dev/null | tr '\\000' '\\200'"
                         .to_vec(),
                 ],
             }))
-            .expect("open echo request");
+            .expect("open binary stdout request");
+        sender
+            .send(Ok(EgoBridgeMessage::StdinEof { request_id }))
+            .expect("close stdin");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let messages = loop {
+            let messages = decode_messages(&output);
+            if messages
+                .iter()
+                .any(|message| matches!(message, EgoBridgeMessage::Exit { request_id: 38, .. }))
+            {
+                break messages;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for exit");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = messages
+            .iter()
+            .filter_map(|message| match message {
+                EgoBridgeMessage::Stdout {
+                    request_id: 38,
+                    data,
+                } => Some(data.as_slice()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(stdout.len() > 1);
+        assert!(stdout.len() < REQUEST_QUEUE_CAPACITY);
+        assert_eq!(stdout.concat(), expected);
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            EgoBridgeMessage::Exit {
+                request_id: 38,
+                code: Some(0),
+                signal: None,
+            }
+        )));
+        assert!(!messages.iter().any(|message| matches!(
+            message,
+            EgoBridgeMessage::Stderr { request_id: 38, .. }
+                | EgoBridgeMessage::Error { request_id: 38, .. }
+        )));
+        drop(sender);
+        assert!(worker.join().expect("executor worker").is_err());
+    }
+
+    #[test]
+    fn executor_forwards_stdin_larger_than_input_queue() {
+        let (sender, output, worker) = start_test_executor();
+        let request_id = 39;
+        let input = (0..9 * 16 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        sender
+            .send(Ok(EgoBridgeMessage::Open {
+                request_id,
+                argv: vec![b"-c".to_vec(), b"cksum".to_vec()],
+            }))
+            .expect("open checksum request");
         for chunk in input.chunks(16 * 1024) {
             sender
                 .send(Ok(EgoBridgeMessage::Stdin {
@@ -5433,10 +5681,18 @@ mod tests {
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        assert_eq!(actual, input);
-        assert!(messages
+        assert_eq!(actual, b"1862523210 147456\n");
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            EgoBridgeMessage::Exit {
+                request_id: 39,
+                code: Some(0),
+                signal: None,
+            }
+        )));
+        assert!(!messages
             .iter()
-            .any(|message| matches!(message, EgoBridgeMessage::Exit { request_id: 39, .. })));
+            .any(|message| matches!(message, EgoBridgeMessage::Error { request_id: 39, .. })));
         drop(sender);
         assert!(worker.join().expect("executor worker").is_err());
     }

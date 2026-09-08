@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
-import time
 import unittest
 from pathlib import Path
 
@@ -26,15 +25,12 @@ class ManualE2ETest(unittest.TestCase):
             raise RuntimeError(f"{BINARY_ENV} is not a file: {cls.binary}")
         cls.target = os.environ[TARGET_ENV]
         cls.shim = os.environ.get(SHIM_ENV, "~/.local/bin/ego-browser")
-        cls.name = f"manual-e2e-{os.getpid()}-{time.time_ns()}"
-        cls.duplicate_name = f"{cls.name}-duplicate"
         cls.added: set[str] = set()
 
     @classmethod
     def tearDownClass(cls) -> None:
-        for name in (cls.duplicate_name, cls.name):
-            if name in cls.added:
-                cls.run_bridge("remote", "remove", name, check=False)
+        for config_id in cls.added:
+            cls.run_bridge("remote", "remove", config_id, check=False)
         cls.run_bridge("stop", check=False)
 
     @classmethod
@@ -65,32 +61,33 @@ class ManualE2ETest(unittest.TestCase):
     def test_remote_crud_and_linux_shim(self) -> None:
         self.run_bridge("start")
 
-        added = self.run_bridge("remote", "add", self.name, self.target)
-        self.added.add(self.name)
+        added = self.run_bridge("remote", "add", self.target)
         fields = added.stdout.rstrip("\n").split("\t")
-        self.assertEqual(len(fields), 4, added.stdout)
+        self.assertEqual(len(fields), 3, added.stdout)
         config_id = fields[0]
+        self.added.add(config_id)
+        self.assertRegex(config_id, r"^[0-9a-f]{32}$")
         self.assertEqual(
             fields[1:],
-            [self.name, self.target, "desired=active observed=connected"],
+            [self.target, "desired=active observed=connected"],
         )
 
         status = self.run_bridge("status")
         status_lines = status.stdout.splitlines()
         self.assertRegex(status_lines[0], r"^daemon=running remotes=[1-9][0-9]*$")
         self.assertIn(
-            f"{self.name} desired=active observed=connected", status_lines[1:]
+            f"{config_id} desired=active observed=connected", status_lines[1:]
         )
         remote_list = self.run_bridge("remote", "list")
         self.assertIn(added.stdout.rstrip("\n"), remote_list.stdout.splitlines())
 
-        remote_status = self.run_bridge("remote", "status", self.name)
+        remote_status = self.run_bridge("remote", "status", config_id)
         details = dict(line.split(": ", 1) for line in remote_status.stdout.splitlines())
+        self.assertNotIn("name", details)
         self.assertEqual(
             list(details),
             [
                 "config-id",
-                "name",
                 "target",
                 "desired",
                 "observed",
@@ -104,19 +101,18 @@ class ManualE2ETest(unittest.TestCase):
             ],
         )
         self.assertEqual(details["config-id"], config_id)
-        self.assertEqual(details["name"], self.name)
         self.assertEqual(details["target"], self.target)
         self.assertEqual(details["desired"], "active")
         self.assertEqual(details["observed"], "connected")
         self.assertEqual(details["last-error"], "unknown")
-        self.assertEqual(details["protocol-version"], "2")
+        self.assertEqual(details["protocol-version"], "3")
         self.assertRegex(details["capabilities"], r"^0x[0-9a-f]+$")
         self.assertEqual(details["reconnect-attempt"], "unknown")
         self.assertEqual(details["reconnect-at-unix-ms"], "unknown")
         self.assertRegex(details["active-requests"], r"^0/[1-9][0-9]*$")
 
         before_doctor = self.config_snapshot()
-        for selector in ((), (self.name,)):
+        for selector in ((), (config_id,)):
             doctor = self.run_bridge("doctor", *selector)
             lines = doctor.stdout.splitlines()
             self.assertIn("PASS mac.launchd: loaded", lines)
@@ -130,20 +126,20 @@ class ManualE2ETest(unittest.TestCase):
                 )
             )
             self.assertIn(
-                f"PASS remote.{self.name}.state: daemon snapshot desired=active observed=connected",
+                f"PASS remote.{config_id}.state: daemon snapshot desired=active observed=connected",
                 lines,
             )
             self.assertIn(
-                f"PASS remote.{self.name}.configured_identity: present", lines
+                f"PASS remote.{config_id}.configured_identity: present", lines
             )
             self.assertIn(
-                f"PASS remote.{self.name}.handshake: currently known v2 "
+                f"PASS remote.{config_id}.handshake: currently known v3 "
                 f"capabilities={details['capabilities']}",
                 lines,
             )
-            self.assertIn(f"PASS remote.{self.name}.capacity: 0/8 active", lines)
+            self.assertIn(f"PASS remote.{config_id}.capacity: 0/8 active", lines)
             self.assertIn(
-                f"NOT CHECKED remote.{self.name}.live_endpoint: no new SSH, socket permission check, or end-to-end probe",
+                f"NOT CHECKED remote.{config_id}.live_endpoint: no new SSH, socket permission check, or end-to-end probe",
                 lines,
             )
             self.assertFalse(any(line.startswith("FAIL ") for line in lines), doctor.stdout)
@@ -157,16 +153,16 @@ class ManualE2ETest(unittest.TestCase):
         )
         self.assertEqual(shim.returncode, 0, shim.stderr.decode(errors="replace"))
 
-        duplicate = self.run_bridge(
-            "remote", "add", self.duplicate_name, self.target, check=False
-        )
+        duplicate = self.run_bridge("remote", "add", self.target, check=False)
         if duplicate.returncode == 0:
-            self.added.add(self.duplicate_name)
+            duplicate_id = duplicate.stdout.split("\t", 1)[0]
+            self.added.add(duplicate_id)
         self.assertNotEqual(duplicate.returncode, 0, duplicate.stdout + duplicate.stderr)
+        self.assertIn(config_id, duplicate.stdout + duplicate.stderr)
         self.assertIn("endpoint", (duplicate.stdout + duplicate.stderr).lower())
 
-        removed = self.run_bridge("remote", "remove", self.name)
-        self.added.remove(self.name)
+        removed = self.run_bridge("remote", "remove", config_id)
+        self.added.remove(config_id)
         self.assertIn("removed ", removed.stdout)
 
 
