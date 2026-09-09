@@ -121,23 +121,7 @@ main() {
     chmod +x "$STAGED_BINARY"
     validate_install_paths
 
-    trap '' PIPE
-    CREATED_SHIM=false
-    if [ "$os" = "linux" ] && [ ! -L "$SHIM" ]; then
-        ln -s "$BIN" "$SHIM"
-        CREATED_SHIM=true
-    fi
-    if ! mv "$STAGED_BINARY" "${INSTALL_DIR}/${BIN}"; then
-        if [ "$CREATED_SHIM" = true ]; then
-            rm -f "$SHIM"
-        fi
-        err "failed to install ${BIN}"
-    fi
-
-    if [ "$CREATED_SHIM" = true ]; then
-        log "created ego-browser shim at ${SHIM}"
-    fi
-    log "installed ${BIN} to ${INSTALL_DIR}/${BIN}"
+    commit_binary
 
     if [ "$os" = "linux" ]; then
         # Read the controlling terminal, never the script input (curl | sh).
@@ -173,6 +157,26 @@ main() {
     echo ""
     return 0
 }
+
+commit_binary() (
+    trap '' PIPE
+    CREATED_SHIM=false
+    if [ "$os" = "linux" ] && [ ! -L "$SHIM" ]; then
+        ln -s "$BIN" "$SHIM" || err "failed to create ego-browser shim at ${SHIM}"
+        CREATED_SHIM=true
+    fi
+    if ! mv "$STAGED_BINARY" "${INSTALL_DIR}/${BIN}"; then
+        if [ "$CREATED_SHIM" = true ]; then
+            rm -f "$SHIM" || err "failed to remove new ego-browser shim at ${SHIM} after binary installation failed"
+        fi
+        err "failed to install ${BIN}"
+    fi
+
+    if [ "$CREATED_SHIM" = true ]; then
+        log "created ego-browser shim at ${SHIM}" || :
+    fi
+    log "installed ${BIN} to ${INSTALL_DIR}/${BIN}" || :
+)
 
 confirm_skill() (
     # Background terminal reads must fail, not suspend the installer. Keep the

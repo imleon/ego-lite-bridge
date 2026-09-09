@@ -257,7 +257,7 @@ assert sys.stdin.read() == ''
 print(os.environ.get('FAKE_NODE_VERSION', 'v22.20.0'))
 sys.exit(int(os.environ.get('FAKE_NODE_EXIT', '0')))
 """)
-        self._write_executable("npx", f"""#!{sys.executable}
+        self._write_executable("npx-python", f"""#!{sys.executable}
 import json, os, signal, sys
 from pathlib import Path
 assert signal.getsignal(signal.SIGTTIN) == signal.SIG_DFL, 'SIGTTIN leaked into npx'
@@ -272,6 +272,11 @@ if os.environ.get('FAKE_NPX_READ'):
     assert input() == 'from-terminal'
 print('Installation cancelled' if os.environ.get('FAKE_NPX_CANCEL') else 'Mock CLI ended')
 sys.exit(int(os.environ.get('FAKE_NPX_EXIT', '0')))
+""")
+        self._write_executable("npx", """#!/bin/sh
+sh -c 'trap - PIPE; kill -PIPE "$$"; exit 99' 2>/dev/null
+[ "$?" -ne 99 ] || { echo 'SIGPIPE leaked into npx' >&2; exit 1; }
+exec npx-python "$@"
 """)
         return env
 
