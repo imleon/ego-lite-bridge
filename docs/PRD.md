@@ -38,6 +38,7 @@ ego-browser <args...>
 - argv，包括 Unix 非 UTF-8 参数；
 - binary-safe stdin、stdout、stderr；
 - stdin EOF；
+- request-scoped PNG screenshot files created under the bridge transfer directory；
 - exit code，以及 Mac child 因 signal 终止时的 canonical signal name；
 - spawn、协议和连接错误；
 - request 级取消。
@@ -317,7 +318,8 @@ existing broker通过当前SSH channel发送随机nonce probe；只有匹配ack�
 - 每方向每请求最多排队8个data frames，即512KiB payload；
 - daemon全部request mailbox payload总预算为8MiB；
 - 超过单消息、request queue或daemon预算时只取消所属请求并返回明确错误；
-- argv整体编码仍受2MiB frame上限约束。
+- argv整体编码仍受2MiB frame上限约束；
+- screenshot return只传输request-scoped transfer directory中的`.png`文件，单文件最大32MiB，并按64KiB chunks传输。
 
 ### 8.3 隔离与清理
 
@@ -325,6 +327,7 @@ existing broker通过当前SSH channel发送随机nonce probe；只有匹配ack�
 - 慢客户端超过buffer或write timeout后只取消自身；
 - duplicate active request ID只拒绝冲突请求；
 - request ID在远端终态和本地worker均结束前不得复用；
+- screenshot return只扫描每请求私有`/tmp/ego-lite-bridge-screenshots-*`目录中的direct-child `.png`文件，不解析stdout/stderr路径，不回传任意Mac文件；
 - remote channel断开时，其请求全部失败并被唤醒；
 - Mac child使用独立process group，取消和断线必须终止并回收整个组；
 - 一个remote故障不得影响其他remote。
@@ -388,7 +391,7 @@ broker socket路径改为：
 
 ## 12. 协议要求
 
-正式0.1采用包含endpoint identity、ownership和portable exit signal语义的remote exec protocol v3；remote name移除导致wire shape变化，本地control protocol独立升级为v3：
+正式0.1采用包含endpoint identity、ownership、portable exit signal和request-scoped screenshot return语义的remote exec protocol v4；remote name移除导致wire shape变化，本地control protocol独立保持v3：
 
 - exact-version和exact-capability匹配，不支持remote exec v2 fallback或静默降级；
 - child exit signal在wire上使用canonical名称，不使用平台signal number或enum ordinal；
@@ -397,7 +400,7 @@ broker socket路径改为：
 - Mac owner identity必须在candidate broker触碰现有socket之前交换；
 - ownership确定后broker返回明确ready或owner-conflict；
 - takeover、liveness probe和ack使用framed protocol，不解析日志；
-- v3 golden fixture覆盖全部消息和仲裁状态，并包含canonical signal name；
+- v4 golden fixture覆盖全部消息、仲裁状态、request transfer root和screenshot file messages，并包含canonical signal name；
 - wire shape变化必须显式升级版本和fixture。
 
 ## 13. Status 与 Doctor

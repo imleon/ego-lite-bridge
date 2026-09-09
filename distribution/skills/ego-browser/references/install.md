@@ -28,4 +28,4 @@ ego-lite-bridge remote retry <config-id>
 
 The daemon and remote must be healthy before retrying `ego-browser` on Linux. Bridge failures are explicit; there is no local browser fallback.
 
-Paths passed to browser helpers such as `uploadFile()` are resolved on the Mac executor. The bridge does not transfer Linux files, so copy a file to the Mac first and pass its Mac path.
+Paths passed to browser helpers such as `uploadFile()` are resolved on the Mac executor. The bridge does not transfer Linux files, so copy a file to the Mac first and pass its Mac path. PNG screenshots are the exception in the other direction: screenshots saved to the bridge request transfer directory are returned to Linux automatically.
