@@ -3693,6 +3693,8 @@ fn execute_request_inner(
     budget: &ResourceBudget,
 ) -> Result<(), RequestExecutionError> {
     let mut command = crate::macos_process::command(program);
+    let input_prelude =
+        nodejs_input_prelude(argv, transfer_root).map_err(RequestExecutionError::Local)?;
     if let Some(root) = transfer_root {
         prepare_screenshot_transfer_root(root).map_err(RequestExecutionError::Local)?;
         command
@@ -3780,6 +3782,7 @@ fn execute_request_inner(
                 pending_input,
                 &stdin_cancelled,
                 &stdin_worker_done,
+                input_prelude,
             )
         });
 
@@ -3819,6 +3822,32 @@ fn execute_request_inner(
         );
         Ok(())
     })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn nodejs_input_prelude(
+    argv: &[std::ffi::OsString],
+    transfer_root: Option<&Path>,
+) -> io::Result<Option<Vec<u8>>> {
+    if argv != [std::ffi::OsString::from("nodejs")] {
+        return Ok(None);
+    }
+    let Some(root) = transfer_root else {
+        return Ok(None);
+    };
+    let root = root.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "screenshot transfer root is not UTF-8",
+        )
+    })?;
+    let literal = serde_json::to_string(root).map_err(io::Error::other)?;
+    Ok(Some(
+        format!(
+            "globalThis.process.env.TMPDIR={literal};globalThis.process.env.EGO_LITE_BRIDGE_TRANSFER_DIR={literal};\n"
+        )
+        .into_bytes(),
+    ))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -3979,13 +4008,78 @@ fn send_executor_data(
 }
 
 #[cfg(any(target_os = "macos", test))]
+struct InputPrelude {
+    prelude: Option<Vec<u8>>,
+    pending: Vec<u8>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl InputPrelude {
+    fn new(prelude: Option<Vec<u8>>) -> Self {
+        Self {
+            prelude,
+            pending: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, data: &[u8], eof: bool) -> io::Result<Option<Vec<u8>>> {
+        let Some(prelude) = self.prelude.as_ref() else {
+            return Ok((!data.is_empty()).then(|| data.to_vec()));
+        };
+        self.pending.extend_from_slice(data);
+
+        const BOM: &[u8] = b"\xef\xbb\xbf";
+        if !eof && self.pending.len() < BOM.len() && BOM.starts_with(&self.pending) {
+            return Ok(None);
+        }
+        let bom_len = usize::from(self.pending.starts_with(BOM)) * BOM.len();
+        let source = &self.pending[bom_len..];
+        if !eof && source.len() < 2 && b"#!".starts_with(source) {
+            return Ok(None);
+        }
+
+        let shebang = source.starts_with(b"#!");
+        let insertion = if shebang {
+            match source.iter().position(|byte| *byte == b'\n') {
+                Some(newline) => bom_len + newline + 1,
+                None if !eof => {
+                    if self.pending.len() > MAX_STREAM_PAYLOAD_SIZE {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ego-browser nodejs shebang exceeds maximum stream payload",
+                        ));
+                    }
+                    return Ok(None);
+                }
+                None => self.pending.len(),
+            }
+        } else {
+            bom_len
+        };
+
+        let mut output = Vec::with_capacity(self.pending.len() + prelude.len() + 1);
+        output.extend_from_slice(&self.pending[..insertion]);
+        if shebang && eof && !output.ends_with(b"\n") {
+            output.push(b'\n');
+        }
+        output.extend_from_slice(prelude);
+        output.extend_from_slice(&self.pending[insertion..]);
+        self.pending.clear();
+        self.prelude = None;
+        Ok(Some(output))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn forward_input(
     mut child_stdin: impl Write,
     receiver: &mpsc::Receiver<RequestInput>,
     pending_input: &AtomicUsize,
     cancelled: &AtomicBool,
     done: &AtomicBool,
+    prelude: Option<Vec<u8>>,
 ) -> io::Result<()> {
+    let mut input_prelude = InputPrelude::new(prelude);
     while !done.load(Ordering::Acquire) && !cancelled.load(Ordering::Acquire) {
         match receiver.recv_timeout(EXEC_POLL_INTERVAL) {
             Ok(input) => {
@@ -3993,22 +4087,26 @@ fn forward_input(
                 if cancelled.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                match input {
-                    RequestInput::Stdin(data, _payload) => {
-                        if let Err(err) = child_stdin
-                            .write_all(&data)
-                            .and_then(|()| child_stdin.flush())
+                let (data, eof) = match input {
+                    RequestInput::Stdin(data, _payload) => (data, false),
+                    RequestInput::StdinEof => (Vec::new(), true),
+                };
+                if let Some(output) = input_prelude.push(&data, eof)? {
+                    if let Err(err) = child_stdin
+                        .write_all(&output)
+                        .and_then(|()| child_stdin.flush())
+                    {
+                        if err.kind() == io::ErrorKind::BrokenPipe
+                            || cancelled.load(Ordering::Acquire)
                         {
-                            if err.kind() == io::ErrorKind::BrokenPipe
-                                || cancelled.load(Ordering::Acquire)
-                            {
-                                return Ok(());
-                            }
-                            cancelled.store(true, Ordering::Release);
-                            return Err(err);
+                            return Ok(());
                         }
+                        cancelled.store(true, Ordering::Release);
+                        return Err(err);
                     }
-                    RequestInput::StdinEof => return Ok(()),
+                }
+                if eof {
+                    return Ok(());
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -5276,6 +5374,94 @@ mod tests {
     }
 
     #[test]
+    fn nodejs_prelude_requires_exact_argv_and_transfer_root() {
+        let root = Path::new("/tmp/ego-lite-bridge-screenshots-1001-1");
+        assert!(nodejs_input_prelude(&["nodejs".into()], Some(root))
+            .expect("build prelude")
+            .is_some());
+        for argv in [
+            Vec::new(),
+            vec!["open".into()],
+            vec!["nodejs-extra".into()],
+            vec!["nodejs".into(), "--sdk-path".into()],
+        ] {
+            assert!(nodejs_input_prelude(&argv, Some(root))
+                .expect("skip prelude")
+                .is_none());
+        }
+        assert!(nodejs_input_prelude(&["nodejs".into()], None)
+            .expect("skip missing root")
+            .is_none());
+    }
+
+    #[test]
+    fn input_prelude_preserves_bom_shebang_chunks_and_eof() {
+        const PRELUDE: &[u8] = b"PRELUDE\n";
+        for (chunks, expected) in [
+            (
+                vec![b"console.log(1)".as_slice(), b"".as_slice()],
+                b"PRELUDE\nconsole.log(1)".as_slice(),
+            ),
+            (
+                vec![
+                    b"\xef".as_slice(),
+                    b"\xbb\xbflet x=1".as_slice(),
+                    b"".as_slice(),
+                ],
+                b"\xef\xbb\xbfPRELUDE\nlet x=1".as_slice(),
+            ),
+            (
+                vec![
+                    b"#".as_slice(),
+                    b"!/usr/bin/env node\nlet x=1".as_slice(),
+                    b"".as_slice(),
+                ],
+                b"#!/usr/bin/env node\nPRELUDE\nlet x=1".as_slice(),
+            ),
+            (
+                vec![
+                    b"\xef\xbb".as_slice(),
+                    b"\xbf#".as_slice(),
+                    b"!/usr/bin/env node\nlet x=1".as_slice(),
+                    b"".as_slice(),
+                ],
+                b"\xef\xbb\xbf#!/usr/bin/env node\nPRELUDE\nlet x=1".as_slice(),
+            ),
+            (
+                vec![b"#!/usr/bin/env node".as_slice(), b"".as_slice()],
+                b"#!/usr/bin/env node\nPRELUDE\n".as_slice(),
+            ),
+            (vec![b"".as_slice()], b"PRELUDE\n".as_slice()),
+            (
+                vec![b"\xff\x80".as_slice(), b"".as_slice()],
+                b"PRELUDE\n\xff\x80".as_slice(),
+            ),
+        ] {
+            let mut injector = InputPrelude::new(Some(PRELUDE.to_vec()));
+            let mut output = Vec::new();
+            for (index, chunk) in chunks.iter().enumerate() {
+                if let Some(bytes) = injector
+                    .push(chunk, index + 1 == chunks.len())
+                    .expect("inject prelude")
+                {
+                    output.extend(bytes);
+                }
+            }
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn input_without_prelude_remains_binary_exact() {
+        let mut injector = InputPrelude::new(None);
+        let mut output = Vec::new();
+        for chunk in [b"\x00\xff".as_slice(), b"data".as_slice()] {
+            output.extend(injector.push(chunk, false).expect("pass through").unwrap());
+        }
+        assert_eq!(output, b"\x00\xffdata");
+    }
+
+    #[test]
     fn cancelled_input_worker_does_not_write_already_queued_data() {
         let (sender, receiver) = mpsc::sync_channel(1);
         sender
@@ -5288,6 +5474,7 @@ mod tests {
             &AtomicUsize::new(1),
             &AtomicBool::new(true),
             &AtomicBool::new(false),
+            Some(b"prelude".to_vec()),
         )
         .expect("cancel input worker");
         assert!(output.is_empty());

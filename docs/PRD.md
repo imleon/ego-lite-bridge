@@ -36,8 +36,8 @@ ego-browser <args...>
 系统通过 daemon 主动建立的 SSH channel，将请求交给 Mac 上真实的 `ego-browser`，并传递：
 
 - argv，包括 Unix 非 UTF-8 参数；
-- binary-safe stdin、stdout、stderr；
-- stdin EOF；
+- binary-safe stdout、stderr；
+- stdin与stdin EOF；除精确`ego-browser nodejs`模式外stdin保持binary-transparent；该模式由Mac executor在可选UTF-8 BOM和首行shebang之后注入bridge-owned JavaScript prelude，将`TMPDIR`和`EGO_LITE_BRIDGE_TRANSFER_DIR`设为已验证的request transfer root；
 - request-scoped PNG screenshot files created under the bridge transfer directory；
 - exit code，以及 Mac child 因 signal 终止时的 canonical signal name；
 - spawn、协议和连接错误；
