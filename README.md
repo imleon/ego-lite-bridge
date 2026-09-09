@@ -28,7 +28,6 @@ Prerequisites:
 - macOS with the real `ego-browser` available on `PATH`.
 - A Linux host reachable with non-interactive SSH authentication.
 - `~/.local/bin` on `PATH` on both machines.
-- On Linux, Node.js 22.20.0 or newer and `npm`/`npx` for Agent skill installation.
 
 Install the latest release on both the Mac and Linux host:
 
@@ -36,19 +35,42 @@ Install the latest release on both the Mac and Linux host:
 curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/install.sh | sh
 ```
 
-The installer verifies the binary against the release manifest's SHA-256 checksum. On macOS it installs only `ego-lite-bridge`. The release also contains `ego-browser-skill.tgz`; on Linux, the installer downloads it from the manifest's `skill_url`, verifies its manifest SHA-256 checksum, extracts it, installs the binary and `ego-browser` shim, then internally runs this pinned command against the extracted local directory:
+The installer verifies the binary against the release manifest's SHA-256 checksum. On macOS it installs only `ego-lite-bridge`, without prompting for a skill. On Linux, after committing the binary and `ego-browser` shim, it asks `[Y/n]` through `/dev/tty`: Enter or `y`/`yes` (case-insensitive) starts optional skill installation; `n`/`no` skips it; invalid input prompts again. EOF, a read failure, or no usable terminal skips the skill and prints the manual-install link. Skipping needs no Node.js, npm/npx, or tar and leaves Agent directories untouched.
+
+Only after consent does the optional step require Node.js 22.20.0 or newer, `npm`/`npx`, and `tar`. It downloads the same release's skill using the manifest already fetched for the binary, verifies SHA-256, validates the archive, and extracts it safely. Before any skill download or CLI launch, a guard tied to the fixed `skills@1.5.24` version checks for Agent execution environments; if detected, it asks you to rerun in an ordinary terminal instead of silently clearing environment variables or launching a potentially auto-confirming CLI.
+
+The installer runs `npx --yes skills@1.5.24 add <extracted-skill> --skill ego-browser --global --copy` with stdin, stdout, and stderr connected to `/dev/tty`, including when invoked through `curl | sh`. The outer `npx --yes` permits fetching the CLI; no inner `--yes`, `--agent`, or `--all` is passed. Agent selection and confirmation use the native upstream interface, not a bridge-defined selector: universal targets cannot be deselected, and a single-Agent setup may omit the selection screen. The default `[Y/n]` does not accept all upstream choices for you.
+
+If this optional step fails, the installer exits nonzero and reports that the bridge is installed but the skill step is incomplete; it does not roll back the bridge, retry, or fall back. Upstream cancellation can also exit 0, so a zero exit only reports that the interaction ended—check the CLI output for the result, not a blanket skill-install success message. The CLI may write only some targets; exit 0 does not guarantee every target succeeded, and skills already written are not rolled back.
+
+<a id="optional-agent-skill-installation"></a>
+### Optional Agent skill installation
+
+The release retains the vendored `ego-browser-skill.tgz` asset and its URL and SHA-256 in the manifest. As an independent alternative to the installer's native interactive flow, you can install it manually on Linux for an explicit Agent. This requires Node.js 22.20.0 or newer, `npm`/`npx`, and `tar`. Set `VERSION` to the exact bridge release already installed, then set `AGENT_ID` in your shell to one explicit Agent ID supported by the skills CLI; in this manual command, do not omit `--agent` or use `*`.
 
 ```bash
-npx --yes skills@1.5.24 add /path/to/extracted/ego-browser --skill ego-browser --global --agent '*' --yes --copy
+(
+  set -eu
+  VERSION=0.1.0
+  : "${AGENT_ID:?set AGENT_ID to one explicit skills CLI Agent ID}"
+  WORK_DIR="$(mktemp -d)"
+  trap 'rm -rf "$WORK_DIR"' EXIT
+  cd "$WORK_DIR"
+  RELEASE_URL="https://github.com/imleon/ego-lite-bridge/releases/download/v${VERSION}"
+  curl -fLO "${RELEASE_URL}/ego-browser-skill.tgz"
+  curl -fLO "${RELEASE_URL}/SHA256SUMS"
+  grep ' ego-browser-skill.tgz$' SHA256SUMS > ego-browser-skill.sha256
+  sha256sum -c ego-browser-skill.sha256
+  mkdir skill
+  tar -xzf ego-browser-skill.tgz -C skill
+  npx --yes skills@1.5.24 add "$WORK_DIR/skill/ego-browser" \
+    --skill ego-browser --global --agent "$AGENT_ID" --yes --copy
+)
 ```
 
-This uses the general-purpose Vercel skills CLI to globally install or overwrite the `ego-browser` skill for every supported Agent target it can write. Some targets do not support global or per-agent writes; the CLI may print errors for those targets and still exit 0, so a successful installer run does not guarantee that every target was updated. Rerunning the installer overwrites existing `ego-browser` skills and local changes for targets it writes.
+The skills CLI may overwrite an existing `ego-browser` skill, including local changes, for that Agent. Rerunning the bridge installer and consenting to the optional flow can also overwrite existing skills; skipping it leaves them untouched. This is not a runtime updater or automatic skill cleanup. The vendored skill remains a release asset and manifest entry. Its calls still pass through the Linux shim to the real browser running on the Mac.
 
-The distributed skill keeps the upstream general invocation guidance; only its installation reference is changed to cover Linux bridge troubleshooting. Calls still pass transparently through the Linux shim, while the browser continues to run on the Mac.
-
-The installer commits the verified bridge binary and shim before invoking the skills CLI. If skill installation then fails, the bridge remains installed and the installer exits nonzero with an explicit partial-success error. The CLI's writes across targets are not transactional: a failed run may have already overwritten some skills, and those changes cannot be rolled back automatically.
-
-To download and install manually instead, run the matching commands on each machine. These manual steps install the bridge binary and Linux shim only; they do not distribute the Agent skill.
+To download and install the bridge manually instead, run the matching commands on each machine. These steps install the bridge binary and Linux shim only.
 
 macOS arm64:
 

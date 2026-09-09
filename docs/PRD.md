@@ -101,14 +101,20 @@ remote retry <config-id>
 
 ### 4.4 Installer 分发
 
-- macOS installer只安装bridge binary；Linux installer安装binary和`ego-browser` shim，并要求Node.js 22.20.0或更高版本及`npm`/`npx`；
-- release包含`ego-browser-skill.tgz`；Linux installer从manifest的`skill_url`下载，按manifest中的SHA-256校验并解包；
-- Linux installer在解包后的本地skill目录固定调用`npx --yes skills@1.5.24 add /path/to/extracted/ego-browser --skill ego-browser --global --agent '*' --yes --copy`，通过通用Vercel skills CLI向所有Agent target全局安装或覆盖`ego-browser` skill；
+- macOS installer只安装bridge binary，不询问、不安装skill；Linux先安装binary和`ego-browser` shim，成功提交后才通过可用的`/dev/tty`询问`[Y/n]`；
+- 成功读取空行（回车）或`y`/`yes`（不区分大小写）进入可选skill安装，`n`/`no`跳过，非法输入明确提示并重新询问；EOF、读取失败或无可用终端不等于同意，跳过并显示手动安装链接；
+- 同意前不检查Node.js或npm/npx、不下载skill、不触碰Agent目录；跳过时不要求Node.js、npm/npx或tar；同意后才要求Node.js 22.20.0或更高版本、`npm`/`npx`和`tar`；
+- 在任何skill下载或CLI启动前，使用与固定`skills@1.5.24`配套的guard检测Agent执行环境，命中时明确要求用户在普通终端运行，不启动可能自动确认的CLI，不静默清空用户环境；升级固定版本时须同步复核检测逻辑，不自建Agent安装目录探测表；
+- release继续包含vendored `ego-browser-skill.tgz`，manifest继续拥有其`skill_url`和SHA-256；可选流程复用本次binary已获取的manifest，下载同一release的skill到现有临时目录，验证可信URL、SHA-256和归档安全后解包，并检查文件完整性；资产的构建、校验和发布归属不变；
+- 固定调用`npx --yes skills@1.5.24 add <extracted-skill> --skill ego-browser --global --copy`，不传内层`--yes`、`--agent`或`--all`，stdin/stdout/stderr连接`/dev/tty`，直接运行和`curl | sh`均支持；外层`npx --yes`仅允许获取CLI，不替用户接受上游安装选项；
+- 使用上游原生Agent选择与确认界面，不自建选择器；界面受上游逻辑约束：universal target不可取消，单Agent时可能省略选择界面，不承诺只写用户勾选的目标；
+- 可选步骤失败时明确报告“bridge已安装、skill未完成”并非零退出；下载、checksum、目录创建、解包、完整性和CLI调用失败均须显式处理，不回滚bridge、不自动重试或降级；上游取消和成功可能都退出0，零退出仅报告“交互流程已结束，请以CLI输出为准”，不得一概宣称skill安装成功；CLI可能只完成部分目标写入，整体exit 0不保证每个target成功，已写入skill不回滚；
+- 保留独立的Linux手工安装选择：用户以同一显式`VERSION`下载release归档及`SHA256SUMS`，通过`grep`和`sha256sum`校验，并在`set -eu`子shell中新建工作目录后解包；该步骤同样需要Node.js 22.20.0或更高版本、`npm`/`npx`和`tar`；
+- 手工命令必须显式填写单个`AGENT_ID`，固定调用`npx --yes skills@1.5.24 add <extracted-skill> --skill ego-browser --global --agent "$AGENT_ID" --yes --copy`；仅此手工路径不得使用`*`或省略`--agent`；
+- skills CLI可能覆盖已有`ego-browser` skill及本地修改；重跑bridge installer并同意可选流程也可能覆盖，跳过则不触碰skill，不自动清理Agent目录；
 - skill保留上游通用调用内容，仅将installation reference改为Linux bridge故障排查；skill调用仍经Linux shim透明转发，真实浏览器仍在Mac执行；
-- 少数skills CLI target不支持global或per-agent写入；CLI可能打印单target错误却整体exit 0，因此不保证每个target成功；
-- 重跑installer会覆盖已写入target的现有`ego-browser` skill及本地修改；多target写入不是事务，失败时可能已经部分覆盖且无法自动回滚；
-- manifest、下载、checksum或archive验证失败时不提交bridge binary；验证完成后先原子提交binary与shim，再调用skills CLI，后者失败时保留可用bridge并以明确的部分成功错误退出；
-- 该能力只属于installer分发，不是runtime updater，不改变bridge协议或执行语义。
+- binary manifest、下载或checksum验证失败时不提交bridge binary；验证完成后原子提交binary与shim；
+- skill分发资产、可选交互和手工安装均不属于runtime updater，不改变bridge协议或执行语义。
 
 ## 5. Daemon 生命周期
 
@@ -423,7 +429,7 @@ ego-lite-bridge doctor [config-id]
 - 非SSH transport；
 - Windows；
 - daemon GUI或TUI；
-- bridge或skill的runtime自动更新；skill仅由Linux installer分发，重跑installer才会覆盖更新；
+- bridge或skill的runtime自动更新；skill只在用户同意的可选交互流程或独立手工步骤中安装，重跑installer并同意时可能覆盖已有skill；
 - dashboard或metrics框架；
 - owner手工强制抢占；
 - hostname/IP/SSH alias规范化；
@@ -470,7 +476,11 @@ ego-lite-bridge doctor [config-id]
 - 原生runner分别构建并验证`linux-x86_64`（静态`x86_64-unknown-linux-musl`、runner `x86_64`、ELF x86-64，无program interpreter、动态依赖或`GLIBC_*`版本要求）和`macos-aarch64`（原生`aarch64-apple-darwin`、runner `arm64`、Mach-O arm64）；
 - preparation workflow在Ubuntu 20.04、glibc 2.31容器中运行精确的已暂存Linux候选并验证`--version`；
 - 下载产物包含保持可执行权限的`tar.gz`候选bundle及其disabled manifest；
-- 维护者在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；Linux验证包含固定`skills@1.5.24`分发命令、覆盖更新行为和skill安装失败时保留已提交的bridge并明确报告部分成功，并记录skills CLI可能部分写入且exit 0不保证全部target成功；macOS保持binary-only；
+- 维护者在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；保留可选手工skill步骤的同一显式版本、checksum校验、单个显式Agent ID及固定`skills@1.5.24`命令验证；macOS保持binary-only且不询问；
+- 上一轮Linux binary/shim-only流程已由用户实机验收通过；本次新增的可选交互流程另行验收，当前待测，不撤销此前验收结论；
+- 新增验收：无TTY、no和EOF均不下载skill、不调用npx、不触碰Agent目录，即使无Node/npx/tar也能完成bridge安装；TTY回车或yes在bridge提交后进入原生交互，非法输入重询，直接运行和管道stdin均有效；
+- 新增验收：同意后才检查依赖，并基于本次manifest校验同一release skill的URL、SHA-256和归档安全；缺依赖、旧Node、下载/校验/解包/完整性或CLI失败均明确部分完成、非零退出且保留bridge；
+- 新增验收：Agent环境guard明确要求普通终端且不清空环境；原生参数保留`--global --copy`，无内层`--yes`、`--agent`或`--all`，stdio均为TTY；确认universal target和单Agent界面限制，取消退出0不误报成功，重跑并确认可能覆盖已有skill；
 - 实际发布前`distribution/latest.json`保持`available: false`，工作流不更新release metadata。
 
 自动跨主机重复测试、主动remote diagnostics、真实网页smoke和24小时soak属于Post-0.1 hardening。这些后续自动化不改变或放宽本节定义的产品语义与安全边界。

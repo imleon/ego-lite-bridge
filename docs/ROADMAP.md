@@ -8,8 +8,8 @@
 
 - installer只接受本产品manifest和可信release URL；
 - release不可用或checksum失败时不覆盖已安装binary；
-- macOS installer保持binary-only；release包含manifest SHA-256校验的`ego-browser-skill.tgz`，Linux installer在Node.js 22.20.0或更高版本及`npm`/`npx`前置条件满足后，从manifest的`skill_url`下载、校验并解包，再从本地skill目录通过固定`skills@1.5.24`命令全局安装或覆盖所有Agent target的`ego-browser` skill；
-- 明显前置条件skill失败时保留已提交bridge并报告部分成功；skills CLI非零退出时保留已提交的bridge并明确报告部分成功；多target写入不是事务，CLI可能部分覆盖且对不支持global/per-agent写入的target打印错误后整体exit 0，因此不承诺每个target成功。
+- macOS installer保持binary-only；上一轮Linux binary/shim-only流程不要求Node.js或npm、不安装skill且不触碰Agent目录，已由用户实机验收通过；本次新增可选交互流程的待验收项见下文，不撤销此前结论；
+- release继续包含manifest记录URL和SHA-256的vendored `ego-browser-skill.tgz`；保留独立的可选手工步骤：以同一显式`VERSION`下载归档和`SHA256SUMS`，用`grep`与`sha256sum`校验，在`set -eu`子shell的新工作目录解包，并要求显式单个`AGENT_ID`后固定调用`skills@1.5.24`；此手工命令不得使用`*`或省略agent；skills CLI可能覆盖目标skill。
 
 ### M1 — 产品仓库裁剪
 
@@ -141,7 +141,18 @@ M5冻结的是identity/ownership wire基线；最终0.1 remote exec protocol在M
 - 创建与Cargo version一致的`v0.1.0` tag；
 - 创建GitHub Release并上传已验证的两个binary、`ego-browser-skill.tgz`及包含三者的`SHA256SUMS`；
 - 将审核后的binary与skill URL及SHA-256写入`distribution/latest.json`并设置`available: true`；
-- 在Linux x86_64与macOS arm64分别执行一次公开installer smoke；Linux验证固定`skills@1.5.24`分发、覆盖更新和skill失败时保留已提交bridge并报告部分成功，并记录多target写入可能部分成功且exit 0不保证全部target成功；macOS保持binary-only。
+- 在Linux x86_64与macOS arm64分别执行一次公开installer smoke；Linux覆盖下述可选交互流程，并保留独立手工skill步骤的同一显式版本、checksum校验、单个显式Agent ID及固定`skills@1.5.24`命令验证；macOS保持binary-only且不询问。
+
+### Linux 可选 skill 原生交互（本次新增，待验收）
+
+- binary与shim成功提交后通过`/dev/tty`询问`[Y/n]`；回车或`y`/`yes`（不区分大小写）继续，`n`/`no`跳过，非法输入重询；EOF、读失败或无TTY跳过并显示手动链接，不误判为默认同意；
+- 同意前不检查Node/npm/npx、不下载skill、不触碰Agent目录；同意后才要求Node.js ≥22.20.0、npm/npx和tar，复用本次binary已获取的manifest下载同一release skill，校验可信URL、SHA-256、归档安全和解包完整性；
+- 下载skill或启动CLI前，用固定`skills@1.5.24`配套guard检测Agent执行环境，命中时要求普通终端运行，不静默清空环境；升级版本须复核guard，不自建Agent探测表或选择器；
+- 固定原生命令为`npx --yes skills@1.5.24 add <extracted-skill> --skill ego-browser --global --copy`；无内层`--yes`、`--agent`或`--all`，stdin/stdout/stderr接到TTY，支持直接运行和`curl | sh`；外层`npx --yes`不代替上游安装确认；
+- 原生界面受上游选择逻辑约束：universal target不可取消，单Agent可能省略选择；上游取消也可能exit 0，安装器仅提示交互结束、以CLI输出为准，不一概宣称成功；重跑并同意可选流程可能覆盖已有skill及本地修改，跳过则不触碰；
+- 验证无TTY/no/EOF且无Node/npx/tar时仍完成bridge安装；PTY覆盖回车/yes、非法输入、EOF、管道stdin和原生stdio/参数；缺依赖、旧Node、下载/校验/解包/完整性或CLI失败均明确“bridge已安装、skill未完成”，非零退出，不回滚bridge、不自动重试或降级；保持macOS、binary/shim校验、提交回滚与PIPE测试通过。
+
+上一轮用户实机验收通过的事实保持有效；以上新流程的自动化和实机验收单独记录，不以本次文档更新宣称通过。
 
 ## 推荐分支与提交顺序
 
@@ -179,7 +190,7 @@ git diff --check
 其他工作仅由真实需求驱动：
 
 - remote update；
-- bridge或skill的runtime updater（skill仅由Linux installer分发）；
+- bridge或skill的runtime updater（现有skill安装仅限用户同意的可选交互或独立手工步骤）；
 - 可配置并发额度和跨remote公平调度；
 - Homebrew等分发渠道；
 - Sigstore、attestation与SBOM；
