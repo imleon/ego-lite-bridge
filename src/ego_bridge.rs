@@ -2892,6 +2892,13 @@ impl TryCloneStream for crate::ipc::LocalStream {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+impl TryCloneStream for std::os::unix::net::UnixStream {
+    fn try_clone_stream(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 pub(crate) enum RemoteWorkerEvent {
