@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1] - 2026-09-11
+
+### Fixed
+
+- Returned request-scoped PNG screenshots from the macOS executor to the Linux shim.
+- Injected the verified request transfer root into exact `ego-browser nodejs` stdin.
+- Restricted screenshot transfer to direct-child `.png` files inside the per-request directory without parsing stdout or stderr as paths or adding a fallback.
+
 ## [0.1.0] - 2026-09-08
 
 ### Added
