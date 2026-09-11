@@ -19,7 +19,7 @@ Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-brow
 
 ## 发布状态
 
-版本 0.1.0 为 `linux-x86_64` 和 `macos-aarch64` 提供预编译二进制，用户无需安装 Rust 或从源码构建。Linux 发行版是静态 `x86_64-unknown-linux-musl` binary，macOS 发行版是原生 `aarch64-apple-darwin` binary。
+版本 0.1.1 为 `linux-x86_64` 和 `macos-aarch64` 提供预编译二进制，用户无需安装 Rust 或从源码构建。Linux 发行版是静态 `x86_64-unknown-linux-musl` binary，macOS 发行版是原生 `aarch64-apple-darwin` binary。
 
 ## 快速开始
 
@@ -51,7 +51,7 @@ release 保留 vendored `ego-browser-skill.tgz` 资产，以及 manifest 中对�
 ```bash
 (
   set -eu
-  VERSION=0.1.0
+  VERSION=0.1.1
   : "${AGENT_ID:?请将 AGENT_ID 设置为一个明确的 skills CLI Agent ID}"
   WORK_DIR="$(mktemp -d)"
   trap 'rm -rf "$WORK_DIR"' EXIT
