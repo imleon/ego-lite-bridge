@@ -163,14 +163,14 @@ These steps are for contributors building from source; regular users should use 
 - Only macOS executors and Linux callers are supported.
 - Up to 8 `ego-browser` invocations run concurrently. Additional invocations are rejected immediately at capacity; a blocked or disconnected request does not block the others.
 - The Linux broker path is fixed to `~/.local/bin/ego-lite-bridge`.
-- The bridge forwards command arguments and standard streams only; it does not mirror the Mac filesystem or environment.
+- The bridge forwards command arguments, standard streams, and request-scoped PNG screenshots. It does not mirror the Mac filesystem or environment.
 
 ## Trust boundary
 
 - SSH authentication and host-key verification define trust between the Mac and Linux host. Configure and verify them before starting the bridge.
 - Linux runtime endpoints are `/tmp/ego-lite-bridge-<uid>/broker.sock` and `/tmp/ego-lite-bridge-<uid>/owner.sock`. The directory is mode `0700` and the sockets are mode `0600`, so only the owning Linux user can connect.
 - Any process running as that Linux user can ask the Mac to run the fixed `ego-browser` executable with arbitrary arguments and stdin. Run the bridge only for a Linux account you trust.
-- Browser output and exit status come from the connected Mac executor. No local or alternate-browser fallback is used.
+- Browser output and exit status come from the connected Mac executor. PNG screenshots are returned only from the per-request `/tmp/ego-lite-bridge-screenshots-*` transfer directory; stdout and stderr paths are never parsed as files. No local or alternate-browser fallback is used.
 
 ## Troubleshooting
 

@@ -6,10 +6,8 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Read, Write};
-#[cfg(target_os = "macos")]
-use std::path::Path;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::path::PathBuf;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use std::path::{Component, Path, PathBuf};
 #[cfg(any(target_os = "macos", test))]
 use std::process::Stdio;
 #[cfg(any(target_os = "macos", test))]
@@ -26,21 +24,25 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PROTOCOL_VERSION: u32 = 3;
+pub(crate) const PROTOCOL_VERSION: u32 = 4;
 const CAPABILITY_BINARY_ARGV: u64 = 1 << 0;
 const CAPABILITY_STDIO_STREAMS: u64 = 1 << 1;
 const CAPABILITY_REQUEST_CANCEL: u64 = 1 << 2;
 const CAPABILITY_SIGNAL_EXIT: u64 = 1 << 3;
 const CAPABILITY_BROKER_OWNERSHIP: u64 = 1 << 4;
 const CAPABILITY_MULTIPLEXING: u64 = 1 << 5;
+const CAPABILITY_SCREENSHOT_RETURN: u64 = 1 << 6;
 pub(crate) const PROTOCOL_CAPABILITIES: u64 = CAPABILITY_BINARY_ARGV
     | CAPABILITY_STDIO_STREAMS
     | CAPABILITY_REQUEST_CANCEL
     | CAPABILITY_SIGNAL_EXIT
     | CAPABILITY_BROKER_OWNERSHIP
-    | CAPABILITY_MULTIPLEXING;
+    | CAPABILITY_MULTIPLEXING
+    | CAPABILITY_SCREENSHOT_RETURN;
 const MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
 const MAX_STREAM_PAYLOAD_SIZE: usize = 64 * 1024;
+const MAX_SCREENSHOT_FILE_SIZE: u64 = 32 * 1024 * 1024;
+const SCREENSHOT_TRANSFER_PREFIX: &str = "ego-lite-bridge-screenshots-";
 const MAX_CONCURRENT_REQUESTS: usize = 8;
 const REQUEST_QUEUE_CAPACITY: usize = 8;
 #[cfg(target_os = "linux")]
@@ -302,6 +304,7 @@ enum EgoBridgeMessage {
     Open {
         request_id: u64,
         argv: Vec<Vec<u8>>,
+        transfer_root: Option<Vec<u8>>,
     },
     Stdin {
         request_id: u64,
@@ -317,6 +320,18 @@ enum EgoBridgeMessage {
     Stderr {
         request_id: u64,
         data: Vec<u8>,
+    },
+    FileBegin {
+        request_id: u64,
+        relative_path: Vec<u8>,
+        size: u64,
+    },
+    FileChunk {
+        request_id: u64,
+        data: Vec<u8>,
+    },
+    FileEnd {
+        request_id: u64,
     },
     Exit {
         request_id: u64,
@@ -371,6 +386,9 @@ impl EgoBridgeMessage {
             Self::StdinEof { .. } => "stdin_eof",
             Self::Stdout { .. } => "stdout",
             Self::Stderr { .. } => "stderr",
+            Self::FileBegin { .. } => "file_begin",
+            Self::FileChunk { .. } => "file_chunk",
+            Self::FileEnd { .. } => "file_end",
             Self::Exit { .. } => "exit",
             Self::Error { .. } => "error",
             Self::Cancel { .. } => "cancel",
@@ -388,6 +406,9 @@ impl EgoBridgeMessage {
             | Self::StdinEof { request_id }
             | Self::Stdout { request_id, .. }
             | Self::Stderr { request_id, .. }
+            | Self::FileBegin { request_id, .. }
+            | Self::FileChunk { request_id, .. }
+            | Self::FileEnd { request_id }
             | Self::Exit { request_id, .. }
             | Self::Error { request_id, .. }
             | Self::Cancel { request_id } => Some(*request_id),
@@ -397,10 +418,19 @@ impl EgoBridgeMessage {
 
     fn payload_len(&self) -> Option<usize> {
         match self {
-            Self::Open { argv, .. } => Some(argv.iter().map(Vec::len).sum()),
-            Self::Stdin { data, .. } | Self::Stdout { data, .. } | Self::Stderr { data, .. } => {
-                Some(data.len())
-            }
+            Self::Open {
+                argv,
+                transfer_root,
+                ..
+            } => Some(
+                argv.iter().map(Vec::len).sum::<usize>()
+                    + transfer_root.as_ref().map_or(0, Vec::len),
+            ),
+            Self::Stdin { data, .. }
+            | Self::Stdout { data, .. }
+            | Self::Stderr { data, .. }
+            | Self::FileChunk { data, .. } => Some(data.len()),
+            Self::FileBegin { relative_path, .. } => Some(relative_path.len()),
             Self::Error { message, .. } => Some(message.len()),
             _ => None,
         }
@@ -408,7 +438,10 @@ impl EgoBridgeMessage {
 
     fn validate_stream_payload(&self) -> io::Result<()> {
         match self {
-            Self::Stdin { data, .. } | Self::Stdout { data, .. } | Self::Stderr { data, .. }
+            Self::Stdin { data, .. }
+            | Self::Stdout { data, .. }
+            | Self::Stderr { data, .. }
+            | Self::FileChunk { data, .. }
                 if data.len() > MAX_STREAM_PAYLOAD_SIZE =>
             {
                 Err(io::Error::new(
@@ -867,7 +900,8 @@ fn inbound_ordinary_bytes(message: &EgoBridgeMessage) -> usize {
     match message {
         EgoBridgeMessage::Stdin { data, .. }
         | EgoBridgeMessage::Stdout { data, .. }
-        | EgoBridgeMessage::Stderr { data, .. } => data.len(),
+        | EgoBridgeMessage::Stderr { data, .. }
+        | EgoBridgeMessage::FileChunk { data, .. } => data.len(),
         _ => 0,
     }
 }
@@ -875,7 +909,12 @@ fn inbound_ordinary_bytes(message: &EgoBridgeMessage) -> usize {
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn queued_payload_bytes(message: &EgoBridgeMessage) -> usize {
     match message {
-        EgoBridgeMessage::Open { argv, .. } => argv.iter().map(Vec::len).sum(),
+        EgoBridgeMessage::Open {
+            argv,
+            transfer_root,
+            ..
+        } => argv.iter().map(Vec::len).sum::<usize>() + transfer_root.as_ref().map_or(0, Vec::len),
+        EgoBridgeMessage::FileBegin { relative_path, .. } => relative_path.len(),
         _ => inbound_ordinary_bytes(message),
     }
 }
@@ -2209,6 +2248,9 @@ fn broker_route(
                     message,
                     EgoBridgeMessage::Stdout { .. }
                         | EgoBridgeMessage::Stderr { .. }
+                        | EgoBridgeMessage::FileBegin { .. }
+                        | EgoBridgeMessage::FileChunk { .. }
+                        | EgoBridgeMessage::FileEnd { .. }
                         | EgoBridgeMessage::Exit { .. }
                         | EgoBridgeMessage::Error { .. }
                 ) {
@@ -2457,15 +2499,18 @@ pub(crate) fn run_shim(argv: &[std::ffi::OsString]) -> io::Result<i32> {
             format!("ego-browser bridge is not connected; start the Mac daemon and add this remote: {err}"),
         )
     })?;
+    let request_id = new_request_id()?;
+    let transfer_root = create_screenshot_transfer_root(request_id)?;
     run_shim_stream(
         stream,
-        new_request_id()?,
+        request_id,
         argv.iter()
             .map(|arg| {
                 use std::os::unix::ffi::OsStrExt as _;
                 arg.as_os_str().as_bytes().to_vec()
             })
             .collect(),
+        Some(transfer_root),
         io::stdin(),
         io::stdout(),
         io::stderr(),
@@ -2477,6 +2522,33 @@ fn new_request_id() -> io::Result<u64> {
     let mut bytes = [0; std::mem::size_of::<u64>()];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(u64::from_ne_bytes(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn create_screenshot_transfer_root(request_id: u64) -> io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let path = Path::new("/tmp").join(format!(
+        "{SCREENSHOT_TRANSFER_PREFIX}{}-{request_id}",
+        unsafe { libc::geteuid() }
+    ));
+    std::fs::create_dir(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(path)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn path_to_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn bytes_to_path(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2491,6 +2563,7 @@ fn run_shim_stream<S, I, O, E>(
     mut stream: S,
     request_id: u64,
     argv: Vec<Vec<u8>>,
+    transfer_root: Option<PathBuf>,
     mut stdin: I,
     mut stdout: O,
     mut stderr: E,
@@ -2501,7 +2574,16 @@ where
     O: Write,
     E: Write,
 {
-    write_message(&mut stream, &EgoBridgeMessage::Open { request_id, argv })?;
+    let transfer_root_bytes = transfer_root.as_deref().map(path_to_bytes);
+    let mut screenshots = ScreenshotReceiver::new(transfer_root.clone());
+    write_message(
+        &mut stream,
+        &EgoBridgeMessage::Open {
+            request_id,
+            argv,
+            transfer_root: transfer_root_bytes,
+        },
+    )?;
     let mut upload = stream.try_clone_stream()?;
     let _uploader = thread::spawn(move || -> io::Result<()> {
         let mut buffer = vec![0; 16 * 1024];
@@ -2572,22 +2654,42 @@ where
                 stderr.write_all(&data)?;
                 stderr.flush()?;
             }
+            EgoBridgeMessage::FileBegin {
+                relative_path,
+                size,
+                ..
+            } => screenshots.begin(relative_path, size)?,
+            message @ EgoBridgeMessage::FileChunk { .. } => {
+                message.validate_stream_payload()?;
+                let EgoBridgeMessage::FileChunk { data, .. } = message else {
+                    unreachable!()
+                };
+                screenshots.chunk(&data)?;
+            }
+            EgoBridgeMessage::FileEnd { .. } => screenshots.end()?,
             EgoBridgeMessage::Exit {
                 code: Some(code),
                 signal: None,
                 ..
-            } => return Ok(code),
+            } => {
+                screenshots.finish()?;
+                return Ok(code);
+            }
             EgoBridgeMessage::Exit {
                 code: None,
                 signal: Some(signal),
                 ..
             } => {
+                screenshots.finish()?;
                 #[cfg(unix)]
                 return replay_signal(signal);
                 #[cfg(not(unix))]
                 return Ok(1);
             }
-            EgoBridgeMessage::Error { message, .. } => return Err(io::Error::other(message)),
+            EgoBridgeMessage::Error { message, .. } => {
+                screenshots.abort();
+                return Err(io::Error::other(message));
+            }
             message => {
                 return Err(io::Error::other(format!(
                     "unexpected broker message: {}",
@@ -2642,14 +2744,156 @@ fn replay_signal(exit_signal: ExitSignal) -> io::Result<i32> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+struct ReceivingScreenshot {
+    path: PathBuf,
+    temp_path: PathBuf,
+    file: std::fs::File,
+    expected: u64,
+    written: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct ScreenshotReceiver {
+    root: Option<PathBuf>,
+    current: Option<ReceivingScreenshot>,
+    received: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl ScreenshotReceiver {
+    fn new(root: Option<PathBuf>) -> Self {
+        Self {
+            root,
+            current: None,
+            received: false,
+        }
+    }
+
+    fn begin(&mut self, relative_path: Vec<u8>, size: u64) -> io::Result<()> {
+        if self.current.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "nested screenshot transfer",
+            ));
+        }
+        if size > MAX_SCREENSHOT_FILE_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("screenshot size {size} exceeds maximum {MAX_SCREENSHOT_FILE_SIZE}"),
+            ));
+        }
+        let root = self.root.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "screenshot transfer received without transfer root",
+            )
+        })?;
+        let name = screenshot_file_name(&relative_path)?;
+        let path = root.join(name);
+        let temp_path = path.with_extension("png.part");
+        let file = std::fs::File::create(&temp_path)?;
+        self.received = true;
+        self.current = Some(ReceivingScreenshot {
+            path,
+            temp_path,
+            file,
+            expected: size,
+            written: 0,
+        });
+        Ok(())
+    }
+
+    fn chunk(&mut self, data: &[u8]) -> io::Result<()> {
+        let current = self.current.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "screenshot chunk before begin")
+        })?;
+        current.written = current
+            .written
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "screenshot size overflow")
+            })?;
+        if current.written > current.expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "screenshot chunk exceeds declared size",
+            ));
+        }
+        current.file.write_all(data)
+    }
+
+    fn end(&mut self) -> io::Result<()> {
+        let mut current = self.current.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "screenshot end before begin")
+        })?;
+        if current.written != current.expected {
+            let _ = std::fs::remove_file(&current.temp_path);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "screenshot size does not match declared size",
+            ));
+        }
+        current.file.flush()?;
+        drop(current.file);
+        std::fs::rename(&current.temp_path, &current.path)
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        if let Some(current) = self.current.take() {
+            let _ = std::fs::remove_file(current.temp_path);
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete screenshot transfer",
+            ));
+        }
+        if !self.received {
+            if let Some(root) = &self.root {
+                let _ = std::fs::remove_dir(root);
+            }
+        }
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        if let Some(current) = self.current.take() {
+            let _ = std::fs::remove_file(current.temp_path);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn screenshot_file_name(bytes: &[u8]) -> io::Result<&std::ffi::OsStr> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = Path::new(std::ffi::OsStr::from_bytes(bytes));
+    if path.components().count() != 1
+        || !matches!(path.components().next(), Some(Component::Normal(_)))
+        || path.extension() != Some(std::ffi::OsStr::new("png"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid screenshot file name",
+        ));
+    }
+    Ok(path.as_os_str())
+}
+
+#[cfg(any(target_os = "linux", test))]
 trait TryCloneStream {
     fn try_clone_stream(&self) -> io::Result<Self>
     where
         Self: Sized;
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 impl TryCloneStream for crate::ipc::LocalStream {
+    fn try_clone_stream(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl TryCloneStream for std::os::unix::net::UnixStream {
     fn try_clone_stream(&self) -> io::Result<Self> {
         self.try_clone()
     }
@@ -3131,7 +3375,11 @@ fn serve_requests(
             EgoBridgeMessage::OwnerProbe { nonce } => {
                 channel_out.control_committed(EgoBridgeMessage::OwnerProbeAck { nonce })?;
             }
-            EgoBridgeMessage::Open { request_id, argv } => {
+            EgoBridgeMessage::Open {
+                request_id,
+                argv,
+                transfer_root,
+            } => {
                 drain_executor_completions(
                     &completed,
                     &mut routes,
@@ -3193,11 +3441,13 @@ fn serve_requests(
                 let worker_budget = budget.clone();
                 let program = program.to_owned();
                 let argv = decode_argv(argv);
+                let transfer_root = transfer_root.map(bytes_to_path);
                 let worker = thread::spawn(move || {
                     let result = execute_request(
                         &program,
                         request_id,
                         &argv,
+                        transfer_root.as_deref(),
                         request_input,
                         &worker_pending_input,
                         &worker_cancelled,
@@ -3387,6 +3637,7 @@ fn execute_request(
     program: &OsStr,
     request_id: u64,
     argv: &[std::ffi::OsString],
+    transfer_root: Option<&Path>,
     receiver: mpsc::Receiver<RequestInput>,
     pending_input: &Arc<AtomicUsize>,
     cancelled: &Arc<AtomicBool>,
@@ -3399,6 +3650,7 @@ fn execute_request(
         program,
         request_id,
         argv,
+        transfer_root,
         receiver,
         pending_input,
         cancelled,
@@ -3438,6 +3690,7 @@ fn execute_request_inner(
     program: &OsStr,
     request_id: u64,
     argv: &[std::ffi::OsString],
+    transfer_root: Option<&Path>,
     receiver: mpsc::Receiver<RequestInput>,
     pending_input: &Arc<AtomicUsize>,
     cancelled: &Arc<AtomicBool>,
@@ -3447,6 +3700,15 @@ fn execute_request_inner(
     budget: &ResourceBudget,
 ) -> Result<(), RequestExecutionError> {
     let mut command = crate::macos_process::command(program);
+    let input_prelude =
+        nodejs_input_prelude(argv, transfer_root).map_err(RequestExecutionError::Local)?;
+    if let Some(root) = transfer_root {
+        prepare_screenshot_transfer_root(root).map_err(RequestExecutionError::Local)?;
+        command
+            .current_dir(root)
+            .env("TMPDIR", root)
+            .env("EGO_LITE_BRIDGE_TRANSFER_DIR", root);
+    }
     command
         .args(argv)
         .stdin(Stdio::piped())
@@ -3527,6 +3789,7 @@ fn execute_request_inner(
                 pending_input,
                 &stdin_cancelled,
                 &stdin_worker_done,
+                input_prelude,
             )
         });
 
@@ -3541,6 +3804,9 @@ fn execute_request_inner(
         stdout?;
         stderr?;
         stdin.map_err(RequestExecutionError::Local)?;
+        if let Some(root) = transfer_root {
+            send_screenshots(request_id, root, channel_out)?;
+        }
         let (code, signal) = exit_status(status).map_err(RequestExecutionError::Local)?;
         if request_error
             .lock()
@@ -3566,13 +3832,261 @@ fn execute_request_inner(
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn nodejs_input_prelude(
+    argv: &[std::ffi::OsString],
+    transfer_root: Option<&Path>,
+) -> io::Result<Option<Vec<u8>>> {
+    if argv != [std::ffi::OsString::from("nodejs")] {
+        return Ok(None);
+    }
+    let Some(root) = transfer_root else {
+        return Ok(None);
+    };
+    let root = root.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "screenshot transfer root is not UTF-8",
+        )
+    })?;
+    let literal = serde_json::to_string(root).map_err(io::Error::other)?;
+    Ok(Some(
+        format!(
+            "globalThis.process.env.TMPDIR={literal};globalThis.process.env.EGO_LITE_BRIDGE_TRANSFER_DIR={literal};\n"
+        )
+        .into_bytes(),
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn prepare_screenshot_transfer_root(root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    validate_screenshot_transfer_root(root)?;
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "screenshot transfer root is not a directory",
+                ));
+            }
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "screenshot transfer root is not owned by current user",
+                ));
+            }
+            if metadata.permissions().mode() & 0o777 != 0o700 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "screenshot transfer root must be mode 0700",
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            std::fs::create_dir(root)?;
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_screenshot_transfer_root(root: &Path) -> io::Result<()> {
+    if !root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "screenshot transfer root must be absolute",
+        ));
+    }
+    let mut components = root.components();
+    if components.next() != Some(Component::RootDir)
+        || components.next() != Some(Component::Normal(std::ffi::OsStr::new("tmp")))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "screenshot transfer root must be under /tmp",
+        ));
+    }
+    let Some(Component::Normal(name)) = components.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "screenshot transfer root missing directory name",
+        ));
+    };
+    if !name
+        .to_string_lossy()
+        .starts_with(SCREENSHOT_TRANSFER_PREFIX)
+        || components.next().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid screenshot transfer root",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn send_screenshots(
+    request_id: u64,
+    root: &Path,
+    channel_out: &ChannelWriter,
+) -> Result<(), RequestExecutionError> {
+    let entries = std::fs::read_dir(root).map_err(RequestExecutionError::Local)?;
+    for entry in entries {
+        let entry = entry.map_err(RequestExecutionError::Local)?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if screenshot_file_name(name.as_encoded_bytes()).is_err() {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path).map_err(RequestExecutionError::Local)?;
+        if !metadata.file_type().is_file() {
+            return Err(RequestExecutionError::Local(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "screenshot transfer entry is not a regular file",
+            )));
+        }
+        let size = metadata.len();
+        if size > MAX_SCREENSHOT_FILE_SIZE {
+            return Err(RequestExecutionError::Local(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("screenshot size {size} exceeds maximum {MAX_SCREENSHOT_FILE_SIZE}"),
+            )));
+        }
+        let relative_path = name.as_encoded_bytes().to_vec();
+        send_executor_data(
+            request_id,
+            channel_out,
+            EgoBridgeMessage::FileBegin {
+                request_id,
+                relative_path,
+                size,
+            },
+        )?;
+        let mut file = std::fs::File::open(&path).map_err(RequestExecutionError::Local)?;
+        let mut buffer = vec![0; MAX_STREAM_PAYLOAD_SIZE];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(RequestExecutionError::Local)?;
+            if read == 0 {
+                break;
+            }
+            send_executor_data(
+                request_id,
+                channel_out,
+                EgoBridgeMessage::FileChunk {
+                    request_id,
+                    data: buffer[..read].to_vec(),
+                },
+            )?;
+        }
+        send_executor_data(
+            request_id,
+            channel_out,
+            EgoBridgeMessage::FileEnd { request_id },
+        )?;
+    }
+    if let Err(error) = std::fs::remove_dir_all(root) {
+        eprintln!("ego-lite-bridge: failed to remove screenshot transfer root: {error}");
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn send_executor_data(
+    request_id: u64,
+    channel_out: &ChannelWriter,
+    message: EgoBridgeMessage,
+) -> Result<(), RequestExecutionError> {
+    match channel_out.data(message) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(RequestExecutionError::Local(io::Error::new(
+                error.kind(),
+                output_queue_error(request_id, &error),
+            )))
+        }
+        Err(error) => Err(RequestExecutionError::Channel(error)),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct InputPrelude {
+    prelude: Option<Vec<u8>>,
+    pending: Vec<u8>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl InputPrelude {
+    fn new(prelude: Option<Vec<u8>>) -> Self {
+        Self {
+            prelude,
+            pending: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, data: &[u8], eof: bool) -> io::Result<Option<Vec<u8>>> {
+        let Some(prelude) = self.prelude.as_ref() else {
+            return Ok((!data.is_empty()).then(|| data.to_vec()));
+        };
+        self.pending.extend_from_slice(data);
+
+        const BOM: &[u8] = b"\xef\xbb\xbf";
+        if !eof && self.pending.len() < BOM.len() && BOM.starts_with(&self.pending) {
+            return Ok(None);
+        }
+        let bom_len = usize::from(self.pending.starts_with(BOM)) * BOM.len();
+        let source = &self.pending[bom_len..];
+        if !eof && source.len() < 2 && b"#!".starts_with(source) {
+            return Ok(None);
+        }
+
+        let shebang = source.starts_with(b"#!");
+        let insertion = if shebang {
+            match source.iter().position(|byte| *byte == b'\n') {
+                Some(newline) => bom_len + newline + 1,
+                None if !eof => {
+                    if self.pending.len() > MAX_STREAM_PAYLOAD_SIZE {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ego-browser nodejs shebang exceeds maximum stream payload",
+                        ));
+                    }
+                    return Ok(None);
+                }
+                None => self.pending.len(),
+            }
+        } else {
+            bom_len
+        };
+
+        let mut output = Vec::with_capacity(self.pending.len() + prelude.len() + 1);
+        output.extend_from_slice(&self.pending[..insertion]);
+        if shebang && eof && !output.ends_with(b"\n") {
+            output.push(b'\n');
+        }
+        output.extend_from_slice(prelude);
+        output.extend_from_slice(&self.pending[insertion..]);
+        self.pending.clear();
+        self.prelude = None;
+        Ok(Some(output))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn forward_input(
     mut child_stdin: impl Write,
     receiver: &mpsc::Receiver<RequestInput>,
     pending_input: &AtomicUsize,
     cancelled: &AtomicBool,
     done: &AtomicBool,
+    prelude: Option<Vec<u8>>,
 ) -> io::Result<()> {
+    let mut input_prelude = InputPrelude::new(prelude);
     while !done.load(Ordering::Acquire) && !cancelled.load(Ordering::Acquire) {
         match receiver.recv_timeout(EXEC_POLL_INTERVAL) {
             Ok(input) => {
@@ -3580,22 +4094,26 @@ fn forward_input(
                 if cancelled.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                match input {
-                    RequestInput::Stdin(data, _payload) => {
-                        if let Err(err) = child_stdin
-                            .write_all(&data)
-                            .and_then(|()| child_stdin.flush())
+                let (data, eof) = match input {
+                    RequestInput::Stdin(data, _payload) => (data, false),
+                    RequestInput::StdinEof => (Vec::new(), true),
+                };
+                if let Some(output) = input_prelude.push(&data, eof)? {
+                    if let Err(err) = child_stdin
+                        .write_all(&output)
+                        .and_then(|()| child_stdin.flush())
+                    {
+                        if err.kind() == io::ErrorKind::BrokenPipe
+                            || cancelled.load(Ordering::Acquire)
                         {
-                            if err.kind() == io::ErrorKind::BrokenPipe
-                                || cancelled.load(Ordering::Acquire)
-                            {
-                                return Ok(());
-                            }
-                            cancelled.store(true, Ordering::Release);
-                            return Err(err);
+                            return Ok(());
                         }
+                        cancelled.store(true, Ordering::Release);
+                        return Err(err);
                     }
-                    RequestInput::StdinEof => return Ok(()),
+                }
+                if eof {
+                    return Ok(());
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -3735,6 +4253,33 @@ mod tests {
     const TEST_ENDPOINT_ID: EndpointId = EndpointId([1; 16]);
     const TEST_OWNER_ID: OwnerId = OwnerId([2; 16]);
     const TEST_PROBE_NONCE: ProbeNonce = ProbeNonce([3; 16]);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn screenshot(name: &str) -> Self {
+            let path = Path::new("/tmp").join(format!(
+                "{SCREENSHOT_TRANSFER_PREFIX}test-{name}-{}-{:?}",
+                std::process::id(),
+                thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir(&path).expect("create test directory");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                    .expect("secure test directory");
+            }
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
         let (read, write) = UnixStream::pair().expect("socket pair");
@@ -3894,7 +4439,7 @@ mod tests {
         writer.shutdown().expect("join writer");
     }
 
-    fn protocol_v3_messages() -> Vec<EgoBridgeMessage> {
+    fn protocol_v4_messages() -> Vec<EgoBridgeMessage> {
         let mut messages = vec![
             hello(TEST_ENDPOINT_ID),
             welcome(TEST_OWNER_ID, None),
@@ -3925,6 +4470,7 @@ mod tests {
             EgoBridgeMessage::Open {
                 request_id: 42,
                 argv: vec![b"open".to_vec(), vec![b'x', 0xff]],
+                transfer_root: Some(b"/tmp/ego-lite-bridge-screenshots-501-42".to_vec()),
             },
             EgoBridgeMessage::Stdin {
                 request_id: 42,
@@ -3939,6 +4485,16 @@ mod tests {
                 request_id: 42,
                 data: vec![0xff, b'e'],
             },
+            EgoBridgeMessage::FileBegin {
+                request_id: 42,
+                relative_path: b"shot.png".to_vec(),
+                size: 3,
+            },
+            EgoBridgeMessage::FileChunk {
+                request_id: 42,
+                data: b"png".to_vec(),
+            },
+            EgoBridgeMessage::FileEnd { request_id: 42 },
             EgoBridgeMessage::Exit {
                 request_id: 42,
                 code: Some(7),
@@ -3959,11 +4515,11 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v3_golden_fixture() {
-        let fixture = include_bytes!("../tests/fixtures/ego_bridge_v3.bin");
+    fn protocol_v4_golden_fixture() {
+        let fixture = include_bytes!("../tests/fixtures/ego_bridge_v4.bin");
         let mut input = io::Cursor::new(fixture.as_slice());
 
-        for expected in protocol_v3_messages() {
+        for expected in protocol_v4_messages() {
             let start = input.position() as usize;
             let decoded = read_message(&mut input).expect("decode fixture message");
             let end = input.position() as usize;
@@ -4014,6 +4570,10 @@ mod tests {
             },
             EgoBridgeMessage::Stderr {
                 request_id: 3,
+                data: vec![0; MAX_STREAM_PAYLOAD_SIZE + 1],
+            },
+            EgoBridgeMessage::FileChunk {
+                request_id: 4,
                 data: vec![0; MAX_STREAM_PAYLOAD_SIZE + 1],
             },
         ] {
@@ -4073,6 +4633,7 @@ mod tests {
             EgoBridgeMessage::Open {
                 request_id: 1,
                 argv: Vec::new(),
+                transfer_root: None,
             },
         ];
 
@@ -4194,6 +4755,7 @@ mod tests {
             EgoBridgeMessage::Open {
                 request_id: 1,
                 argv: Vec::new(),
+                transfer_root: None,
             },
         ] {
             assert_eq!(
@@ -4235,6 +4797,7 @@ mod tests {
             &EgoBridgeMessage::Open {
                 request_id: 1,
                 argv: Vec::new(),
+                transfer_root: None,
             },
         )
         .expect("encode open");
@@ -4272,6 +4835,79 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn shim_receives_screenshot_without_rewriting_stdout() {
+        let root = std::env::temp_dir().join(format!(
+            "{SCREENSHOT_TRANSFER_PREFIX}test-shim-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).expect("create transfer root");
+        let expected_path = root.join("shot.png");
+        let printed = path_to_bytes(&expected_path);
+        let (client, mut broker) = UnixStream::pair().expect("socket pair");
+        let broker_thread = thread::spawn(move || {
+            let _ = read_message(&mut broker).expect("open");
+            let _ = read_message(&mut broker).expect("stdin EOF");
+            write_message(
+                &mut broker,
+                &EgoBridgeMessage::Stdout {
+                    request_id: 70,
+                    data: printed,
+                },
+            )
+            .expect("stdout");
+            write_message(
+                &mut broker,
+                &EgoBridgeMessage::FileBegin {
+                    request_id: 70,
+                    relative_path: b"shot.png".to_vec(),
+                    size: 3,
+                },
+            )
+            .expect("file begin");
+            write_message(
+                &mut broker,
+                &EgoBridgeMessage::FileChunk {
+                    request_id: 70,
+                    data: b"png".to_vec(),
+                },
+            )
+            .expect("file chunk");
+            write_message(&mut broker, &EgoBridgeMessage::FileEnd { request_id: 70 })
+                .expect("file end");
+            write_message(
+                &mut broker,
+                &EgoBridgeMessage::Exit {
+                    request_id: 70,
+                    code: Some(0),
+                    signal: None,
+                },
+            )
+            .expect("exit");
+        });
+        let mut stdout = Vec::new();
+        let code = run_shim_stream(
+            client,
+            70,
+            Vec::new(),
+            Some(root.clone()),
+            io::empty(),
+            &mut stdout,
+            io::sink(),
+        )
+        .expect("run shim");
+        broker_thread.join().expect("broker thread");
+        assert_eq!(code, 0);
+        assert_eq!(stdout, path_to_bytes(&expected_path));
+        assert_eq!(
+            std::fs::read(&expected_path).expect("read screenshot"),
+            b"png"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn shim_forwards_stdin_output_and_exit_code() {
         let (client, mut broker) = UnixStream::pair().expect("socket pair");
         let broker_thread = thread::spawn(move || {
@@ -4279,7 +4915,8 @@ mod tests {
                 read_message(&mut broker).expect("open"),
                 EgoBridgeMessage::Open {
                     request_id: 9,
-                    argv: vec![b"open".to_vec()]
+                    argv: vec![b"open".to_vec()],
+                    transfer_root: None,
                 }
             );
             assert_eq!(
@@ -4325,6 +4962,7 @@ mod tests {
             client,
             9,
             vec![b"open".to_vec()],
+            None,
             io::Cursor::new(b"input".to_vec()),
             &mut stdout,
             &mut stderr,
@@ -4435,8 +5073,16 @@ mod tests {
             .expect("wrong response");
         });
 
-        let error = run_shim_stream(client, 20, Vec::new(), io::empty(), io::sink(), io::sink())
-            .expect_err("reject wrong response id");
+        let error = run_shim_stream(
+            client,
+            20,
+            Vec::new(),
+            None,
+            io::empty(),
+            io::sink(),
+            io::sink(),
+        )
+        .expect_err("reject wrong response id");
         broker_thread.join().expect("broker thread");
         assert!(error.to_string().contains("request id mismatch"));
     }
@@ -4449,8 +5095,16 @@ mod tests {
             let _ = read_message(&mut broker).expect("stdin EOF");
         });
 
-        let error = run_shim_stream(client, 22, Vec::new(), io::empty(), io::sink(), io::sink())
-            .expect_err("report bridge disconnect");
+        let error = run_shim_stream(
+            client,
+            22,
+            Vec::new(),
+            None,
+            io::empty(),
+            io::sink(),
+            io::sink(),
+        )
+        .expect_err("report bridge disconnect");
         broker_thread.join().expect("broker thread");
 
         assert!(error
@@ -4538,6 +5192,7 @@ mod tests {
             &EgoBridgeMessage::Open {
                 request_id,
                 argv: Vec::new(),
+                transfer_root: None,
             },
         )
         .expect("write open");
@@ -4632,7 +5287,8 @@ mod tests {
         let scheduler = InboundScheduler::new(false);
         assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Open {
             request_id: 1,
-            argv: Vec::new()
+            argv: Vec::new(),
+            transfer_root: None,
         })));
         for _ in 0..INBOUND_REQUEST_FRAMES_PER_REQUEST + 3 {
             assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Stdin {
@@ -4671,6 +5327,7 @@ mod tests {
         assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Open {
             request_id,
             argv: Vec::new(),
+            transfer_root: None,
         })));
         assert!(matches!(
             scheduler.pop_timeout(Duration::ZERO).unwrap(),
@@ -4701,6 +5358,7 @@ mod tests {
         assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Open {
             request_id,
             argv: Vec::new(),
+            transfer_root: None,
         })));
         assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Stdin {
             request_id,
@@ -4723,6 +5381,94 @@ mod tests {
     }
 
     #[test]
+    fn nodejs_prelude_requires_exact_argv_and_transfer_root() {
+        let root = Path::new("/tmp/ego-lite-bridge-screenshots-1001-1");
+        assert!(nodejs_input_prelude(&["nodejs".into()], Some(root))
+            .expect("build prelude")
+            .is_some());
+        for argv in [
+            Vec::new(),
+            vec!["open".into()],
+            vec!["nodejs-extra".into()],
+            vec!["nodejs".into(), "--sdk-path".into()],
+        ] {
+            assert!(nodejs_input_prelude(&argv, Some(root))
+                .expect("skip prelude")
+                .is_none());
+        }
+        assert!(nodejs_input_prelude(&["nodejs".into()], None)
+            .expect("skip missing root")
+            .is_none());
+    }
+
+    #[test]
+    fn input_prelude_preserves_bom_shebang_chunks_and_eof() {
+        const PRELUDE: &[u8] = b"PRELUDE\n";
+        for (chunks, expected) in [
+            (
+                vec![b"console.log(1)".as_slice(), b"".as_slice()],
+                b"PRELUDE\nconsole.log(1)".as_slice(),
+            ),
+            (
+                vec![
+                    b"\xef".as_slice(),
+                    b"\xbb\xbflet x=1".as_slice(),
+                    b"".as_slice(),
+                ],
+                b"\xef\xbb\xbfPRELUDE\nlet x=1".as_slice(),
+            ),
+            (
+                vec![
+                    b"#".as_slice(),
+                    b"!/usr/bin/env node\nlet x=1".as_slice(),
+                    b"".as_slice(),
+                ],
+                b"#!/usr/bin/env node\nPRELUDE\nlet x=1".as_slice(),
+            ),
+            (
+                vec![
+                    b"\xef\xbb".as_slice(),
+                    b"\xbf#".as_slice(),
+                    b"!/usr/bin/env node\nlet x=1".as_slice(),
+                    b"".as_slice(),
+                ],
+                b"\xef\xbb\xbf#!/usr/bin/env node\nPRELUDE\nlet x=1".as_slice(),
+            ),
+            (
+                vec![b"#!/usr/bin/env node".as_slice(), b"".as_slice()],
+                b"#!/usr/bin/env node\nPRELUDE\n".as_slice(),
+            ),
+            (vec![b"".as_slice()], b"PRELUDE\n".as_slice()),
+            (
+                vec![b"\xff\x80".as_slice(), b"".as_slice()],
+                b"PRELUDE\n\xff\x80".as_slice(),
+            ),
+        ] {
+            let mut injector = InputPrelude::new(Some(PRELUDE.to_vec()));
+            let mut output = Vec::new();
+            for (index, chunk) in chunks.iter().enumerate() {
+                if let Some(bytes) = injector
+                    .push(chunk, index + 1 == chunks.len())
+                    .expect("inject prelude")
+                {
+                    output.extend(bytes);
+                }
+            }
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn input_without_prelude_remains_binary_exact() {
+        let mut injector = InputPrelude::new(None);
+        let mut output = Vec::new();
+        for chunk in [b"\x00\xff".as_slice(), b"data".as_slice()] {
+            output.extend(injector.push(chunk, false).expect("pass through").unwrap());
+        }
+        assert_eq!(output, b"\x00\xffdata");
+    }
+
+    #[test]
     fn cancelled_input_worker_does_not_write_already_queued_data() {
         let (sender, receiver) = mpsc::sync_channel(1);
         sender
@@ -4735,6 +5481,7 @@ mod tests {
             &AtomicUsize::new(1),
             &AtomicBool::new(true),
             &AtomicBool::new(false),
+            Some(b"prelude".to_vec()),
         )
         .expect("cancel input worker");
         assert!(output.is_empty());
@@ -4834,6 +5581,7 @@ mod tests {
         assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Open {
             request_id: 8,
             argv: Vec::new(),
+            transfer_root: None,
         })));
         for _ in 0..INBOUND_REQUEST_FRAMES_PER_REQUEST + 2 {
             assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Stdin {
@@ -4845,6 +5593,7 @@ mod tests {
         assert!(scheduler.enqueue(Ok(EgoBridgeMessage::Open {
             request_id: 8,
             argv: vec![b"reused".to_vec()],
+            transfer_root: None,
         })));
 
         let mut kinds = Vec::new();
@@ -4859,6 +5608,51 @@ mod tests {
         let eof = kinds.iter().position(|kind| *kind == "stdin_eof").unwrap();
         let reused = kinds.iter().rposition(|kind| *kind == "open").unwrap();
         assert!(overload < eof && eof < reused);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broker_routes_interleaved_screenshot_responses() {
+        let (path, remote, output, broker) = start_test_broker();
+        let mut first = connect_open(&path, 70);
+        let mut second = connect_open(&path, 71);
+        wait_for_messages(&output, 2);
+        for message in [
+            EgoBridgeMessage::FileBegin {
+                request_id: 71,
+                relative_path: b"second.png".to_vec(),
+                size: 1,
+            },
+            EgoBridgeMessage::FileBegin {
+                request_id: 70,
+                relative_path: b"first.png".to_vec(),
+                size: 1,
+            },
+            EgoBridgeMessage::Exit {
+                request_id: 70,
+                code: Some(0),
+                signal: None,
+            },
+            EgoBridgeMessage::Exit {
+                request_id: 71,
+                code: Some(0),
+                signal: None,
+            },
+        ] {
+            remote.send(Ok(message)).expect("remote response");
+        }
+        assert!(
+            matches!(read_message(&mut first), Ok(EgoBridgeMessage::FileBegin { relative_path, .. }) if relative_path == b"first.png")
+        );
+        assert!(
+            matches!(read_message(&mut second), Ok(EgoBridgeMessage::FileBegin { relative_path, .. }) if relative_path == b"second.png")
+        );
+        drop(remote);
+        assert!(matches!(
+            broker.join(),
+            Ok(Err(BrokerRouteError::Channel(_)))
+        ));
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(target_os = "linux")]
@@ -4934,6 +5728,7 @@ mod tests {
                     stream,
                     request_id,
                     Vec::new(),
+                    None,
                     stdin,
                     io::sink(),
                     io::sink(),
@@ -5418,6 +6213,7 @@ mod tests {
         assert!(first.enqueue(Ok(EgoBridgeMessage::Open {
             request_id: 20,
             argv: vec![vec![0]],
+            transfer_root: None,
         })));
         assert!(second.enqueue(Ok(EgoBridgeMessage::Stdin {
             request_id: 21,
@@ -5534,6 +6330,7 @@ mod tests {
                         "-c".into(),
                         "printf %s \"$$\"; read _; printf output; read _".into(),
                     ],
+                    None,
                     receiver,
                     &pending_input,
                     &cancelled,
@@ -5586,6 +6383,7 @@ mod tests {
                     b"LC_ALL=C; export LC_ALL; dd if=/dev/zero bs=16384 count=1 2>/dev/null; dd if=/dev/zero bs=16384 count=1 2>/dev/null | tr '\\000' '\\377'; dd if=/dev/zero bs=16384 count=1 2>/dev/null | tr '\\000' '\\200'"
                         .to_vec(),
                 ],
+            transfer_root: None,
             }))
             .expect("open binary stdout request");
         sender
@@ -5645,6 +6443,7 @@ mod tests {
             .send(Ok(EgoBridgeMessage::Open {
                 request_id,
                 argv: vec![b"-c".to_vec(), b"cksum".to_vec()],
+                transfer_root: None,
             }))
             .expect("open checksum request");
         for chunk in input.chunks(16 * 1024) {
@@ -5706,6 +6505,7 @@ mod tests {
             .send(Ok(EgoBridgeMessage::Open {
                 request_id: 40,
                 argv: vec![b"-c".to_vec(), b"exec sleep 30".to_vec()],
+                transfer_root: None,
             }))
             .expect("open blocked request");
         for _ in 0..REQUEST_QUEUE_CAPACITY {
@@ -5720,6 +6520,7 @@ mod tests {
             .send(Ok(EgoBridgeMessage::Open {
                 request_id: 41,
                 argv: vec![b"-c".to_vec(), b"printf ready".to_vec()],
+                transfer_root: None,
             }))
             .expect("open independent request");
         sender
@@ -5748,6 +6549,7 @@ mod tests {
             .send(Ok(EgoBridgeMessage::Open {
                 request_id: 50,
                 argv: vec![b"-c".to_vec(), b"exit 0".to_vec()],
+                transfer_root: None,
             }))
             .expect("open first request");
         wait_for_messages(&output, 1);
@@ -5758,6 +6560,7 @@ mod tests {
             .send(Ok(EgoBridgeMessage::Open {
                 request_id: 51,
                 argv: vec![b"-c".to_vec(), b"printf alive".to_vec()],
+                transfer_root: None,
             }))
             .expect("open second request");
         sender
@@ -5780,6 +6583,7 @@ mod tests {
             .send(Ok(EgoBridgeMessage::Open {
                 request_id,
                 argv: vec![b"-c".to_vec(), b"exec sleep 30".to_vec()],
+                transfer_root: None,
             }))
             .expect("open request");
         for _ in 0..=INBOUND_REQUEST_FRAMES_PER_REQUEST {
@@ -5829,6 +6633,7 @@ mod tests {
         assert!(inbound.enqueue(Ok(EgoBridgeMessage::Open {
             request_id,
             argv: vec![b"-c".to_vec(), b"exec sleep 30".to_vec()],
+            transfer_root: None,
         })));
         for _ in 0..INBOUND_REQUEST_FRAMES_PER_REQUEST {
             assert!(inbound.enqueue(Ok(EgoBridgeMessage::Stdin {
@@ -5843,6 +6648,7 @@ mod tests {
                 b"-c".to_vec(),
                 b"read value; printf '%s' \"$value\"".to_vec(),
             ],
+            transfer_root: None,
         })));
         assert!(inbound.enqueue(Ok(EgoBridgeMessage::Stdin {
             request_id,
@@ -5885,6 +6691,7 @@ mod tests {
             .send(Ok(EgoBridgeMessage::Open {
                 request_id: 60,
                 argv: vec![b"-c".to_vec(), b"exit 0".to_vec()],
+                transfer_root: None,
             }))
             .expect("open first generation");
         wait_for_messages(&output, 1);
@@ -5895,6 +6702,7 @@ mod tests {
                     b"-c".to_vec(),
                     b"read value; printf '%s' \"$value\"".to_vec(),
                 ],
+                transfer_root: None,
             }))
             .expect("reuse request id");
         sender
@@ -5943,6 +6751,7 @@ mod tests {
                 .send(Ok(EgoBridgeMessage::Open {
                     request_id,
                     argv: vec![b"-c".to_vec(), b"exec sleep 30".to_vec()],
+                    transfer_root: None,
                 }))
                 .expect("open request");
         }
@@ -5969,6 +6778,7 @@ mod tests {
                         b"-c".to_vec(),
                         b"read value; printf '%s' \"$value\"".to_vec(),
                     ],
+                    transfer_root: None,
                 }))
                 .expect("open request");
         }
@@ -5999,6 +6809,7 @@ mod tests {
                 .send(Ok(EgoBridgeMessage::Open {
                     request_id,
                     argv: vec![b"-c".to_vec(), b"exec sleep 30".to_vec()],
+                    transfer_root: None,
                 }))
                 .expect("open request");
         }
@@ -6006,12 +6817,14 @@ mod tests {
             .send(Ok(EgoBridgeMessage::Open {
                 request_id: 0,
                 argv: vec![b"-c".to_vec(), b"exit 99".to_vec()],
+                transfer_root: None,
             }))
             .expect("duplicate open");
         sender
             .send(Ok(EgoBridgeMessage::Open {
                 request_id: 99,
                 argv: Vec::new(),
+                transfer_root: None,
             }))
             .expect("capacity open");
         wait_for_messages(&output, 1);
@@ -6052,6 +6865,7 @@ mod tests {
             .send(Ok(EgoBridgeMessage::Open {
                 request_id: 7,
                 argv: vec![b"-c".to_vec(), b"exec sleep 30".to_vec()],
+                transfer_root: None,
             }))
             .expect("open request");
         sender
@@ -6074,6 +6888,7 @@ mod tests {
             .send(Ok(EgoBridgeMessage::Open {
                 request_id: 8,
                 argv: vec![b"-c".to_vec(), b"exec sleep 30".to_vec()],
+                transfer_root: None,
             }))
             .expect("open request");
         sender
@@ -6094,6 +6909,60 @@ mod tests {
     }
 
     #[test]
+    fn executor_returns_png_from_transfer_tmpdir_before_exit() {
+        let root = TestDir::screenshot("executor-return");
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        let (channel_out, _writer_failed, output) = start_captured_writer();
+        execute_request(
+            OsStr::new("/bin/sh"),
+            72,
+            &[
+                "-c".into(),
+                "printf '%s/shot.png' \"$TMPDIR\"; printf png > \"$TMPDIR/shot.png\"".into(),
+            ],
+            Some(&root.0),
+            receiver,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(Mutex::new(None)),
+            &channel_out,
+            &ResourceBudget::default(),
+        )
+        .expect("execute child");
+        let messages = decode_messages(&output);
+        let expected_path = path_to_bytes(&root.0.join("shot.png"));
+        assert!(messages.iter().any(
+            |message| matches!(message, EgoBridgeMessage::Stdout { request_id: 72, data } if data == &expected_path)
+        ));
+        assert!(messages.iter().any(
+            |message| matches!(message, EgoBridgeMessage::FileBegin { request_id: 72, relative_path, size: 3 } if relative_path == b"shot.png")
+        ));
+        assert!(messages.iter().any(
+            |message| matches!(message, EgoBridgeMessage::FileChunk { request_id: 72, data } if data == b"png")
+        ));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, EgoBridgeMessage::FileEnd { request_id: 72 })));
+        assert!(matches!(
+            messages.last(),
+            Some(EgoBridgeMessage::Exit {
+                request_id: 72,
+                code: Some(0),
+                signal: None
+            })
+        ));
+    }
+
+    #[test]
+    fn screenshot_transfer_validators_reject_escape_paths() {
+        assert!(validate_screenshot_transfer_root(Path::new("/Users/me/shot")).is_err());
+        assert!(screenshot_file_name(b"../secret.png").is_err());
+        assert!(screenshot_file_name(b"nested/shot.png").is_err());
+        assert!(screenshot_file_name(b"shot.txt").is_err());
+    }
+
+    #[test]
     fn child_exit_does_not_wait_for_stdin_eof() {
         let (_sender, receiver) = mpsc::sync_channel(1);
         let (channel_out, _writer_failed, output) = start_captured_writer();
@@ -6102,6 +6971,7 @@ mod tests {
             OsStr::new("/bin/sh"),
             3,
             &["-c".into(), "exit 7".into()],
+            None,
             receiver,
             &Arc::new(AtomicUsize::new(0)),
             &Arc::new(AtomicBool::new(false)),
@@ -6131,6 +7001,7 @@ mod tests {
             OsStr::new("/bin/sh"),
             4,
             &["-c".into(), "exec sleep 30".into()],
+            None,
             receiver,
             &Arc::new(AtomicUsize::new(0)),
             &Arc::new(AtomicBool::new(true)),
@@ -6155,6 +7026,7 @@ mod tests {
             OsStr::new("/definitely/missing/ego-browser"),
             5,
             &[],
+            None,
             receiver,
             &Arc::new(AtomicUsize::new(0)),
             &Arc::new(AtomicBool::new(false)),

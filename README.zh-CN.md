@@ -163,14 +163,14 @@ ln -sf ego-lite-bridge ~/.local/bin/ego-browser
 - 仅支持 macOS executor 和 Linux caller。
 - 最多可并发执行 8 个 `ego-browser` 调用；达到容量后新增调用会立即被拒绝，阻塞或断开的请求不会阻塞其他请求。
 - Linux broker 路径固定为 `~/.local/bin/ego-lite-bridge`。
-- bridge 只转发命令参数和标准流，不映射 Mac 文件系统或环境变量。
+- bridge 转发命令参数、标准流和请求级 PNG 截图；不映射 Mac 文件系统或环境变量。
 
 ## 信任边界
 
 - Mac 与 Linux 之间的信任由 SSH 认证和主机密钥校验决定；启动 bridge 前应完成配置和验证。
 - Linux runtime endpoint 为 `/tmp/ego-lite-bridge-<uid>/broker.sock` 和 `/tmp/ego-lite-bridge-<uid>/owner.sock`。目录权限为 `0700`，socket 权限为 `0600`，只有对应 Linux 用户可以连接。
 - 以该 Linux 用户运行的任何进程都可以要求 Mac 使用任意参数和 stdin 启动固定的 `ego-browser`。只应面向可信的 Linux 账户运行 bridge。
-- 浏览器输出和退出状态来自已连接的 Mac executor。系统不会回退到本地或其他浏览器。
+- 浏览器输出和退出状态来自已连接的 Mac executor。PNG 截图只会从每请求的 `/tmp/ego-lite-bridge-screenshots-*` transfer directory 回传；stdout 和 stderr 中的路径不会被解析为文件。系统不会回退到本地或其他浏览器。
 
 ## 故障排查
 

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 pub(crate) type LocalListener = UnixListener;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) type LocalStream = UnixStream;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

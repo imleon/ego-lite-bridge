@@ -46,6 +46,7 @@ The heredoc body runs as a Node.js script that controls the selected ego-browser
 
 Notes:
 - `cliLog(value)` — prints to the terminal; it is the only output mechanism inside a heredoc, and all final results must go through it.
+- Screenshots saved without an explicit path, or under `process.env.EGO_LITE_BRIDGE_TRANSFER_DIR`, are returned to the Linux side when running through ego-lite-bridge. Do not use arbitrary Mac paths for screenshots that Linux must read.
 - `await pageInfo()` — normally resolves to `{ url, title, w, h, sx, sy, pw, ph }`; if a native browser dialog is open, resolves to `{ dialog: ... }` instead because page JavaScript is blocked.
 - If `await pageInfo()` resolves to `{ dialog: ... }`, handle the dialog with `await cdp('Page.handleJavaScriptDialog', { accept: true })` or `accept: false` before running page JavaScript.
 - `await ensureRealTab()` — switches to an existing non-internal page tab if needed and resolves to it; resolves to `null` when none exists. It does not create a tab — use `await openOrReuseTab(...)` for that.
