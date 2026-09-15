@@ -19,7 +19,7 @@ Linux ego-browser shim -> Linux broker -> SSH channel -> Mac executor -> ego-bro
 
 ## Release status
 
-Version 0.1.1 provides prebuilt binaries for `linux-x86_64` and `macos-aarch64`; users do not need Rust or a source build. The Linux release is a static `x86_64-unknown-linux-musl` binary, and the macOS release is a native `aarch64-apple-darwin` binary.
+Version 0.1.2 provides prebuilt binaries for `linux-x86_64` and `macos-aarch64`; users do not need Rust or a source build. The Linux release is a static `x86_64-unknown-linux-musl` binary, and the macOS release is a native `aarch64-apple-darwin` binary.
 
 ## Quick start
 
@@ -59,7 +59,7 @@ For the existing fixed-release manual alternative, set `VERSION` to the exact in
 ```bash
 (
   set -eu
-  VERSION=0.1.1
+  VERSION=0.1.2
   : "${AGENT_ID:?set AGENT_ID to one explicit skills CLI Agent ID}"
   WORK_DIR="$(mktemp -d)"
   trap 'rm -rf "$WORK_DIR"' EXIT
