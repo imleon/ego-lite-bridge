@@ -15,7 +15,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::MetadataExt;
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(any(target_os = "linux", test))]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(any(target_os = "linux", test))]
 use std::path::Component;
 use std::path::Path;
