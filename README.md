@@ -35,9 +35,9 @@ Install the latest release on both the Mac and Linux host:
 curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/install.sh | sh
 ```
 
-The installer verifies the binary against the release manifest's SHA-256 checksum. On macOS it installs only `ego-lite-bridge`, without prompting for a skill. On Linux, after committing the binary and `ego-browser` shim, it asks `[Y/n]` through `/dev/tty`: Enter or `y`/`yes` (case-insensitive) starts optional skill installation; `n`/`no` skips it; invalid input prompts again. EOF, a read failure, or no usable terminal skips the skill and prints the manual-install link. Skipping needs no Node.js, npm/npx, or tar and leaves Agent directories untouched.
+The installer verifies the binary against the release manifest's SHA-256 checksum. On macOS it installs only `ego-lite-bridge`, without prompting for a skill. On Linux, after committing the binary and `ego-browser` shim, it asks `[Y/n]` through `/dev/tty`: Enter or `y`/`yes` (case-insensitive) starts optional skill installation; `n`/`no` skips it; invalid input prompts again. EOF, a read failure, or no usable terminal skips the skill and prints the manual-install link. Skipping needs no Node.js, npx, tar, or gzip and leaves Agent directories untouched.
 
-Only after consent does the optional step require Node.js 22.20.0 or newer, `npm`/`npx`, and `tar`. It downloads the same release's skill using the manifest already fetched for the binary, verifies SHA-256, validates the archive, and extracts it safely. Before any skill download or CLI launch, a guard tied to the fixed `skills@1.5.24` version checks for Agent execution environments; if detected, it asks you to rerun in an ordinary terminal instead of silently clearing environment variables or launching a potentially auto-confirming CLI.
+Only after consent does the optional step require Node.js 22.20.0 or newer, `npx`, `tar`, and `gzip`. It downloads the same release's skill using the manifest already fetched for the binary, verifies SHA-256, validates the archive, and extracts it safely. Before any skill download or CLI launch, a guard tied to the fixed `skills@1.5.24` version checks for Agent execution environments; if detected, it asks you to rerun in an ordinary terminal instead of silently clearing environment variables or launching a potentially auto-confirming CLI.
 
 The installer runs `npx --yes skills@1.5.24 add <extracted-skill> --skill ego-browser --global --copy` with stdin, stdout, and stderr connected to `/dev/tty`, including when invoked through `curl | sh`. The outer `npx --yes` permits fetching the CLI; no inner `--yes`, `--agent`, or `--all` is passed. Agent selection and confirmation use the native upstream interface, not a bridge-defined selector: universal targets cannot be deselected, and a single-Agent setup may omit the selection screen. The default `[Y/n]` does not accept all upstream choices for you.
 
@@ -46,7 +46,15 @@ If this optional step fails, the installer exits nonzero and reports that the br
 <a id="optional-agent-skill-installation"></a>
 ### Optional Agent skill installation
 
-The release retains the vendored `ego-browser-skill.tgz` asset and its URL and SHA-256 in the manifest. As an independent alternative to the installer's native interactive flow, you can install it manually on Linux for an explicit Agent. This requires Node.js 22.20.0 or newer, `npm`/`npx`, and `tar`. Set `VERSION` to the exact bridge release already installed, then set `AGENT_ID` in your shell to one explicit Agent ID supported by the skills CLI; in this manual command, do not omit `--agent` or use `*`.
+On Linux, explicitly install the skill from the latest release with:
+
+```bash
+ego-lite-bridge skill install
+```
+
+This always opens the native skills CLI selection and confirmation interface; it does not infer Agent installation state, has no `--force` option, and may overwrite an existing `ego-browser` skill including local changes. Before fetching the latest manifest, it rejects Agent execution environments and requires a foreground `/dev/tty`. It then requires Node.js 22.20.0 or newer, `npx`, `tar`, and `gzip`, refuses when the installed bridge version does not match the latest release, and downloads the skill into a private `0700` directory under the system temporary directory. It does not fall back to another skill version. The vendored skill remains a release asset and manifest entry, and its calls still pass through the Linux shim to the real browser running on the Mac.
+
+For the existing fixed-release manual alternative, set `VERSION` to the exact installed bridge release and `AGENT_ID` to one explicit skills CLI Agent ID:
 
 ```bash
 (
@@ -68,7 +76,7 @@ The release retains the vendored `ego-browser-skill.tgz` asset and its URL and S
 )
 ```
 
-The skills CLI may overwrite an existing `ego-browser` skill, including local changes, for that Agent. Rerunning the bridge installer and consenting to the optional flow can also overwrite existing skills; skipping it leaves them untouched. This is not a runtime updater or automatic skill cleanup. The vendored skill remains a release asset and manifest entry. Its calls still pass through the Linux shim to the real browser running on the Mac.
+Do not omit `--agent` or use `*` in this manual path. It may also overwrite the selected Agent's existing skill.
 
 To download and install the bridge manually instead, run the matching commands on each machine. These steps install the bridge binary and Linux shim only.
 
@@ -109,9 +117,21 @@ ego-browser <args...>
 
 The daemon reconnects automatically after transient SSH or network failures.
 
+## Upgrade
+
+Run `ego-lite-bridge upgrade` to upgrade directly to the latest release; selecting another version is not supported. The fixed `ego-lite-bridge` installation has a nonblocking upgrade lock, so a concurrent upgrade of that installation fails immediately as busy. The verified download is staged beside the destination, synced, atomically renamed, and followed by a parent-directory sync. A failure before rename leaves the old binary installed; a failure syncing the directory means the replacement may already be installed but durability is unknown, and the command still exits nonzero.
+
+On macOS, a running daemon is stopped before replacement and restarted afterward with its persisted canonical `ego-browser` path; a stopped daemon remains stopped. If shutdown reports unconfirmed worker cleanup, the upgrade aborts without committing or restarting and leaves the daemon stopped. If another stop error is observed after the daemon has stopped, the old daemon is restored; if it is still running or its state is unknown, no restart or commit is attempted. A pre-rename commit failure restores a previously running daemon from the old binary. After rename—including unknown durability—the installed destination is used for restart. Success is printed only after the original running/stopped state has been restored; restart failure exits nonzero.
+
+On Linux, the command replaces the bridge binary and creates a missing `ego-browser` shim or preserves an existing exact relative shim. The shim target is the fixed `ego-lite-bridge` binary; any other object at the shim path causes failure.
+
+During a Linux upgrade, the command reads the packaged skill checksum from the currently installed release's `SHA256SUMS` and compares it with the latest manifest. It prompts `Update the optional ego-browser skill? [Y/n]` only when those release checksums differ; when they match, skill handling is skipped completely. This comparison says only whether the packaged release asset changed—it does not inspect whether any Agent has the skill installed or whether an installed copy was modified. Before prompting, it applies the Agent-environment guard and requires a foreground `/dev/tty`; failure leaves the skill unchanged. Declining or EOF also leaves it unchanged. Only Enter or `y`/`yes` triggers dependency checks and a skill download into a private system-temporary directory, reusing the already fetched latest manifest. Skill failure does not roll back the completed bridge upgrade but exits nonzero. There is no fallback.
+
+The first-time `curl | sh` installer behavior described above is unchanged and separate from `upgrade`.
+
 ## Command reference
 
-Run these control commands on macOS:
+Lifecycle and remote-control commands run on macOS; `upgrade` runs on both platforms, and `skill install` is Linux-only:
 
 | Command | Purpose | Successful output |
 | --- | --- | --- |
@@ -124,12 +144,14 @@ Run these control commands on macOS:
 | `ego-lite-bridge remote retry <config-id>` | Retry a remote currently in `active/error`. | The `remote list` record for the updated remote |
 | `ego-lite-bridge remote remove <config-id>` | Remove a remote and clean up its worker. | `removed <config-id>` |
 | `ego-lite-bridge stop` | Stop the daemon and its workers. | `ego-lite-bridge stopped` (or `is stopped` if already stopped) |
+| `ego-lite-bridge upgrade` | Upgrade to the latest release only; preserves whether the macOS daemon was running, or replaces the Linux binary/shim. | `ego-lite-bridge upgraded to v<version>`; macOS then reports `started` or `daemon remains stopped` after restoring state; an unchanged version reports that it is already current |
+| `ego-lite-bridge skill install` | Linux only: always open the native skills CLI for the latest matching release; may overwrite and has no force option. | Native skills CLI output |
 
 Desired states are `pending`, `active`, and `removing`; observed states are `connecting`, `connected`, `reconnecting`, `error`, and `removing`. Unknown unavailable detail is printed as `unknown`. `active-requests` is `<active>/<capacity>`. Every `[config-id]` or `<config-id>` selector must be the full 32-character lowercase hexadecimal ID printed by `remote add` or `remote list`; short prefixes, names, selector aliases, migration, and fallback are not supported.
 
 `doctor` is read-only. In M7 it checks whether the LaunchAgent is loaded, the daemon is running, and the configured absolute `ego-browser` path is valid. For each remote, it checks persisted endpoint identity presence and desired/observed state, plus handshake, capacity, and reconnect/error data from the daemon's **current worker snapshot**. It does not verify that the live endpoint identity matches the persisted value. `PASS` means that check is healthy in the inspected local state or snapshot; `FAIL` means an environment, daemon, selector, or snapshot check failed; `NOT CHECKED` explicitly means M7 did not open a new SSH connection or verify live endpoint identity, Linux socket permissions, or end-to-end execution. Those active remote checks are planned for post-0.1 hardening. Exit status is 0 when no check fails, 1 when any check fails, and 2 for invalid `doctor` syntax. `doctor` never repairs, installs, or changes configuration.
 
-Control commands are macOS-only; Linux exposes the `ego-browser` shim.
+Lifecycle, diagnostics, and remote-control commands are macOS-only. Linux exposes the `ego-browser` shim plus `upgrade` and `skill install`; macOS also supports `upgrade`.
 
 ## Development from source
 

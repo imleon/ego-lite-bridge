@@ -1,5 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
+#[cfg(target_os = "linux")]
+use std::io::{BufRead, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -26,8 +28,9 @@ mod launchd;
 mod macos_process;
 #[cfg(target_os = "macos")]
 mod managed_ssh;
+mod release;
 
-const USAGE: &str = "ego-lite-bridge — headless reverse remote exec bridge for ego-browser\n\nUsage:\n  ego-lite-bridge start\n  ego-lite-bridge stop\n  ego-lite-bridge status\n  ego-lite-bridge doctor [config-id]\n  ego-lite-bridge remote add <target>\n  ego-lite-bridge remote list\n  ego-lite-bridge remote status <config-id>\n  ego-lite-bridge remote retry <config-id>\n  ego-lite-bridge remote remove <config-id>\n  ego-lite-bridge --help\n  ego-lite-bridge --version";
+const USAGE: &str = "ego-lite-bridge — headless reverse remote exec bridge for ego-browser\n\nUsage:\n  ego-lite-bridge start\n  ego-lite-bridge stop\n  ego-lite-bridge status\n  ego-lite-bridge doctor [config-id]\n  ego-lite-bridge remote add <target>\n  ego-lite-bridge remote list\n  ego-lite-bridge remote status <config-id>\n  ego-lite-bridge remote retry <config-id>\n  ego-lite-bridge remote remove <config-id>\n  ego-lite-bridge upgrade\n  ego-lite-bridge skill install\n  ego-lite-bridge --help\n  ego-lite-bridge --version";
 #[cfg(any(target_os = "macos", test))]
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "macos", test))]
@@ -59,11 +62,18 @@ fn run(args: &[OsString]) -> io::Result<i32> {
         Some(command) if command == "status" && args.len() == 2 => run_status(),
         Some(command) if command == "doctor" => run_doctor(&args[2..]),
         Some(command) if command == "remote" => run_remote(&args[2..]),
+        Some(command) if command == "upgrade" && args.len() == 2 => run_upgrade(),
+        Some(command) if command == "skill" && args.len() == 3 && args[2] == "install" => {
+            run_skill_install()
+        }
         Some(command) if command == "daemon" && args.len() == 4 && args[2] == "--ego-browser" => {
             run_daemon(Path::new(&args[3]))
         }
         Some(command) if command == "ego-browser-broker" && args.len() == 2 => {
             ego_bridge::run_broker().map(|()| 0)
+        }
+        Some(command) if command == "installer-commit" && args.len() == 3 => {
+            release::commit_installer(&std::env::current_exe()?, Path::new(&args[2])).map(|()| 0)
         }
         Some(command) if (command == "--help" || command == "-h") && args.len() == 2 => {
             println!("{USAGE}");
@@ -86,29 +96,54 @@ fn run_start() -> io::Result<i32> {
     let paths = daemon::application_paths(&home)?;
     let directory = daemon::open_application_directory(&home)?;
     let _lifecycle_lock = daemon::DaemonLock::acquire_lifecycle(&directory)?;
+    if start_locked(&home, &paths, &directory)? {
+        println!("ego-lite-bridge started");
+    } else {
+        println!("ego-lite-bridge is running");
+    }
+    Ok(0)
+}
+
+#[cfg(target_os = "macos")]
+fn start_locked(
+    home: &Path,
+    paths: &daemon::ApplicationPaths,
+    directory: &ipc::SecureDirectory,
+) -> io::Result<bool> {
     if let Ok(control::Response::Status {
         state: control::DaemonState::Running,
         ..
     }) = control::probe(&paths.control_socket, CONTROL_TIMEOUT)
     {
-        println!("ego-lite-bridge is running");
-        return Ok(0);
+        return Ok(false);
     }
     let uid = unsafe { libc::geteuid() };
     launchd::bootout(uid)?;
-    wait_for_daemon_exit(&directory, LIFECYCLE_TIMEOUT)?;
+    wait_for_daemon_exit(directory, LIFECYCLE_TIMEOUT)?;
     let browser = resolve_ego_browser()?;
-    daemon::clear_stop_intent(&home, &browser)?;
     let bridge = std::env::current_exe()?.canonicalize()?;
-    let plist_path = launchd::plist_path(&home)?;
-    launchd::install(&plist_path, &launchd::plist(&bridge, &browser)?)?;
-    launchd::start(uid, &plist_path)?;
+    start_stopped_with_browser_locked(home, paths, directory, &bridge, &browser)?;
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn start_stopped_with_browser_locked(
+    home: &Path,
+    paths: &daemon::ApplicationPaths,
+    directory: &ipc::SecureDirectory,
+    bridge: &Path,
+    browser: &Path,
+) -> io::Result<()> {
+    wait_for_daemon_exit(directory, LIFECYCLE_TIMEOUT)?;
+    daemon::clear_stop_intent(home, browser)?;
+    let plist_path = launchd::plist_path(home)?;
+    launchd::install(&plist_path, &launchd::plist(bridge, browser)?)?;
+    launchd::start(unsafe { libc::geteuid() }, &plist_path)?;
     if let Err(error) = poll_until(LIFECYCLE_TIMEOUT, || running(&paths.control_socket)) {
-        launchd::bootout(uid)?;
+        launchd::bootout(unsafe { libc::geteuid() })?;
         return Err(error);
     }
-    println!("ego-lite-bridge started");
-    Ok(0)
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -122,52 +157,117 @@ fn run_stop() -> io::Result<i32> {
     let paths = daemon::application_paths(&home)?;
     let directory = daemon::open_application_directory(&home)?;
     let _lifecycle_lock = daemon::DaemonLock::acquire_lifecycle(&directory)?;
-    let socket = paths.control_socket;
+    let (was_running, cleanup_confirmed) = stop_locked(&home, &paths)?;
+    if was_running && !cleanup_confirmed {
+        eprintln!("ego-lite-bridge stopped, but worker cleanup was not confirmed");
+        Ok(1)
+    } else {
+        println!(
+            "ego-lite-bridge {}",
+            if was_running { "stopped" } else { "is stopped" }
+        );
+        Ok(0)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+enum UpgradeStopError {
+    Operational(io::Error),
+    CleanupUnconfirmed(io::Error),
+}
+
+#[cfg(target_os = "macos")]
+fn stop_locked(home: &Path, paths: &daemon::ApplicationPaths) -> io::Result<(bool, bool)> {
+    stop_locked_for_upgrade(home, paths).map_err(|error| match error {
+        UpgradeStopError::Operational(error) | UpgradeStopError::CleanupUnconfirmed(error) => error,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn stop_locked_for_upgrade(
+    home: &Path,
+    paths: &daemon::ApplicationPaths,
+) -> Result<(bool, bool), UpgradeStopError> {
+    stop_locked_with_expectation(home, paths, false)
+}
+
+#[cfg(target_os = "macos")]
+fn stop_running_locked_for_upgrade(
+    home: &Path,
+    paths: &daemon::ApplicationPaths,
+) -> Result<(bool, bool), UpgradeStopError> {
+    stop_locked_with_expectation(home, paths, true)
+}
+
+#[cfg(target_os = "macos")]
+fn stop_locked_with_expectation(
+    home: &Path,
+    paths: &daemon::ApplicationPaths,
+    cleanup_required: bool,
+) -> Result<(bool, bool), UpgradeStopError> {
+    let socket = &paths.control_socket;
     if matches!(
-        control::probe(&socket, CONTROL_TIMEOUT),
+        control::probe(socket, CONTROL_TIMEOUT),
         Err(control::ControlError::VersionMismatch { .. })
     ) {
         let uid = unsafe { libc::geteuid() };
         stop_unresponsive(
-            || daemon::persist_stop_intent(&home),
+            || daemon::persist_stop_intent(home),
             || launchd::bootout(uid),
-        )?;
-        println!("ego-lite-bridge is stopped");
-        return Ok(0);
+        )
+        .map_err(UpgradeStopError::Operational)?;
+        if cleanup_required {
+            return Err(UpgradeStopError::CleanupUnconfirmed(io::Error::other(
+                "daemon protocol changed before worker cleanup could be confirmed",
+            )));
+        }
+        return Ok(forced_stop_outcome(true));
     }
-    if !running(&socket)? {
+    if !running(socket).map_err(UpgradeStopError::Operational)? {
         let uid = unsafe { libc::geteuid() };
+        let was_running = launchd::loaded(uid).map_err(UpgradeStopError::Operational)?;
         stop_unresponsive(
-            || daemon::persist_stop_intent(&home),
+            || daemon::persist_stop_intent(home),
             || launchd::bootout(uid),
-        )?;
-        println!("ego-lite-bridge is stopped");
-        return Ok(0);
+        )
+        .map_err(UpgradeStopError::Operational)?;
+        if cleanup_required {
+            return Err(UpgradeStopError::CleanupUnconfirmed(io::Error::other(
+                "daemon became unavailable before worker cleanup could be confirmed",
+            )));
+        }
+        return Ok(forced_stop_outcome(was_running));
     }
-    let response = std::os::unix::net::UnixStream::connect(&socket)
+    let response = std::os::unix::net::UnixStream::connect(socket)
         .map_err(control::ControlError::Transport)
         .and_then(|mut stream| {
             control::request(&mut stream, CLEANUP_TIMEOUT, control::Request::Shutdown)
         })
-        .map_err(|error| control_io_error(&error))?;
+        .map_err(|error| UpgradeStopError::Operational(control_io_error(&error)))?;
     let cleanup_confirmed = match response {
         control::Response::ShutdownAccepted { cleanup_confirmed } => cleanup_confirmed,
         response => {
-            return Err(io::Error::other(format!(
+            return Err(UpgradeStopError::Operational(io::Error::other(format!(
                 "unexpected shutdown response: {response:?}"
-            )))
+            ))))
         }
     };
-    poll_until(LIFECYCLE_TIMEOUT, || running(&socket).map(|value| !value))?;
-    let uid = unsafe { libc::geteuid() };
-    launchd::bootout(uid)?;
-    if cleanup_confirmed {
-        println!("ego-lite-bridge stopped");
-        Ok(0)
-    } else {
-        eprintln!("ego-lite-bridge stopped, but worker cleanup was not confirmed");
-        Ok(1)
-    }
+    let classify = |error| {
+        if cleanup_confirmed {
+            UpgradeStopError::Operational(error)
+        } else {
+            UpgradeStopError::CleanupUnconfirmed(error)
+        }
+    };
+    poll_until(LIFECYCLE_TIMEOUT, || running(socket).map(|value| !value)).map_err(&classify)?;
+    launchd::bootout(unsafe { libc::geteuid() }).map_err(classify)?;
+    Ok((true, cleanup_confirmed))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn forced_stop_outcome(was_running: bool) -> (bool, bool) {
+    (was_running, !was_running)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -674,6 +774,315 @@ fn run_remote(_args: &[OsString]) -> io::Result<i32> {
     unsupported("remote")
 }
 
+#[cfg(target_os = "linux")]
+fn run_upgrade() -> io::Result<i32> {
+    let current_exe = std::env::current_exe()?.canonicalize()?;
+    let upgrade_lock = release::UpgradeLock::acquire(&current_exe)?;
+    let manifest = release::fetch_manifest()?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    if !release::upgrade_available(current_version, &manifest.version)? {
+        println!("ego-lite-bridge is already up to date (v{current_version})");
+        return Ok(0);
+    }
+    let prepared = release::prepare_upgrade(&upgrade_lock, &manifest)?;
+    let version = prepared.version().to_owned();
+    prepared.commit_linux().map_err(io::Error::other)?;
+    println!("ego-lite-bridge upgraded to v{version}");
+    match release::packaged_skill_changed(&manifest, current_version) {
+        Ok(true) => offer_skill_install(&manifest, &version)?,
+        Ok(false) => {}
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "bridge upgraded; optional ego-browser skill update status unknown: {error}; run 'ego-lite-bridge skill install' later"
+                ),
+            ));
+        }
+    }
+    Ok(0)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Eq, PartialEq)]
+enum SkillPromptAnswer {
+    Install,
+    Skip,
+}
+
+#[cfg(target_os = "linux")]
+fn prompt_skill_install(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+) -> io::Result<SkillPromptAnswer> {
+    loop {
+        write!(writer, "Update the optional ego-browser skill? [Y/n] ")?;
+        writer.flush()?;
+        let mut answer = String::new();
+        if reader.read_line(&mut answer)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "input closed before answering the optional ego-browser skill prompt",
+            ));
+        }
+        match answer
+            .trim_end_matches(['\r', '\n'])
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "y" | "yes" => return Ok(SkillPromptAnswer::Install),
+            "n" | "no" => return Ok(SkillPromptAnswer::Skip),
+            _ => writeln!(writer, "Please answer yes or no.")?,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn offer_skill_install(manifest: &release::ReleaseManifest, version: &str) -> io::Result<()> {
+    let tty = release::acquire_skill_tty().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "bridge upgraded; optional ego-browser skill installation incomplete: {error}; run 'ego-lite-bridge skill install' later"
+            ),
+        )
+    })?;
+    let mut reader = io::BufReader::new(tty.try_clone()?);
+    let mut writer = tty.try_clone()?;
+    let answer = prompt_skill_install(&mut reader, &mut writer).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "bridge upgraded; optional ego-browser skill installation incomplete: {error}; run 'ego-lite-bridge skill install' later"
+            ),
+        )
+    })?;
+    match answer {
+        SkillPromptAnswer::Install => {
+            drop(reader);
+            drop(writer);
+            if let Err(error) = release::install_skill(manifest, version, tty) {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "bridge upgraded; optional ego-browser skill installation incomplete: {error}; run 'ego-lite-bridge skill install' later"
+                    ),
+                ));
+            }
+            println!(
+                "ego-browser skill installation flow completed; see the skills CLI output above"
+            );
+        }
+        SkillPromptAnswer::Skip => {
+            println!(
+                "ego-browser skill was not updated; run 'ego-lite-bridge skill install' later"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpgradeDaemonState {
+    Running,
+    Stopped,
+    Unknown,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn coordinate_mac_upgrade(
+    initial_state: UpgradeDaemonState,
+    destination: &Path,
+    browser: Option<&Path>,
+    mut stop: impl FnMut() -> Result<bool, UpgradeStopError>,
+    mut observe: impl FnMut() -> UpgradeDaemonState,
+    commit: impl FnOnce() -> Result<(), release::CommitError>,
+    mut restart: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let running_browser = match initial_state {
+        UpgradeDaemonState::Running => Some(browser.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "running daemon has no browser path",
+            )
+        })?),
+        UpgradeDaemonState::Stopped => None,
+        UpgradeDaemonState::Unknown => {
+            return Err(io::Error::other(
+                "daemon state is unknown; stop it before upgrading",
+            ))
+        }
+    };
+
+    if let Some(browser) = running_browser {
+        match stop() {
+            Ok(true) => {}
+            Ok(false) => return Err(io::Error::other(
+                "daemon stopped, but worker cleanup was not confirmed; upgrade was not committed",
+            )),
+            Err(UpgradeStopError::CleanupUnconfirmed(error)) => {
+                return Err(io::Error::other(format!(
+                    "daemon stopped, but worker cleanup was not confirmed; upgrade was not committed: {error}"
+                )));
+            }
+            Err(UpgradeStopError::Operational(error)) => {
+                if observe() == UpgradeDaemonState::Stopped {
+                    restart(destination, browser).map_err(|restart| {
+                        io::Error::other(format!(
+                            "could not stop daemon for upgrade: {error}; the previous daemon could not be restored: {restart}"
+                        ))
+                    })?;
+                }
+                return Err(io::Error::other(format!(
+                    "could not stop daemon for upgrade: {error}"
+                )));
+            }
+        }
+    }
+
+    match commit() {
+        Ok(()) => {
+            if let Some(browser) = running_browser {
+                restart(destination, browser).map_err(|error| {
+                    io::Error::other(format!(
+                        "upgrade was committed, but the daemon could not be restarted: {error}"
+                    ))
+                })?;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(browser) = running_browser {
+                restart(destination, browser).map_err(|restart| {
+                    io::Error::other(format!(
+                        "{error}; the daemon could not be restored: {restart}"
+                    ))
+                })?;
+            }
+            Err(io::Error::other(error))
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn classify_upgrade_daemon_state(
+    probe: Result<control::Response, control::ControlError>,
+    launchd_loaded: io::Result<bool>,
+    acquire_daemon_lock: impl FnOnce() -> io::Result<()>,
+) -> UpgradeDaemonState {
+    match probe {
+        Ok(control::Response::Status {
+            state: control::DaemonState::Running,
+            ..
+        })
+        | Err(control::ControlError::VersionMismatch { .. }) => UpgradeDaemonState::Running,
+        _ if matches!(launchd_loaded, Ok(false)) && acquire_daemon_lock().is_ok() => {
+            UpgradeDaemonState::Stopped
+        }
+        _ => UpgradeDaemonState::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn upgrade_daemon_state(
+    paths: &daemon::ApplicationPaths,
+    directory: &ipc::SecureDirectory,
+) -> UpgradeDaemonState {
+    classify_upgrade_daemon_state(
+        control::probe(&paths.control_socket, CONTROL_TIMEOUT),
+        launchd::loaded(unsafe { libc::geteuid() }),
+        || daemon::DaemonLock::acquire(directory).map(drop),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_state_after_stop(
+    paths: &daemon::ApplicationPaths,
+    directory: &ipc::SecureDirectory,
+) -> UpgradeDaemonState {
+    if matches!(
+        control::probe(&paths.control_socket, CONTROL_TIMEOUT),
+        Ok(control::Response::Status {
+            state: control::DaemonState::Running,
+            ..
+        })
+    ) {
+        return UpgradeDaemonState::Running;
+    }
+    match daemon::DaemonLock::acquire(directory) {
+        Ok(lock) => {
+            drop(lock);
+            UpgradeDaemonState::Stopped
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => UpgradeDaemonState::Unknown,
+        Err(_) => UpgradeDaemonState::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_upgrade() -> io::Result<i32> {
+    let current_exe = std::env::current_exe()?.canonicalize()?;
+    let upgrade_lock = release::UpgradeLock::acquire(&current_exe)?;
+    let manifest = release::fetch_manifest()?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    if !release::upgrade_available(current_version, &manifest.version)? {
+        println!("ego-lite-bridge is already up to date (v{current_version})");
+        return Ok(0);
+    }
+    let prepared = release::prepare_upgrade(&upgrade_lock, &manifest)?;
+    let version = prepared.version().to_owned();
+    let home = home_directory()?;
+    let paths = daemon::application_paths(&home)?;
+    let directory = daemon::open_application_directory(&home)?;
+    let _lifecycle_lock = daemon::DaemonLock::acquire_lifecycle(&directory)?;
+    let initial_state = upgrade_daemon_state(&paths, &directory);
+    let browser = if initial_state == UpgradeDaemonState::Running {
+        Some(daemon::configured_ego_browser(&home)?)
+    } else {
+        None
+    };
+    coordinate_mac_upgrade(
+        initial_state,
+        &current_exe,
+        browser.as_deref(),
+        || {
+            stop_running_locked_for_upgrade(&home, &paths)
+                .map(|(_, cleanup_confirmed)| cleanup_confirmed)
+        },
+        || daemon_state_after_stop(&paths, &directory),
+        || prepared.commit(),
+        |bridge, browser| {
+            start_stopped_with_browser_locked(&home, &paths, &directory, bridge, browser)
+        },
+    )?;
+    println!("ego-lite-bridge upgraded to v{version}");
+    if initial_state == UpgradeDaemonState::Running {
+        println!("ego-lite-bridge started");
+    } else {
+        println!("ego-lite-bridge daemon remains stopped");
+    }
+    Ok(0)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn run_upgrade() -> io::Result<i32> {
+    release::release_target().map(|_| 0)
+}
+
+#[cfg(target_os = "linux")]
+fn run_skill_install() -> io::Result<i32> {
+    release::install_latest_skill()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_skill_install() -> io::Result<i32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "skill install is only supported on Linux",
+    ))
+}
+
 #[cfg(target_os = "macos")]
 fn run_daemon(browser: &Path) -> io::Result<i32> {
     let home = home_directory()?;
@@ -806,12 +1215,57 @@ mod tests {
             run(&["ego-lite-bridge".into(), "unknown".into()]).expect("dispatch"),
             2
         );
-        for flag in ["--help", "-h", "--version", "-V"] {
+        for args in [
+            vec!["--help", "extra"],
+            vec!["-h", "extra"],
+            vec!["--version", "extra"],
+            vec!["-V", "extra"],
+            vec!["upgrade", "extra"],
+            vec!["skill"],
+            vec!["skill", "remove"],
+            vec!["skill", "install", "extra"],
+        ] {
+            let args: Vec<_> = std::iter::once(OsString::from("ego-lite-bridge"))
+                .chain(args.into_iter().map(OsString::from))
+                .collect();
+            assert_eq!(run(&args).expect("dispatch"), 2);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn skill_prompt_accepts_answers_and_retries() {
+        for input in ["\n", "y\n", "yes\n"] {
+            let mut reader = io::Cursor::new(input.as_bytes());
+            let mut writer = Vec::new();
             assert_eq!(
-                run(&["ego-lite-bridge".into(), flag.into(), "extra".into()]).expect("dispatch"),
-                2
+                prompt_skill_install(&mut reader, &mut writer).expect("prompt"),
+                SkillPromptAnswer::Install
             );
         }
+
+        let mut reader = io::Cursor::new(b"maybe\n   \nno\n");
+        let mut writer = Vec::new();
+        assert_eq!(
+            prompt_skill_install(&mut reader, &mut writer).expect("prompt"),
+            SkillPromptAnswer::Skip
+        );
+        assert_eq!(
+            String::from_utf8(writer)
+                .expect("utf8")
+                .matches("Please answer yes or no.")
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn skill_prompt_rejects_eof() {
+        let mut reader = io::Cursor::new(Vec::new());
+        let mut writer = Vec::new();
+        let error = prompt_skill_install(&mut reader, &mut writer).expect_err("eof");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -960,6 +1414,12 @@ mod tests {
     }
 
     #[test]
+    fn forced_stop_marks_only_a_previously_running_daemon_unconfirmed() {
+        assert_eq!(forced_stop_outcome(true), (true, false));
+        assert_eq!(forced_stop_outcome(false), (false, true));
+    }
+
+    #[test]
     fn unresponsive_stop_persists_before_bootout_and_propagates_failure() {
         let calls = std::cell::RefCell::new(Vec::new());
         let error = stop_unresponsive(
@@ -975,5 +1435,246 @@ mod tests {
         .expect_err("bootout failure must fail stop");
         assert_eq!(*calls.borrow(), ["persist", "bootout"]);
         assert_eq!(error.to_string(), "still loaded");
+    }
+
+    fn mac_upgrade(
+        initial_state: UpgradeDaemonState,
+        browser: Option<&Path>,
+        cleanup: Result<bool, UpgradeStopError>,
+        observed: UpgradeDaemonState,
+        commit: Result<(), release::CommitError>,
+        restart_error: Option<&str>,
+    ) -> (io::Result<()>, Vec<String>) {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = coordinate_mac_upgrade(
+            initial_state,
+            Path::new("/installed/ego-lite-bridge"),
+            browser,
+            || {
+                calls.borrow_mut().push("stop".into());
+                match cleanup.as_ref() {
+                    Ok(value) => Ok(*value),
+                    Err(UpgradeStopError::Operational(error)) => {
+                        Err(UpgradeStopError::Operational(io::Error::new(
+                            error.kind(),
+                            error.to_string(),
+                        )))
+                    }
+                    Err(UpgradeStopError::CleanupUnconfirmed(error)) => {
+                        Err(UpgradeStopError::CleanupUnconfirmed(io::Error::new(
+                            error.kind(),
+                            error.to_string(),
+                        )))
+                    }
+                }
+            },
+            || {
+                calls.borrow_mut().push("observe".into());
+                observed
+            },
+            || {
+                calls.borrow_mut().push("commit".into());
+                commit
+            },
+            |bridge, browser| {
+                calls.borrow_mut().push(format!(
+                    "restart:{}:{}",
+                    bridge.display(),
+                    browser.display()
+                ));
+                restart_error.map_or(Ok(()), |error| Err(io::Error::other(error)))
+            },
+        );
+        (result, calls.into_inner())
+    }
+
+    #[test]
+    fn mac_upgrade_running_orders_stop_commit_restart_with_persisted_paths() {
+        let (result, calls) = mac_upgrade(
+            UpgradeDaemonState::Running,
+            Some(Path::new("/persisted/ego-browser")),
+            Ok(true),
+            UpgradeDaemonState::Stopped,
+            Ok(()),
+            None,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            calls,
+            [
+                "stop",
+                "commit",
+                "restart:/installed/ego-lite-bridge:/persisted/ego-browser"
+            ]
+        );
+    }
+
+    #[test]
+    fn mac_upgrade_stopped_only_commits() {
+        let (result, calls) = mac_upgrade(
+            UpgradeDaemonState::Stopped,
+            None,
+            Ok(true),
+            UpgradeDaemonState::Stopped,
+            Ok(()),
+            None,
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls, ["commit"]);
+    }
+
+    #[test]
+    fn mac_upgrade_unconfirmed_cleanup_aborts_stopped_without_commit_or_restart() {
+        let (result, calls) = mac_upgrade(
+            UpgradeDaemonState::Running,
+            Some(Path::new("/persisted/ego-browser")),
+            Ok(false),
+            UpgradeDaemonState::Stopped,
+            Ok(()),
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, ["stop"]);
+    }
+
+    #[test]
+    fn mac_upgrade_before_rename_restores_old_daemon_and_fails() {
+        let (result, calls) = mac_upgrade(
+            UpgradeDaemonState::Running,
+            Some(Path::new("/persisted/ego-browser")),
+            Ok(true),
+            UpgradeDaemonState::Stopped,
+            Err(release::CommitError::BeforeRename(io::Error::other(
+                "rename failed",
+            ))),
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], "stop");
+        assert_eq!(calls[1], "commit");
+        assert!(calls[2].starts_with("restart:/installed/ego-lite-bridge:"));
+    }
+
+    #[test]
+    fn mac_upgrade_unknown_durability_restarts_destination_but_fails() {
+        let (result, calls) = mac_upgrade(
+            UpgradeDaemonState::Running,
+            Some(Path::new("/persisted/ego-browser")),
+            Ok(true),
+            UpgradeDaemonState::Stopped,
+            Err(release::CommitError::DurabilityUnknown {
+                error: io::Error::other("sync failed"),
+                committed: true,
+            }),
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[1], "commit");
+        assert_eq!(
+            calls[2],
+            "restart:/installed/ego-lite-bridge:/persisted/ego-browser"
+        );
+    }
+
+    #[test]
+    fn mac_upgrade_restart_failure_is_nonzero_after_commit() {
+        let (result, calls) = mac_upgrade(
+            UpgradeDaemonState::Running,
+            Some(Path::new("/persisted/ego-browser")),
+            Ok(true),
+            UpgradeDaemonState::Stopped,
+            Ok(()),
+            Some("start failed"),
+        );
+        assert!(result
+            .expect_err("restart failure")
+            .to_string()
+            .contains("upgrade was committed"));
+        assert_eq!(calls.len(), 3);
+    }
+
+    #[test]
+    fn mac_upgrade_cleanup_unconfirmed_error_never_restarts() {
+        let (result, calls) = mac_upgrade(
+            UpgradeDaemonState::Running,
+            Some(Path::new("/persisted/ego-browser")),
+            Err(UpgradeStopError::CleanupUnconfirmed(io::Error::other(
+                "bootout failed",
+            ))),
+            UpgradeDaemonState::Stopped,
+            Ok(()),
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, ["stop"]);
+    }
+
+    #[test]
+    fn upgrade_state_treats_version_mismatch_as_running_and_requires_lock_for_stopped() {
+        assert_eq!(
+            classify_upgrade_daemon_state(
+                Err(control::ControlError::VersionMismatch {
+                    expected: 4,
+                    received: 3,
+                }),
+                Ok(true),
+                || Ok(()),
+            ),
+            UpgradeDaemonState::Running
+        );
+        assert_eq!(
+            classify_upgrade_daemon_state(
+                Err(control::ControlError::Transport(io::Error::other("absent"))),
+                Ok(false),
+                || Ok(()),
+            ),
+            UpgradeDaemonState::Stopped
+        );
+        assert_eq!(
+            classify_upgrade_daemon_state(
+                Err(control::ControlError::Transport(io::Error::other("absent"))),
+                Ok(false),
+                || Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            ),
+            UpgradeDaemonState::Unknown
+        );
+        assert_eq!(
+            classify_upgrade_daemon_state(
+                Err(control::ControlError::Transport(io::Error::other(
+                    "relaunching"
+                ))),
+                Ok(true),
+                || Ok(()),
+            ),
+            UpgradeDaemonState::Unknown
+        );
+    }
+
+    #[test]
+    fn mac_upgrade_stop_error_only_restores_when_observed_stopped() {
+        for (observed, restarts) in [
+            (UpgradeDaemonState::Stopped, true),
+            (UpgradeDaemonState::Running, false),
+            (UpgradeDaemonState::Unknown, false),
+        ] {
+            let (result, calls) = mac_upgrade(
+                UpgradeDaemonState::Running,
+                Some(Path::new("/persisted/ego-browser")),
+                Err(UpgradeStopError::Operational(io::Error::other(
+                    "stop failed",
+                ))),
+                observed,
+                Ok(()),
+                None,
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                calls.iter().any(|call| call.starts_with("restart:")),
+                restarts
+            );
+            assert!(!calls.iter().any(|call| call == "commit"));
+        }
     }
 }

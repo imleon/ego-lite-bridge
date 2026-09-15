@@ -160,20 +160,8 @@ main() {
 
 commit_binary() (
     trap '' PIPE
-    CREATED_SHIM=false
-    if [ "$os" = "linux" ] && [ ! -L "$SHIM" ]; then
-        ln -s "$BIN" "$SHIM" || err "failed to create ego-browser shim at ${SHIM}"
-        CREATED_SHIM=true
-    fi
-    if ! mv "$STAGED_BINARY" "${INSTALL_DIR}/${BIN}"; then
-        if [ "$CREATED_SHIM" = true ]; then
-            rm -f "$SHIM" || err "failed to remove new ego-browser shim at ${SHIM} after binary installation failed"
-        fi
+    if ! "${TMP}/${BIN}" installer-commit "${INSTALL_DIR}/${BIN}"; then
         err "failed to install ${BIN}"
-    fi
-
-    if [ "$CREATED_SHIM" = true ]; then
-        log "created ego-browser shim at ${SHIM}" || :
     fi
     log "installed ${BIN} to ${INSTALL_DIR}/${BIN}" || :
 )
@@ -210,7 +198,7 @@ skill_interaction_blocked() {
 }
 
 install_skill() {
-    for dependency in node npx tar; do
+    for dependency in node npx tar gzip; do
         command -v "$dependency" >/dev/null 2>&1 || skill_err "requires '$dependency' — install it first"
     done
     require_node_version

@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Added `ego-lite-bridge upgrade` for upgrading directly to the latest release, with a per-install nonblocking lock and durable same-directory staged sync, atomic rename, and directory sync. Unknown post-rename durability exits nonzero.
+- On macOS, upgrades preserve daemon state and the persisted browser path. Unconfirmed cleanup aborts without commit or restart and leaves the daemon stopped; partial-stop recovery depends on the observed state, and success is printed only after state restoration.
+- On Linux, upgrades maintain an `ego-browser` relative shim pointing to the fixed `ego-lite-bridge` binary.
+- Added Linux-only `ego-lite-bridge skill install`, which always opens the native skills CLI interface and may overwrite an existing skill; it has no force option. Agent-environment and foreground-TTY checks run before manifest fetch, and downloads use a private system-temporary directory.
+- Linux upgrades compare the packaged skill checksum in the current release's `SHA256SUMS` with the latest manifest and enter skill handling only when it changed. Only consent triggers dependency checks and a download, reusing that manifest; the comparison does not inspect Agent installation state.
+
 ## [0.1.1] - 2026-09-11
 
 ### Fixed
