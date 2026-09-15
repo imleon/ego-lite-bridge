@@ -25,6 +25,9 @@ ego-lite-bridge remote list
 ego-lite-bridge remote status 0123456789abcdef0123456789abcdef
 ego-lite-bridge remote retry 0123456789abcdef0123456789abcdef
 ego-lite-bridge remote remove 0123456789abcdef0123456789abcdef
+ego-lite-bridge upgrade
+# Linux only
+ego-lite-bridge skill install
 ```
 
 Linux 用户继续按需运行：
@@ -104,18 +107,32 @@ remote retry <config-id>
 
 - macOS installer只安装bridge binary，不询问、不安装skill；Linux先安装binary和`ego-browser` shim，成功提交后才通过可用的`/dev/tty`询问`[Y/n]`；
 - 成功读取空行（回车）或`y`/`yes`（不区分大小写）进入可选skill安装，`n`/`no`跳过，非法输入明确提示并重新询问；EOF、读取失败或无可用终端不等于同意，跳过并显示手动安装链接；
-- 同意前不检查Node.js或npm/npx、不下载skill、不触碰Agent目录；跳过时不要求Node.js、npm/npx或tar；同意后才要求Node.js 22.20.0或更高版本、`npm`/`npx`和`tar`；
+- 同意前不检查Node.js或npx、不下载skill、不触碰Agent目录；跳过时不要求Node.js、npx、tar或gzip；同意后才要求Node.js 22.20.0或更高版本、`npx`、`tar`和`gzip`；
 - 在任何skill下载或CLI启动前，使用与固定`skills@1.5.24`配套的guard检测Agent执行环境，命中时明确要求用户在普通终端运行，不启动可能自动确认的CLI，不静默清空用户环境；升级固定版本时须同步复核检测逻辑，不自建Agent安装目录探测表；
 - release继续包含vendored `ego-browser-skill.tgz`，manifest继续拥有其`skill_url`和SHA-256；可选流程复用本次binary已获取的manifest，下载同一release的skill到现有临时目录，验证可信URL、SHA-256和归档安全后解包，并检查文件完整性；资产的构建、校验和发布归属不变；
 - 固定调用`npx --yes skills@1.5.24 add <extracted-skill> --skill ego-browser --global --copy`，不传内层`--yes`、`--agent`或`--all`，stdin/stdout/stderr连接`/dev/tty`，直接运行和`curl | sh`均支持；外层`npx --yes`仅允许获取CLI，不替用户接受上游安装选项；
 - 使用上游原生Agent选择与确认界面，不自建选择器；界面受上游逻辑约束：universal target不可取消，单Agent时可能省略选择界面，不承诺只写用户勾选的目标；
 - 可选步骤失败时明确报告“bridge已安装、skill未完成”并非零退出；下载、checksum、目录创建、解包、完整性和CLI调用失败均须显式处理，不回滚bridge、不自动重试或降级；上游取消和成功可能都退出0，零退出仅报告“交互流程已结束，请以CLI输出为准”，不得一概宣称skill安装成功；CLI可能只完成部分目标写入，整体exit 0不保证每个target成功，已写入skill不回滚；
-- 保留独立的Linux手工安装选择：用户以同一显式`VERSION`下载release归档及`SHA256SUMS`，通过`grep`和`sha256sum`校验，并在`set -eu`子shell中新建工作目录后解包；该步骤同样需要Node.js 22.20.0或更高版本、`npm`/`npx`和`tar`；
+- 保留独立的Linux手工安装选择：用户以同一显式`VERSION`下载release归档及`SHA256SUMS`，通过`grep`和`sha256sum`校验，并在`set -eu`子shell中新建工作目录后解包；该步骤同样需要Node.js 22.20.0或更高版本、`npx`、`tar`和`gzip`；
 - 手工命令必须显式填写单个`AGENT_ID`，固定调用`npx --yes skills@1.5.24 add <extracted-skill> --skill ego-browser --global --agent "$AGENT_ID" --yes --copy`；仅此手工路径不得使用`*`或省略`--agent`；
 - skills CLI可能覆盖已有`ego-browser` skill及本地修改；重跑bridge installer并同意可选流程也可能覆盖，跳过则不触碰skill，不自动清理Agent目录；
 - skill保留上游通用调用内容，仅将installation reference改为Linux bridge故障排查；skill调用仍经Linux shim透明转发，真实浏览器仍在Mac执行；
 - binary manifest、下载或checksum验证失败时不提交bridge binary；验证完成后原子提交binary与shim；
-- skill分发资产、可选交互和手工安装均不属于runtime updater，不改变bridge协议或执行语义。
+- 首次installer流程保持上述行为，不复用runtime `upgrade`的skill checksum比较，也不改变bridge协议或执行语义。
+
+### 4.5 Runtime upgrade 与显式 skill 安装
+
+- `ego-lite-bridge upgrade`仅获取并升级到latest manifest指向的release；不支持指定版本、回滚、自动重试或fallback；当前版本已是latest时不替换binary，也不进入skill流程；
+- 固定`ego-lite-bridge`安装目标使用目标目录内的独立`0600`非阻塞锁；同一目标已有升级时立即以busy失败，不串行等待；
+- binary在目标同目录私有暂存文件中下载、校验并设为可执行，提交顺序固定为同步暂存文件、原子rename到目标、同步父目录；rename前失败表示未提交，父目录同步失败表示已rename但durability unknown，两者均非零退出；
+- macOS升级先记录daemon状态，并从持久配置读取、校验其canonical `ego-browser`路径；原本停止时只replace并保持停止；原本运行时先stop，worker cleanup未确认则中止升级、保持停止、不commit也不restart；
+- 其他stop错误后，仅在观测到daemon已停止时从旧binary恢复，观测到仍运行或状态未知时不restart、不commit；rename前commit失败恢复原本运行的旧daemon，rename后（包括durability unknown）从安装目标restart；start失败明确返回失败，不恢复旧binary或降级；
+- 仅在原本运行的daemon已restart，或原本停止的状态已保持后输出升级成功；任何状态恢复失败均非零退出；
+- Linux升级原子替换当前bridge binary，并创建缺失的`ego-browser` shim或保留精确指向固定`ego-lite-bridge`的相对symlink；其他对象占用shim路径时明确失败；
+- Linux升级从当前release的`SHA256SUMS`读取`ego-browser-skill.tgz` checksum，并与latest manifest中的skill checksum比较；仅checksum变化时进入skill交互，相同时完全跳过guard、TTY、依赖、下载和CLI；该比较只判断两个release打包的skill资产是否变化，不代表或探测任何Agent的安装状态；
+- checksum变化后，先执行Agent环境guard并取得前台`/dev/tty`，失败则保持skill不变；回车或`y`/`yes`后才检查依赖、复用已获取的latest manifest并下载skill到系统临时目录下私有`0700`目录，`n`/`no`或EOF保持不变；skill失败不回滚已完成的bridge升级，但整体非零退出；
+- Linux-only `ego-lite-bridge skill install`先执行Agent环境guard并取得前台TTY，再获取latest manifest；要求当前bridge版本与latest一致，然后在私有系统临时目录中下载、验证并启动skills CLI原生选择与确认界面；不先比较checksum或Agent安装状态，不提供force参数，可能覆盖已有skill及本地修改；
+- 显式skill安装沿用第4.4节的依赖、可信URL、SHA-256、归档安全、原生CLI参数与结果报告规则；macOS明确不支持该命令。
 
 ## 5. Daemon 生命周期
 
@@ -432,7 +449,7 @@ ego-lite-bridge doctor [config-id]
 - 非SSH transport；
 - Windows；
 - daemon GUI或TUI；
-- bridge或skill的runtime自动更新；skill只在用户同意的可选交互流程或独立手工步骤中安装，重跑installer并同意时可能覆盖已有skill；
+- 后台自动更新、指定版本升级、回滚或跨版本迁移；显式`upgrade`仅升级到latest，显式Linux `skill install`仅运行原生交互；
 - dashboard或metrics框架；
 - owner手工强制抢占；
 - hostname/IP/SSH alias规范化；
@@ -481,7 +498,7 @@ ego-lite-bridge doctor [config-id]
 - 下载产物包含保持可执行权限的`tar.gz`候选bundle及其disabled manifest；
 - 维护者在干净的Linux x86_64与macOS arm64环境手工验证安装、daemon控制面、Remote CRUD和一次真实`ego-browser`调用；保留可选手工skill步骤的同一显式版本、checksum校验、单个显式Agent ID及固定`skills@1.5.24`命令验证；macOS保持binary-only且不询问；
 - 上一轮Linux binary/shim-only流程已由用户实机验收通过；本次新增的可选交互流程另行验收，当前待测，不撤销此前验收结论；
-- 新增验收：无TTY、no和EOF均不下载skill、不调用npx、不触碰Agent目录，即使无Node/npx/tar也能完成bridge安装；TTY回车或yes在bridge提交后进入原生交互，非法输入重询，直接运行和管道stdin均有效；
+- 新增验收：无TTY、no和EOF均不下载skill、不调用npx、不触碰Agent目录，即使无Node/npx/tar/gzip也能完成bridge安装；TTY回车或yes在bridge提交后进入原生交互，非法输入重询，直接运行和管道stdin均有效；
 - 新增验收：同意后才检查依赖，并基于本次manifest校验同一release skill的URL、SHA-256和归档安全；缺依赖、旧Node、下载/校验/解包/完整性或CLI失败均明确部分完成、非零退出且保留bridge；
 - 新增验收：Agent环境guard明确要求普通终端且不清空环境；原生参数保留`--global --copy`，无内层`--yes`、`--agent`或`--all`，stdio均为TTY；确认universal target和单Agent界面限制，取消退出0不误报成功，重跑并确认可能覆盖已有skill；
 - 实际发布前`distribution/latest.json`保持`available: false`，工作流不更新release metadata。

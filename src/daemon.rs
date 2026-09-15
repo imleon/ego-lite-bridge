@@ -68,6 +68,16 @@ pub(crate) fn open_application_directory(home: &Path) -> io::Result<SecureDirect
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn configured_ego_browser(home: &Path) -> io::Result<PathBuf> {
+    let directory = open_application_directory(home)?;
+    let store = config::ConfigStore::open(directory.path())?;
+    let config = store
+        .load()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "config not found"))?;
+    validate_ego_browser(Path::new(&config.ego_browser_path))
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn clear_stop_intent(home: &Path, ego_browser: &Path) -> io::Result<()> {
     let browser = validate_ego_browser(ego_browser)?;
     let directory = open_application_directory(home)?;

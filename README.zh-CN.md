@@ -19,7 +19,7 @@ Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-brow
 
 ## 发布状态
 
-版本 0.1.1 为 `linux-x86_64` 和 `macos-aarch64` 提供预编译二进制，用户无需安装 Rust 或从源码构建。Linux 发行版是静态 `x86_64-unknown-linux-musl` binary，macOS 发行版是原生 `aarch64-apple-darwin` binary。
+版本 0.1.2 为 `linux-x86_64` 和 `macos-aarch64` 提供预编译二进制，用户无需安装 Rust 或从源码构建。Linux 发行版是静态 `x86_64-unknown-linux-musl` binary，macOS 发行版是原生 `aarch64-apple-darwin` binary。
 
 ## 快速开始
 
@@ -35,23 +35,31 @@ Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-brow
 curl -fsSL https://raw.githubusercontent.com/imleon/ego-lite-bridge/master/distribution/install.sh | sh
 ```
 
-安装器会使用发行 manifest 中的 SHA-256 校验二进制。在 macOS 上只安装 `ego-lite-bridge`，不询问 skill 安装。在 Linux 上成功提交 binary 和 `ego-browser` shim 后，通过 `/dev/tty` 询问 `[Y/n]`：回车或 `y`/`yes`（不区分大小写）进入可选 skill 安装；`n`/`no` 跳过；非法输入重新询问。EOF、读取失败或无可用终端时跳过 skill 并显示手动安装链接。跳过时不需要 Node.js、npm/npx 或 tar，也不触碰 Agent 目录。
+安装器会使用发行 manifest 中的 SHA-256 校验二进制。在 macOS 上只安装 `ego-lite-bridge`，不询问 skill 安装。在 Linux 上成功提交 binary 和 `ego-browser` shim 后，通过 `/dev/tty` 询问 `[Y/n]`：回车或 `y`/`yes`（不区分大小写）进入可选 skill 安装；`n`/`no` 跳过；非法输入重新询问。EOF、读取失败或无可用终端时跳过 skill 并显示手动安装链接。跳过时不需要 Node.js、npx、tar 或 gzip，也不触碰 Agent 目录。
 
-只有同意后，可选步骤才要求 Node.js 22.20.0 或更高版本、`npm`/`npx` 和 `tar`。安装器复用本次 binary 已获取的 manifest，下载同一 release 的 skill，校验 SHA-256、检查归档安全后解包。在任何 skill 下载或 CLI 启动前，与固定 `skills@1.5.24` 版本配套的 guard 会检测 Agent 执行环境；命中时明确要求用户在普通终端重跑，不静默清空环境变量，也不启动可能自动确认的 CLI。
+只有同意后，可选步骤才要求 Node.js 22.20.0 或更高版本、`npx`、`tar` 和 `gzip`。安装器复用本次 binary 已获取的 manifest，下载同一 release 的 skill，校验 SHA-256、检查归档安全后解包。在任何 skill 下载或 CLI 启动前，与固定 `skills@1.5.24` 版本配套的 guard 会检测 Agent 执行环境；命中时明确要求用户在普通终端重跑，不静默清空环境变量，也不启动可能自动确认的 CLI。
 
 安装器运行 `npx --yes skills@1.5.24 add <extracted-skill> --skill ego-browser --global --copy`，stdin、stdout、stderr 均连接 `/dev/tty`，同样支持 `curl | sh`。外层 `npx --yes` 允许获取 CLI；不传内层 `--yes`、`--agent` 或 `--all`。Agent 选择与确认使用上游原生界面，不自建选择器：universal target 不可取消，单 Agent 环境可能省略选择界面。默认 `[Y/n]` 不代表替用户接受全部上游选项。
 
 可选步骤失败时，安装器非零退出并明确说明 bridge 已安装、skill 步骤未完成；不回滚 bridge，不自动重试或降级。上游取消也可能退出 0，因此零退出只表示交互流程已结束，请以上游 CLI 输出为准，不一概报告 skill 安装成功。CLI 可能只完成部分目标写入，整体 exit 0 不保证每个目标成功，已写入的 skill 不会回滚。
 
 <a id="optional-agent-skill-installation"></a>
-### 可选的 Agent skill 手工安装
+### 可选的 Agent skill 安装
 
-release 保留 vendored `ego-browser-skill.tgz` 资产，以及 manifest 中对应的 URL 和 SHA-256。除了安装器的原生交互流程，也可以独立选择在 Linux 上为明确的 Agent 手工安装，需要 Node.js 22.20.0 或更高版本、`npm`/`npx` 和 `tar`。将 `VERSION` 设置为已安装 bridge 的同一明确 release 版本，并在 shell 中将 `AGENT_ID` 设置为 skills CLI 支持的一个明确 Agent ID；此手工命令不得省略 `--agent` 或使用 `*`。
+在 Linux 上，可显式安装 latest release 中的 skill：
+
+```bash
+ego-lite-bridge skill install
+```
+
+该命令总是打开 skills CLI 原生选择与确认界面；它不推断 Agent 安装状态，不提供 `--force`，并且可能覆盖已有 `ego-browser` skill 及其本地修改。获取 latest manifest 前，它会拒绝 Agent 执行环境并要求当前进程持有前台 `/dev/tty`；随后才要求 Node.js 22.20.0 或更高版本、`npx`、`tar` 和 `gzip`，校验当前 bridge 版本与 latest release 一致，并把 skill 下载到系统临时目录下私有的 `0700` 目录。版本不匹配时明确失败，不会回退到其他 skill 版本。vendored skill 仍作为 release asset 和 manifest entry 管理，其调用仍经 Linux shim 转发到 Mac 上运行的真实浏览器。
+
+既有的固定 release 手工替代路径继续保留：将 `VERSION` 设为当前已安装 bridge 的明确 release，并将 `AGENT_ID` 设为一个明确的 skills CLI Agent ID：
 
 ```bash
 (
   set -eu
-  VERSION=0.1.1
+  VERSION=0.1.2
   : "${AGENT_ID:?请将 AGENT_ID 设置为一个明确的 skills CLI Agent ID}"
   WORK_DIR="$(mktemp -d)"
   trap 'rm -rf "$WORK_DIR"' EXIT
@@ -68,7 +76,7 @@ release 保留 vendored `ego-browser-skill.tgz` 资产，以及 manifest 中对�
 )
 ```
 
-skills CLI 可能覆盖该 Agent 已有的 `ego-browser` skill，包括本地修改。重跑 bridge installer 并同意可选流程也可能覆盖已有 skill；跳过则保持不变。这不是 runtime updater，也不会自动清理 skill。vendored skill 仍作为 release asset 和 manifest entry 管理。skill 调用仍经 Linux shim 转发到 Mac 上运行的真实浏览器。
+该手工路径不得省略 `--agent` 或使用 `*`，也可能覆盖所选 Agent 已有的 skill。
 
 如果希望手工下载和安装 bridge，请在两台机器上分别运行对应命令。以下步骤只安装 bridge binary 和 Linux shim。
 
@@ -109,9 +117,21 @@ ego-browser <args...>
 
 daemon 会在短暂的 SSH 或网络故障后自动重连。
 
+## 升级
+
+运行 `ego-lite-bridge upgrade` 直接升级到 latest release；不支持选择其他版本。固定的 `ego-lite-bridge` 安装使用非阻塞升级锁，因此同一安装位置已有升级进行时会立即以 busy 失败。校验后的下载先暂存到目标同目录，依次同步暂存文件、原子 rename、同步父目录。rename 前失败时旧 binary 保持不变；父目录同步失败表示替换可能已经完成但 durability unknown，命令仍非零退出。
+
+在 macOS 上，若 daemon 原本运行，升级会先停止 daemon，替换后使用持久配置中的 canonical `ego-browser` 路径重启；若原本停止，则保持停止。若停止操作报告 worker cleanup 未确认，升级中止，不 commit、不重启，并保持 daemon 停止。其他 stop 错误发生后，仅在确认 daemon 已停止时恢复旧 daemon；若仍在运行或状态未知，则不重启也不 commit。rename 前 commit 失败会用旧 binary 恢复原本运行的 daemon；rename 后（包括 durability unknown）则从已安装目标重启。只有恢复原有运行/停止状态后才输出成功；重启失败非零退出。
+
+在 Linux 上，命令替换 bridge binary，并创建缺失的 `ego-browser` shim，或保留已有的精确相对 symlink。shim 固定指向 `ego-lite-bridge` binary；shim 路径被其他对象占用时明确失败。
+
+Linux 升级时，命令读取当前已安装 release 的 `SHA256SUMS` 中所记录的 skill checksum，并与 latest manifest 比较。只有两个 release checksum 不同时才询问 `Update the optional ego-browser skill? [Y/n]`；相同时完全跳过 skill 流程。该比较只表示 release 中打包的 skill 资产是否变化，不检查任何 Agent 是否已安装 skill，也不检查已安装副本是否被修改。询问前会执行 Agent 环境 guard 并要求前台 `/dev/tty`；失败时保持 skill 不变。选择 no 或 EOF 也保持不变。只有回车或 `y`/`yes` 后才检查依赖，并复用已获取的 latest manifest，将 skill 下载到系统临时目录下的私有目录。skill 失败不回滚已完成的 bridge 升级，但命令非零退出。不提供 fallback。
+
+上文首次执行 `curl | sh` 的 installer 行为保持不变，与 `upgrade` 相互独立。
+
 ## 命令参考
 
-以下控制命令均在 macOS 运行：
+生命周期与 remote 控制命令在 macOS 运行；`upgrade` 支持两端，`skill install` 仅支持 Linux：
 
 | 命令 | 用途 | 成功输出 |
 | --- | --- | --- |
@@ -124,12 +144,14 @@ daemon 会在短暂的 SSH 或网络故障后自动重连。
 | `ego-lite-bridge remote retry <配置ID>` | 重试当前处于 `active/error` 的 remote。 | 更新后 remote 的 `remote list` 记录 |
 | `ego-lite-bridge remote remove <配置ID>` | 删除 remote 并清理其 worker。 | `removed <配置ID>` |
 | `ego-lite-bridge stop` | 停止 daemon 及其 worker。 | `ego-lite-bridge stopped`，已停止时为 `ego-lite-bridge is stopped` |
+| `ego-lite-bridge upgrade` | 仅升级到 latest release；保持 macOS daemon 原有运行状态，或替换 Linux binary/shim。 | `ego-lite-bridge upgraded to v<版本>`；macOS 恢复状态后再报告 `started` 或 `daemon remains stopped`；版本未变化时报告已是最新 |
+| `ego-lite-bridge skill install` | 仅 Linux：始终为匹配的 latest release 打开 skills CLI 原生界面；可能覆盖且无 force 选项。 | skills CLI 原生输出 |
 
 Desired 状态为 `pending`、`active` 和 `removing`；observed 状态为 `connecting`、`connected`、`reconnecting`、`error` 和 `removing`。当前无法获得的详情显示为 `unknown`；`active-requests` 格式为 `<活跃数>/<容量>`。所有 `[配置ID]` 或 `<配置ID>` selector 都必须是 `remote add` 或 `remote list` 输出的完整 32 字符小写十六进制 ID；不支持短前缀、名称、selector alias、迁移或 fallback。
 
 `doctor` 是只读命令。M7 检查 LaunchAgent 是否 loaded、daemon 是否 running，以及配置中的 `ego-browser` 绝对路径是否有效。对每个 remote，它检查持久配置中 endpoint identity 是否存在、desired/observed 状态，以及 daemon **当前 worker 快照**中的 handshake、容量和重连/错误信息；不验证 live endpoint identity 是否与持久值匹配。`PASS` 表示被检查的本地状态或快照健康；`FAIL` 表示环境、daemon、selector 或快照检查失败；`NOT CHECKED` 明确表示 M7 没有新建 SSH 连接，也没有验证 live endpoint identity、Linux socket 权限或端到端执行。这些主动 remote 检查计划在 Post-0.1 hardening 中完成。没有 `FAIL` 时退出状态为 0，存在任一 `FAIL` 时为 1，`doctor` 语法无效时为 2。`doctor` 不修复、不安装，也不修改配置。
 
-控制命令仅支持 macOS；Linux 提供 `ego-browser` shim。
+生命周期、诊断和 remote 控制命令仅支持 macOS。Linux 提供 `ego-browser` shim、`upgrade` 和 `skill install`；macOS 也支持 `upgrade`。
 
 ## 从源码开发
 
@@ -189,13 +211,9 @@ Mac bridge 和 Linux broker 都会将生命周期及请求诊断写入 stderr。
 just test             # Rust 测试
 just installer-test   # Unix 安装器测试
 just check            # 格式、Clippy、Rust 测试和安装器测试
-
-# 可选：真实 Mac -> SSH 可达 Linux smoke（不属于 just check）
-EGO_LITE_BRIDGE_BIN=target/release/ego-lite-bridge \
-EGO_LITE_BRIDGE_SSH_TARGET=user@linux-host just e2e-manual
 ```
 
-迭代时运行最小相关测试，提交前运行 `just check`。手动 smoke 需要 `EGO_LITE_BRIDGE_BIN`（当前 macOS binary）和 `EGO_LITE_BRIDGE_SSH_TARGET`（已安装 Linux bridge 的 SSH 目标）；可用 `EGO_LITE_BRIDGE_LINUX_SHIM` 覆盖默认的 `~/.local/bin/ego-browser`。该测试会启停 daemon，不要在 daemon 正服务其他任务时运行。
+迭代时运行最小相关测试，提交前运行 `just check`。
 
 ## 许可证
 

@@ -22,6 +22,3 @@ release-test:
 
 skill-test:
     python3 -m unittest scripts.test_vendored_skill
-
-e2e-manual:
-    python3 -m unittest scripts.test_manual_e2e

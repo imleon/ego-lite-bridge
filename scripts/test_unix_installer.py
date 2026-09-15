@@ -53,7 +53,27 @@ class UnixInstallerTests(unittest.TestCase):
         self.bin_dir.mkdir()
         self.install_dir = self.root / "install"
         self.payload = self.root / "payload"
-        self.payload.write_bytes(b"fake-ego-lite-bridge-binary\n")
+        self.payload.write_text("""#!/bin/sh
+if [ "$1" = "installer-commit" ]; then
+  destination=$2
+  directory=${destination%/*}
+  binary=${destination##*/}
+  shim="${directory}/ego-browser"
+  if [ "${FAKE_OS}" = "linux" ]; then
+    if [ -L "$shim" ]; then
+      [ "$(readlink "$shim")" = "$binary" ] || exit 1
+    elif [ -e "$shim" ]; then
+      exit 1
+    else
+      ln -s "$binary" "$shim" || exit 1
+    fi
+  fi
+  mv "$0" "$destination"
+  exit
+fi
+exit 0
+""", encoding="utf-8")
+        self.payload.chmod(0o755)
         self.expected_sha256 = hashlib.sha256(self.payload.read_bytes()).hexdigest()
         for command in REQUIRED_COMMANDS:
             if command in FAKE_COMMANDS:
@@ -194,6 +214,7 @@ esac
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "PATH": str(self.bin_dir),
             "FAKE_MANIFEST": str(manifest),
+            "FAKE_OS": os_name,
             "FAKE_PAYLOAD": str(self.payload),
             "FAKE_OUTPUT_LOG": str(self.root / "output-path"),
             "EGO_LITE_BRIDGE_INSTALL_DIR": str(self.install_dir),
@@ -245,7 +266,7 @@ esac
             "FAKE_CALL_LOG": str(self.root / "skill-calls.jsonl"),
             "FAKE_URL_LOG": str(self.root / "download-urls"),
         })
-        # Both tools are mocks: never run node/npm or write agent directories.
+        # These tools are mocks: never run Node.js or write agent directories.
         self._write_executable("node", f"""#!{sys.executable}
 import json, os, sys
 from pathlib import Path
@@ -509,7 +530,8 @@ finally:
     def test_skill_dependency_and_cli_errors_keep_bridge(self) -> None:
         for case, message in (
             ("missing-node", "requires 'node'"), ("missing-npx", "requires 'npx'"),
-            ("missing-tar", "requires 'tar'"), ("old-node", "requires Node.js 22.20.0"),
+            ("missing-tar", "requires 'tar'"), ("missing-gzip", "requires 'gzip'"),
+            ("old-node", "requires Node.js 22.20.0"),
             ("invalid-node", "requires Node.js 22.20.0"), ("node-error", "requires Node.js 22.20.0"),
             ("npx-error", "skills CLI failed"),
         ):
