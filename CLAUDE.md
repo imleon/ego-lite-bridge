@@ -36,7 +36,7 @@ just check            # formatting, Clippy, Rust tests, installer tests
 
 Run the narrowest relevant test during iteration and `just check` before committing. Do not bypass failures; fix them or report why they are unrelated.
 
-For bridge behavior, verify argument and binary stream forwarding, stdin EOF, stdout/stderr separation, spawn errors, cancellation, concurrency isolation, ownership conflicts, disconnect recovery, signals, and exit status.
+For bridge behavior, verify argument and binary stream forwarding, stdin EOF, stdout/stderr separation, spawn errors, cancellation, concurrency isolation, ownership conflicts, disconnect recovery, signals, and exit status. This environment cannot run real macOS-to-Linux E2E because it lacks the macOS daemon/browser host and a dedicated SSH endpoint; do not infer E2E execution from local, unit, or installer checks. Treat user-reported external acceptance as separate evidence.
 
 ## Git
 

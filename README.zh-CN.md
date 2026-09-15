@@ -211,13 +211,9 @@ Mac bridge 和 Linux broker 都会将生命周期及请求诊断写入 stderr。
 just test             # Rust 测试
 just installer-test   # Unix 安装器测试
 just check            # 格式、Clippy、Rust 测试和安装器测试
-
-# 可选：真实 Mac -> SSH 可达 Linux smoke（不属于 just check）
-EGO_LITE_BRIDGE_BIN=target/release/ego-lite-bridge \
-EGO_LITE_BRIDGE_SSH_TARGET=user@linux-host just e2e-manual
 ```
 
-迭代时运行最小相关测试，提交前运行 `just check`。手动 smoke 需要 `EGO_LITE_BRIDGE_BIN`（当前 macOS binary）和 `EGO_LITE_BRIDGE_SSH_TARGET`（已安装 Linux bridge 的 SSH 目标）；可用 `EGO_LITE_BRIDGE_LINUX_SHIM` 覆盖默认的 `~/.local/bin/ego-browser`。该测试会启停 daemon，不要在 daemon 正服务其他任务时运行。
+迭代时运行最小相关测试，提交前运行 `just check`。
 
 ## 许可证
 

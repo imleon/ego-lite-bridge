@@ -211,13 +211,9 @@ Both the Mac bridge and Linux broker write lifecycle and request diagnostics to 
 just test             # Rust tests
 just installer-test   # Unix installer tests
 just check            # formatting, Clippy, Rust tests, installer tests
-
-# Opt-in: real Mac -> SSH-reachable Linux smoke (not part of just check)
-EGO_LITE_BRIDGE_BIN=target/release/ego-lite-bridge \
-EGO_LITE_BRIDGE_SSH_TARGET=user@linux-host just e2e-manual
 ```
 
-Run the narrowest relevant test while iterating and `just check` before committing. The manual smoke requires `EGO_LITE_BRIDGE_BIN` (the current macOS binary) and `EGO_LITE_BRIDGE_SSH_TARGET` (an SSH destination with the Linux bridge installed); `EGO_LITE_BRIDGE_LINUX_SHIM` optionally overrides `~/.local/bin/ego-browser`. It starts and stops the daemon, so do not run it against a daemon serving unrelated work.
+Run the narrowest relevant test while iterating and `just check` before committing.
 
 ## License
 
