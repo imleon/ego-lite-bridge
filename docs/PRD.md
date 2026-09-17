@@ -125,7 +125,7 @@ remote retry <config-id>
 - `ego-lite-bridge upgrade`仅获取并升级到latest manifest指向的release；不支持指定版本、回滚、自动重试或fallback；当前版本已是latest时不替换binary，也不进入skill流程；
 - 固定`ego-lite-bridge`安装目标使用目标目录内的独立`0600`非阻塞锁；同一目标已有升级时立即以busy失败，不串行等待；
 - binary在目标同目录私有暂存文件中下载、校验并设为可执行，提交顺序固定为同步暂存文件、原子rename到目标、同步父目录；rename前失败表示未提交，父目录同步失败表示已rename但durability unknown，两者均非零退出；
-- macOS升级先记录daemon状态，并从持久配置读取、校验其canonical `ego-browser`路径；原本停止时只replace并保持停止；原本运行时先stop，worker cleanup未确认则中止升级、保持停止、不commit也不restart；
+- macOS升级先记录daemon状态，并从持久配置读取、校验其canonical `ego-browser`路径；原本停止时只replace并保持停止；原本运行时先stop，remote cleanup未确认则中止升级、保持停止、不commit也不restart；
 - 其他stop错误后，仅在观测到daemon已停止时从旧binary恢复，观测到仍运行或状态未知时不restart、不commit；rename前commit失败恢复原本运行的旧daemon，rename后（包括durability unknown）从安装目标restart；start失败明确返回失败，不恢复旧binary或降级；
 - 仅在原本运行的daemon已restart，或原本停止的状态已保持后输出升级成功；任何状态恢复失败均非零退出；
 - Linux升级原子替换当前bridge binary，并创建缺失的`ego-browser` shim或保留精确指向固定`ego-lite-bridge`的相对symlink；其他对象占用shim路径时明确失败；

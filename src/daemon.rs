@@ -617,7 +617,7 @@ impl DaemonActor {
         {
             let _ = reply.send(actor_error(
                 control::ErrorCode::InvalidState,
-                "remote retry requires active/error state",
+                "remote can be retried only after a failed connection",
             ));
             return;
         }

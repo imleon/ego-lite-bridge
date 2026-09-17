@@ -159,7 +159,7 @@ fn run_stop() -> io::Result<i32> {
     let _lifecycle_lock = daemon::DaemonLock::acquire_lifecycle(&directory)?;
     let (was_running, cleanup_confirmed) = stop_locked(&home, &paths)?;
     if was_running && !cleanup_confirmed {
-        eprintln!("ego-lite-bridge stopped, but worker cleanup was not confirmed");
+        eprintln!("ego-lite-bridge stopped, but remote cleanup was not confirmed");
         Ok(1)
     } else {
         println!(
@@ -219,7 +219,7 @@ fn stop_locked_with_expectation(
         .map_err(UpgradeStopError::Operational)?;
         if cleanup_required {
             return Err(UpgradeStopError::CleanupUnconfirmed(io::Error::other(
-                "daemon protocol changed before worker cleanup could be confirmed",
+                "daemon protocol changed before remote cleanup could be confirmed",
             )));
         }
         return Ok(forced_stop_outcome(true));
@@ -234,7 +234,7 @@ fn stop_locked_with_expectation(
         .map_err(UpgradeStopError::Operational)?;
         if cleanup_required {
             return Err(UpgradeStopError::CleanupUnconfirmed(io::Error::other(
-                "daemon became unavailable before worker cleanup could be confirmed",
+                "daemon became unavailable before remote cleanup could be confirmed",
             )));
         }
         return Ok(forced_stop_outcome(was_running));
@@ -919,11 +919,11 @@ fn coordinate_mac_upgrade(
         match stop() {
             Ok(true) => {}
             Ok(false) => return Err(io::Error::other(
-                "daemon stopped, but worker cleanup was not confirmed; upgrade was not committed",
+                "daemon stopped, but remote cleanup was not confirmed; upgrade was not committed",
             )),
             Err(UpgradeStopError::CleanupUnconfirmed(error)) => {
                 return Err(io::Error::other(format!(
-                    "daemon stopped, but worker cleanup was not confirmed; upgrade was not committed: {error}"
+                    "daemon stopped, but remote cleanup was not confirmed; upgrade was not committed: {error}"
                 )));
             }
             Err(UpgradeStopError::Operational(error)) => {

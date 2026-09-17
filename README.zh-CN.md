@@ -121,7 +121,7 @@ daemon 会在短暂的 SSH 或网络故障后自动重连。
 
 运行 `ego-lite-bridge upgrade` 直接升级到 latest release；不支持选择其他版本。固定的 `ego-lite-bridge` 安装使用非阻塞升级锁，因此同一安装位置已有升级进行时会立即以 busy 失败。校验后的下载先暂存到目标同目录，依次同步暂存文件、原子 rename、同步父目录。rename 前失败时旧 binary 保持不变；父目录同步失败表示替换可能已经完成但 durability unknown，命令仍非零退出。
 
-在 macOS 上，若 daemon 原本运行，升级会先停止 daemon，替换后使用持久配置中的 canonical `ego-browser` 路径重启；若原本停止，则保持停止。若停止操作报告 worker cleanup 未确认，升级中止，不 commit、不重启，并保持 daemon 停止。其他 stop 错误发生后，仅在确认 daemon 已停止时恢复旧 daemon；若仍在运行或状态未知，则不重启也不 commit。rename 前 commit 失败会用旧 binary 恢复原本运行的 daemon；rename 后（包括 durability unknown）则从已安装目标重启。只有恢复原有运行/停止状态后才输出成功；重启失败非零退出。
+在 macOS 上，若 daemon 原本运行，升级会先停止 daemon，替换后使用持久配置中的 canonical `ego-browser` 路径重启；若原本停止，则保持停止。若停止操作报告 remote cleanup 未确认，升级中止，不 commit、不重启，并保持 daemon 停止。其他 stop 错误发生后，仅在确认 daemon 已停止时恢复旧 daemon；若仍在运行或状态未知，则不重启也不 commit。rename 前 commit 失败会用旧 binary 恢复原本运行的 daemon；rename 后（包括 durability unknown）则从已安装目标重启。只有恢复原有运行/停止状态后才输出成功；重启失败非零退出。
 
 在 Linux 上，命令替换 bridge binary，并创建缺失的 `ego-browser` shim，或保留已有的精确相对 symlink。shim 固定指向 `ego-lite-bridge` binary；shim 路径被其他对象占用时明确失败。
 
