@@ -19,7 +19,7 @@ Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-brow
 
 ## 发布状态
 
-版本 0.1.2 为 `linux-x86_64` 和 `macos-aarch64` 提供预编译二进制，用户无需安装 Rust 或从源码构建。Linux 发行版是静态 `x86_64-unknown-linux-musl` binary，macOS 发行版是原生 `aarch64-apple-darwin` binary。
+版本 0.1.3 为 `linux-x86_64` 和 `macos-aarch64` 提供预编译二进制，用户无需安装 Rust 或从源码构建。Linux 发行版是静态 `x86_64-unknown-linux-musl` binary，macOS 发行版是原生 `aarch64-apple-darwin` binary。
 
 ## 快速开始
 
@@ -59,7 +59,7 @@ ego-lite-bridge skill install
 ```bash
 (
   set -eu
-  VERSION=0.1.2
+  VERSION=0.1.3
   : "${AGENT_ID:?请将 AGENT_ID 设置为一个明确的 skills CLI Agent ID}"
   WORK_DIR="$(mktemp -d)"
   trap 'rm -rf "$WORK_DIR"' EXIT
@@ -136,6 +136,7 @@ Linux 升级时，命令读取当前已安装 release 的 `SHA256SUMS` 中所记
 | 命令 | 用途 | 成功输出 |
 | --- | --- | --- |
 | `ego-lite-bridge start` | 启动用户级 daemon；重复运行安全。 | `ego-lite-bridge started`，已启动时为 `ego-lite-bridge is running` |
+| `ego-lite-bridge restart` | 从当前 `PATH` 解析并校验 canonical `ego-browser` 后重启 daemon；原本停止时也会启动。校验失败不影响运行中的 daemon，remote cleanup 未确认时保持停止。 | `ego-lite-bridge restarted` |
 | `ego-lite-bridge status` | 显示 daemon 健康状态，以及每个 remote 的 desired/observed 状态。 | `daemon=running remotes=<数量>`，随后每个 remote 一行 `<配置ID> desired=<状态> observed=<状态>` |
 | `ego-lite-bridge doctor [配置ID]` | 检查 Mac 本地环境，以及 daemon 中全部 remote 或指定 remote 的当前快照。 | 下文说明的 `PASS`、`FAIL` 和 `NOT CHECKED` 记录 |
 | `ego-lite-bridge remote add <SSH-target>` | 添加 remote，并等待其 broker ready。 | `<配置ID>\t<SSH-target>\tdesired=active observed=connected` |

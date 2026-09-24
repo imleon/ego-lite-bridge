@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.3] - 2026-09-24
+
+### Added
+
+- Added macOS `ego-lite-bridge restart`, which validates the current canonical `ego-browser` path before stopping, then starts the daemon with the refreshed path.
+
 ## [0.1.2] - 2026-09-15
 
 ### Added

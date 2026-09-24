@@ -18,6 +18,7 @@ Mac 用户只管理一个后台服务，并通过 CLI 管理 remote：
 
 ```bash
 ego-lite-bridge start
+ego-lite-bridge restart
 ego-lite-bridge stop
 ego-lite-bridge status
 ego-lite-bridge remote add gaolei.veew@linux-a
@@ -85,6 +86,7 @@ CLI 只通过本机 control socket操作 daemon，不直接修改配置或持有
 
 ```text
 start
+restart
 stop
 status
 remote add <ssh-target>
@@ -153,7 +155,7 @@ LaunchAgent不得依赖交互式shell的`PATH`。`start`应解析并保存`ego-b
 - 必须是regular executable；
 - owner必须是当前用户或root；
 - daemon只执行该绝对路径；
-- 路径变化需要显式重新`start`或后续配置命令；
+- 路径变化后使用显式`restart`从当前`PATH`重新解析并保存；解析和校验必须先于停止现有daemon；
 - 配置中不保存浏览器凭据。
 
 ### 5.3 启停语义
@@ -164,6 +166,12 @@ LaunchAgent不得依赖交互式shell的`PATH`。`start`应解析并保存`ego-b
 - 等待control handshake成功；
 - 已运行时幂等返回当前状态；
 - 单个remote失败不等于daemon启动失败。
+
+`restart`：
+
+- 从当前`PATH`解析并校验新的canonical `ego-browser`路径，成功后才停止现有daemon；
+- 复用完整`stop`与`start`流程；原本停止时也启动daemon；
+- remote cleanup未确认时保持停止且不尝试启动；启动失败明确返回失败，不fallback。
 
 `stop`：
 

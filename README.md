@@ -19,7 +19,7 @@ Linux ego-browser shim -> Linux broker -> SSH channel -> Mac executor -> ego-bro
 
 ## Release status
 
-Version 0.1.2 provides prebuilt binaries for `linux-x86_64` and `macos-aarch64`; users do not need Rust or a source build. The Linux release is a static `x86_64-unknown-linux-musl` binary, and the macOS release is a native `aarch64-apple-darwin` binary.
+Version 0.1.3 provides prebuilt binaries for `linux-x86_64` and `macos-aarch64`; users do not need Rust or a source build. The Linux release is a static `x86_64-unknown-linux-musl` binary, and the macOS release is a native `aarch64-apple-darwin` binary.
 
 ## Quick start
 
@@ -59,7 +59,7 @@ For the existing fixed-release manual alternative, set `VERSION` to the exact in
 ```bash
 (
   set -eu
-  VERSION=0.1.2
+  VERSION=0.1.3
   : "${AGENT_ID:?set AGENT_ID to one explicit skills CLI Agent ID}"
   WORK_DIR="$(mktemp -d)"
   trap 'rm -rf "$WORK_DIR"' EXIT
@@ -136,6 +136,7 @@ Lifecycle and remote-control commands run on macOS; `upgrade` runs on both platf
 | Command | Purpose | Successful output |
 | --- | --- | --- |
 | `ego-lite-bridge start` | Start the per-user daemon; it is safe to run when already started. | `ego-lite-bridge started` or `ego-lite-bridge is running` |
+| `ego-lite-bridge restart` | Resolve and validate the canonical `ego-browser` from the current `PATH`, then restart the daemon with it; a stopped daemon is started. Validation failure leaves a running daemon untouched, and unconfirmed remote cleanup leaves it stopped. | `ego-lite-bridge restarted` |
 | `ego-lite-bridge status` | Show daemon health plus each remote's desired and observed state. | `daemon=running remotes=<n>`, followed by `<config-id> desired=<state> observed=<state>` per remote |
 | `ego-lite-bridge doctor [config-id]` | Check the local Mac environment and the daemon's current snapshot of all remotes, or one selected remote. | `PASS`, `FAIL`, and `NOT CHECKED` records described below |
 | `ego-lite-bridge remote add <ssh-target>` | Add a remote and wait until its broker is ready. | `<config-id>\t<ssh-target>\tdesired=active observed=connected` |

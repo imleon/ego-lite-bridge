@@ -30,7 +30,7 @@ mod macos_process;
 mod managed_ssh;
 mod release;
 
-const USAGE: &str = "ego-lite-bridge — headless reverse remote exec bridge for ego-browser\n\nUsage:\n  ego-lite-bridge start\n  ego-lite-bridge stop\n  ego-lite-bridge status\n  ego-lite-bridge doctor [config-id]\n  ego-lite-bridge remote add <target>\n  ego-lite-bridge remote list\n  ego-lite-bridge remote status <config-id>\n  ego-lite-bridge remote retry <config-id>\n  ego-lite-bridge remote remove <config-id>\n  ego-lite-bridge upgrade\n  ego-lite-bridge skill install\n  ego-lite-bridge --help\n  ego-lite-bridge --version";
+const USAGE: &str = "ego-lite-bridge — headless reverse remote exec bridge for ego-browser\n\nUsage:\n  ego-lite-bridge start\n  ego-lite-bridge restart\n  ego-lite-bridge stop\n  ego-lite-bridge status\n  ego-lite-bridge doctor [config-id]\n  ego-lite-bridge remote add <target>\n  ego-lite-bridge remote list\n  ego-lite-bridge remote status <config-id>\n  ego-lite-bridge remote retry <config-id>\n  ego-lite-bridge remote remove <config-id>\n  ego-lite-bridge upgrade\n  ego-lite-bridge skill install\n  ego-lite-bridge --help\n  ego-lite-bridge --version";
 #[cfg(any(target_os = "macos", test))]
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "macos", test))]
@@ -58,6 +58,7 @@ fn run(args: &[OsString]) -> io::Result<i32> {
 
     match args.get(1).map(OsString::as_os_str) {
         Some(command) if command == "start" && args.len() == 2 => run_start(),
+        Some(command) if command == "restart" && args.len() == 2 => run_restart(),
         Some(command) if command == "stop" && args.len() == 2 => run_stop(),
         Some(command) if command == "status" && args.len() == 2 => run_status(),
         Some(command) if command == "doctor" => run_doctor(&args[2..]),
@@ -149,6 +150,57 @@ fn start_stopped_with_browser_locked(
 #[cfg(not(target_os = "macos"))]
 fn run_start() -> io::Result<i32> {
     unsupported("start")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn coordinate_restart<T>(
+    resolve: impl FnOnce() -> io::Result<T>,
+    stop: impl FnOnce() -> Result<(bool, bool), UpgradeStopError>,
+    start: impl FnOnce(T) -> io::Result<()>,
+) -> io::Result<()> {
+    let resolved = resolve()?;
+    let (was_running, cleanup_confirmed) = match stop() {
+        Ok(outcome) => outcome,
+        Err(UpgradeStopError::Operational(error)) => return Err(error),
+        Err(UpgradeStopError::CleanupUnconfirmed(error)) => {
+            return Err(io::Error::other(format!(
+                "daemon stopped, but remote cleanup was not confirmed; restart was not attempted: {error}"
+            )))
+        }
+    };
+    if was_running && !cleanup_confirmed {
+        return Err(io::Error::other(
+            "daemon stopped, but remote cleanup was not confirmed; restart was not attempted",
+        ));
+    }
+    start(resolved)
+}
+
+#[cfg(target_os = "macos")]
+fn run_restart() -> io::Result<i32> {
+    let home = home_directory()?;
+    let paths = daemon::application_paths(&home)?;
+    let directory = daemon::open_application_directory(&home)?;
+    let _lifecycle_lock = daemon::DaemonLock::acquire_lifecycle(&directory)?;
+    coordinate_restart(
+        || {
+            let browser = resolve_ego_browser()?;
+            let bridge = std::env::current_exe()?.canonicalize()?;
+            launchd::plist(&bridge, &browser)?;
+            Ok((bridge, browser))
+        },
+        || stop_locked_for_upgrade(&home, &paths),
+        |(bridge, browser)| {
+            start_stopped_with_browser_locked(&home, &paths, &directory, &bridge, &browser)
+        },
+    )?;
+    println!("ego-lite-bridge restarted");
+    Ok(0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_restart() -> io::Result<i32> {
+    unsupported("restart")
 }
 
 #[cfg(target_os = "macos")]
@@ -1220,6 +1272,7 @@ mod tests {
             vec!["-h", "extra"],
             vec!["--version", "extra"],
             vec!["-V", "extra"],
+            vec!["restart", "extra"],
             vec!["upgrade", "extra"],
             vec!["skill"],
             vec!["skill", "remove"],
@@ -1411,6 +1464,108 @@ mod tests {
         assert!(checks.iter().any(|line| {
             line == "FAIL remote.0123456789abcdef0123456789abcdef.reconnect: attempt=2 at=unknown error=channel lost"
         }));
+    }
+
+    #[test]
+    fn restart_validates_before_stopping_and_starts_when_stopped() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        coordinate_restart(
+            || {
+                calls.borrow_mut().push("resolve");
+                Ok("browser")
+            },
+            || {
+                calls.borrow_mut().push("stop");
+                Ok((false, true))
+            },
+            |browser| {
+                calls.borrow_mut().push(browser);
+                Ok(())
+            },
+        )
+        .expect("restart");
+        assert_eq!(*calls.borrow(), ["resolve", "stop", "browser"]);
+    }
+
+    #[test]
+    fn restart_resolve_failure_keeps_daemon_running() {
+        let stopped = std::cell::Cell::new(false);
+        let result = coordinate_restart::<()>(
+            || Err(io::Error::other("invalid browser")),
+            || {
+                stopped.set(true);
+                Ok((true, true))
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(
+            result.expect_err("resolve failure").to_string(),
+            "invalid browser"
+        );
+        assert!(!stopped.get());
+    }
+
+    #[test]
+    fn restart_does_not_start_after_unconfirmed_cleanup() {
+        let started = std::cell::Cell::new(false);
+        let result = coordinate_restart(
+            || Ok(()),
+            || Ok((true, false)),
+            |_| {
+                started.set(true);
+                Ok(())
+            },
+        );
+        assert!(result
+            .expect_err("unconfirmed cleanup")
+            .to_string()
+            .contains("restart was not attempted"));
+        assert!(!started.get());
+
+        let result = coordinate_restart(
+            || Ok(()),
+            || {
+                Err(UpgradeStopError::CleanupUnconfirmed(io::Error::other(
+                    "bootout failed",
+                )))
+            },
+            |_| {
+                started.set(true);
+                Ok(())
+            },
+        );
+        assert!(result
+            .expect_err("classified cleanup failure")
+            .to_string()
+            .contains("remote cleanup was not confirmed"));
+        assert!(!started.get());
+    }
+
+    #[test]
+    fn restart_propagates_stop_and_start_failures() {
+        let stopped = coordinate_restart(
+            || Ok(()),
+            || {
+                Err(UpgradeStopError::Operational(io::Error::other(
+                    "stop failed",
+                )))
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(
+            stopped.expect_err("stop failure").to_string(),
+            "stop failed"
+        );
+
+        let started = coordinate_restart(
+            || Ok(()),
+            || Ok((true, true)),
+            |_| Err(io::Error::other("start failed")),
+        );
+        assert_eq!(
+            started.expect_err("start failure").to_string(),
+            "start failed"
+        );
     }
 
     #[test]
