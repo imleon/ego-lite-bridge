@@ -53,6 +53,7 @@ class VendoredSkillTests(unittest.TestCase):
             "as `ego-browser nodejs -e '<code>'`",
             "page.setInputFiles()",
             "add `</dev/null`",
+            "run one at a time on the Mac",
             "resolved on the Mac executor",
             "does not transfer Linux files",
         ):
