@@ -3703,6 +3703,14 @@ fn execute_request_inner(
     let input_prelude =
         nodejs_input_prelude(argv, transfer_root).map_err(RequestExecutionError::Local)?;
     let eval_argv = nodejs_eval_argv(argv, transfer_root).map_err(RequestExecutionError::Local)?;
+    let _nodejs_turn = if input_prelude.is_some() || eval_argv.is_some() {
+        Some(
+            acquire_nodejs_prelude_turn(cancelled, channel_out)
+                .map_err(RequestExecutionError::Local)?,
+        )
+    } else {
+        None
+    };
     if let Some(root) = transfer_root {
         prepare_screenshot_transfer_root(root).map_err(RequestExecutionError::Local)?;
         command
@@ -3830,6 +3838,40 @@ fn execute_request_inner(
         );
         Ok(())
     })
+}
+
+/// ego lite runs every `ego-browser nodejs` script in one long-lived Node
+/// process whose `process.env` is shared. The transfer-root prelude writes
+/// `TMPDIR` there, so overlapping prelude scripts would read each other's
+/// transfer root. Prelude requests therefore run one at a time, across all
+/// remotes.
+// ponytail: one global turn, polled rather than FIFO; remove once ego-lite
+// supports a per-run output directory (citrolabs/ego-lite#484).
+#[cfg(any(target_os = "macos", test))]
+static NODEJS_PRELUDE_TURN: Mutex<()> = Mutex::new(());
+
+#[cfg(any(target_os = "macos", test))]
+fn acquire_nodejs_prelude_turn(
+    cancelled: &AtomicBool,
+    channel_out: &ChannelWriter,
+) -> io::Result<std::sync::MutexGuard<'static, ()>> {
+    loop {
+        match NODEJS_PRELUDE_TURN.try_lock() {
+            Ok(turn) => return Ok(turn),
+            // The mutex guards no data, so a panicked holder leaves nothing
+            // inconsistent; the next request may take its turn.
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if cancelled.load(Ordering::Acquire) || channel_out.failed()? {
+            cancelled.store(true, Ordering::Release);
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "request cancelled while waiting for another ego-browser nodejs script",
+            ));
+        }
+        thread::sleep(EXEC_POLL_INTERVAL);
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -5456,6 +5498,90 @@ mod tests {
         assert!(nodejs_eval_argv(&argv, None)
             .expect("skip missing root")
             .is_none());
+    }
+
+    #[test]
+    fn nodejs_prelude_requests_run_one_at_a_time() {
+        // A fake ego-browser that records overlap: it fails if another run's
+        // marker exists while it is running.
+        let marker_dir = TestDir::screenshot("prelude-turn-markers");
+        let program = marker_dir.0.join("fake-ego-browser");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nm='{}/running'\n[ -e \"$m\" ] && exit 9\n: > \"$m\"\nsleep 0.3\nrm -f \"$m\"\n",
+                marker_dir.0.display()
+            ),
+        )
+        .expect("write fake ego-browser");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod fake ego-browser");
+        }
+        let run = |name: &'static str, request_id: u64, argv: Vec<std::ffi::OsString>| {
+            let program = program.clone();
+            thread::spawn(move || {
+                let root = TestDir::screenshot(name);
+                let (sender, receiver) = mpsc::sync_channel(1);
+                drop(sender);
+                let (channel_out, _writer_failed, output) = start_captured_writer();
+                execute_request(
+                    program.as_os_str(),
+                    request_id,
+                    &argv,
+                    Some(&root.0),
+                    receiver,
+                    &Arc::new(AtomicUsize::new(0)),
+                    &Arc::new(AtomicBool::new(false)),
+                    &Arc::new(AtomicBool::new(false)),
+                    &Arc::new(Mutex::new(None)),
+                    &channel_out,
+                    &ResourceBudget::default(),
+                )
+                .expect("execute fake ego-browser");
+                wait_for_messages(&output, 1)
+            })
+        };
+        let started = Instant::now();
+        let stdin = run("prelude-turn-stdin", 81, vec!["nodejs".into()]);
+        let eval = run(
+            "prelude-turn-eval",
+            82,
+            vec!["nodejs".into(), "-e".into(), "1".into()],
+        );
+        for messages in [
+            stdin.join().expect("stdin run"),
+            eval.join().expect("eval run"),
+        ] {
+            assert!(
+                matches!(
+                    messages.last(),
+                    Some(EgoBridgeMessage::Exit { code: Some(0), .. })
+                ),
+                "prelude requests overlapped: {messages:?}"
+            );
+        }
+        assert!(started.elapsed() >= Duration::from_millis(600));
+    }
+
+    #[test]
+    fn cancelled_request_stops_waiting_for_nodejs_prelude_turn() {
+        let turn = NODEJS_PRELUDE_TURN.lock().expect("hold prelude turn");
+        let (channel_out, _writer_failed, _output) = start_captured_writer();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiter_cancelled = Arc::clone(&cancelled);
+        let waiter = thread::spawn(move || {
+            acquire_nodejs_prelude_turn(&waiter_cancelled, &channel_out).map(drop)
+        });
+        thread::sleep(Duration::from_millis(100));
+        cancelled.store(true, Ordering::Release);
+        let error = waiter
+            .join()
+            .expect("waiter thread")
+            .expect_err("cancelled waiter must not take the turn");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        drop(turn);
     }
 
     #[test]

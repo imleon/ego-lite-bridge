@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.5] - 2026-10-18
+
+### Fixed
+
+- `ego-browser nodejs` scripts that receive the transfer-root prelude (stdin and exact `nodejs -e <code>`) now run one at a time on the Mac across all remotes. ego lite shares one `process.env` across concurrent scripts, so overlapping scripts could read each other's transfer root: screenshots returned to the wrong request and download directories were removed by another request. Queued requests can still be cancelled; other commands are not queued.
+
 ## [0.1.4] - 2026-10-17
 
 ### Changed

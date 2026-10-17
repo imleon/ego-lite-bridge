@@ -334,6 +334,7 @@ existing broker通过当前SSH channel发送随机nonce probe；只有匹配ack�
 - 每个remote最多8个active requests；
 - daemon全局最多8个active `ego-browser` processes；
 - 满载立即返回capacity error，不无限排队；
+- 会注入transfer-root prelude的`ego-browser nodejs`请求（stdin模式与精确`nodejs -e <code>`）在daemon内跨remote逐个执行：ego lite在一个常驻Node进程中运行所有脚本，`process.env`共享，并发prelude会读到彼此的transfer root。等待中的请求仍可被Cancel或断线取消；其他argv不受影响。ego lite提供per-run输出目录后（citrolabs/ego-lite#484）移除此限制；
 - 0.1不提供动态配置或复杂公平调度。
 
 ### 8.2 消息与内存边界

@@ -17,6 +17,10 @@ arbitrary Mac paths for screenshots that Linux must read.
 `ego-browser nodejs -e` waits for stdin to close before it runs. When stdin may
 stay open, as in an agent tool shell, add `</dev/null`.
 
+`ego-browser nodejs` scripts from all Linux sessions run one at a time on the
+Mac. A script that waits, for example for the user to take over a page, delays
+every other session's script until it finishes.
+
 ## Other files resolve on the Mac
 
 Paths passed to `page.setInputFiles()` and other file helpers are resolved on
