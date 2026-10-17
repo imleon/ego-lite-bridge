@@ -41,7 +41,7 @@ ego-browser <args...>
 
 - argv，包括 Unix 非 UTF-8 参数；
 - binary-safe stdout、stderr；
-- stdin与stdin EOF；除精确`ego-browser nodejs`模式外stdin保持binary-transparent；该模式由Mac executor在可选UTF-8 BOM和首行shebang之后注入bridge-owned JavaScript prelude，将`TMPDIR`和`EGO_LITE_BRIDGE_TRANSFER_DIR`设为已验证的request transfer root；
+- stdin与stdin EOF；除精确`ego-browser nodejs`模式外stdin保持binary-transparent；该模式由Mac executor在可选UTF-8 BOM和首行shebang之后注入bridge-owned JavaScript prelude，将`TMPDIR`和`EGO_LITE_BRIDGE_TRANSFER_DIR`设为已验证的request transfer root；精确`ego-browser nodejs -e <code>`（恰好三个argv）由Mac executor把同一prelude前置到`<code>`，其他argv形态原样转发；
 - request-scoped PNG screenshot files created under the bridge transfer directory；
 - exit code，以及 Mac child 因 signal 终止时的 canonical signal name；
 - spawn、协议和连接错误；
