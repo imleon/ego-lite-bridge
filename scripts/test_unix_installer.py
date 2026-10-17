@@ -249,7 +249,11 @@ esac
             (self.bin_dir / command).symlink_to(path)
         archive = self.root / "skill.tgz"
         with tarfile.open(archive, "w:gz") as tar:
-            for name in ("ego-browser/SKILL.md", "ego-browser/references/install.md"):
+            for name in (
+                "ego-browser/SKILL.md",
+                "ego-browser/references/install.md",
+                "ego-browser/references/bridge.md",
+            ):
                 data = b"fixture skill\n"
                 member = tarfile.TarInfo(name)
                 member.size = len(data)

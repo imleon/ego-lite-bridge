@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.4] - 2026-10-17
+
+### Changed
+
+- Synced the vendored ego-browser skill to upstream 2.1.0, which bootstraps through `ego-browser skill`; bridge-only rules moved to `references/bridge.md`.
+- Upgraded `sha2` to 0.11 and the pinned GitHub Actions.
+
+### Fixed
+
+- Injected the verified request transfer root into exact `ego-browser nodejs -e <code>` argv, so default-path screenshots return to Linux.
+- Installer and upgrade validation require `references/bridge.md` in the skill archive.
+
 ## [0.1.3] - 2026-09-24
 
 ### Added

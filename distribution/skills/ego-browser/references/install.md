@@ -26,6 +26,8 @@ ego-lite-bridge remote add <linux-host>
 ego-lite-bridge remote retry <config-id>
 ```
 
+If `ego-browser skill` reports `Unknown command: skill`, the bridge works but ego lite on the Mac is older than this skill. Ask the user for approval, then run `ego-browser upgrade`; the shim forwards it to the Mac. If `upgrade` is also an unknown command, have the user update ego lite on the Mac from https://lite.ego.app/.
+
 The daemon and remote must be healthy before retrying `ego-browser` on Linux. Bridge failures are explicit; there is no local browser fallback.
 
-Paths passed to browser helpers such as `uploadFile()` are resolved on the Mac executor. The bridge does not transfer Linux files, so copy a file to the Mac first and pass its Mac path. PNG screenshots are the exception in the other direction: screenshots saved to the bridge request transfer directory are returned to Linux automatically.
+For screenshot transfer and Mac-path file behavior during browser tasks, see [`references/bridge.md`](bridge.md).

@@ -1014,7 +1014,10 @@ impl Drop for StagingDirectory {
 
 #[cfg(any(target_os = "linux", test))]
 fn validate_extracted_skill(source: &Path) -> io::Result<()> {
-    if source.join("SKILL.md").is_file() && source.join("references/install.md").is_file() {
+    if ["SKILL.md", "references/install.md", "references/bridge.md"]
+        .iter()
+        .all(|name| source.join(name).is_file())
+    {
         Ok(())
     } else {
         Err(invalid(
@@ -1307,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn extracted_skill_requires_both_regular_files() {
+    fn extracted_skill_requires_regular_files() {
         let root = test_directory("required-files");
         let source = root.join(SHIM);
         fs::create_dir_all(source.join("references")).expect("skill directories");
@@ -1318,6 +1321,8 @@ mod tests {
         assert!(validate_extracted_skill(&source).is_err());
         fs::remove_dir(source.join("references/install.md")).expect("remove directory");
         fs::write(source.join("references/install.md"), b"install").expect("install file");
+        assert!(validate_extracted_skill(&source).is_err());
+        fs::write(source.join("references/bridge.md"), b"bridge").expect("bridge file");
         assert!(validate_extracted_skill(&source).is_ok());
         fs::remove_dir_all(root).expect("cleanup");
     }

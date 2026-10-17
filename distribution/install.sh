@@ -231,7 +231,8 @@ install_skill() {
     TAR_OPTIONS= tar -xzf "$STAGED_SKILL_ARCHIVE" -C "$STAGED_SKILL_DIR" \
         || skill_err "could not extract ego-browser skill archive"
     SKILL_SOURCE="${STAGED_SKILL_DIR}/ego-browser"
-    if [ ! -f "${SKILL_SOURCE}/SKILL.md" ] || [ ! -f "${SKILL_SOURCE}/references/install.md" ]; then
+    if [ ! -f "${SKILL_SOURCE}/SKILL.md" ] || [ ! -f "${SKILL_SOURCE}/references/install.md" ] \
+        || [ ! -f "${SKILL_SOURCE}/references/bridge.md" ]; then
         skill_err "ego-browser skill archive is missing required files"
     fi
     npx --yes "skills@${SKILLS_CLI_VERSION}" add "$SKILL_SOURCE" --skill ego-browser --global --copy \

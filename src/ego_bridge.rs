@@ -3702,6 +3702,7 @@ fn execute_request_inner(
     let mut command = crate::macos_process::command(program);
     let input_prelude =
         nodejs_input_prelude(argv, transfer_root).map_err(RequestExecutionError::Local)?;
+    let eval_argv = nodejs_eval_argv(argv, transfer_root).map_err(RequestExecutionError::Local)?;
     if let Some(root) = transfer_root {
         prepare_screenshot_transfer_root(root).map_err(RequestExecutionError::Local)?;
         command
@@ -3710,7 +3711,7 @@ fn execute_request_inner(
             .env("EGO_LITE_BRIDGE_TRANSFER_DIR", root);
     }
     command
-        .args(argv)
+        .args(eval_argv.as_deref().unwrap_or(argv))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3839,9 +3840,36 @@ fn nodejs_input_prelude(
     if argv != [std::ffi::OsString::from("nodejs")] {
         return Ok(None);
     }
+    Ok(transfer_root
+        .map(nodejs_prelude)
+        .transpose()?
+        .map(String::into_bytes))
+}
+
+/// `nodejs -e <code>` evaluates its script in the same runtime as stdin, so it
+/// gets the same prelude, prepended to `<code>`. Only this exact argv shape is
+/// rewritten; any other form is forwarded unchanged.
+#[cfg(any(target_os = "macos", test))]
+fn nodejs_eval_argv(
+    argv: &[std::ffi::OsString],
+    transfer_root: Option<&Path>,
+) -> io::Result<Option<Vec<std::ffi::OsString>>> {
+    let [command, flag, code] = argv else {
+        return Ok(None);
+    };
+    if command != "nodejs" || flag != "-e" {
+        return Ok(None);
+    }
     let Some(root) = transfer_root else {
         return Ok(None);
     };
+    let mut script = std::ffi::OsString::from(nodejs_prelude(root)?);
+    script.push(code);
+    Ok(Some(vec![command.clone(), flag.clone(), script]))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn nodejs_prelude(root: &Path) -> io::Result<String> {
     let root = root.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3849,11 +3877,8 @@ fn nodejs_input_prelude(
         )
     })?;
     let literal = serde_json::to_string(root).map_err(io::Error::other)?;
-    Ok(Some(
-        format!(
-            "globalThis.process.env.TMPDIR={literal};globalThis.process.env.EGO_LITE_BRIDGE_TRANSFER_DIR={literal};\n"
-        )
-        .into_bytes(),
+    Ok(format!(
+        "globalThis.process.env.TMPDIR={literal};globalThis.process.env.EGO_LITE_BRIDGE_TRANSFER_DIR={literal};\n"
     ))
 }
 
@@ -5397,6 +5422,38 @@ mod tests {
                 .is_none());
         }
         assert!(nodejs_input_prelude(&["nodejs".into()], None)
+            .expect("skip missing root")
+            .is_none());
+    }
+
+    #[test]
+    fn nodejs_eval_prepends_prelude_only_for_exact_argv() {
+        let root = Path::new("/tmp/ego-lite-bridge-screenshots-1001-1");
+        let argv = ["nodejs".into(), "-e".into(), "console.log(1)".into()];
+        let rewritten = nodejs_eval_argv(&argv, Some(root))
+            .expect("rewrite eval")
+            .expect("eval argv rewritten");
+        let prelude = nodejs_prelude(root).expect("prelude");
+        assert_eq!(
+            rewritten,
+            vec![
+                std::ffi::OsString::from("nodejs"),
+                "-e".into(),
+                format!("{prelude}console.log(1)").into(),
+            ]
+        );
+        for argv in [
+            vec!["nodejs".into()],
+            vec!["nodejs".into(), "-e".into()],
+            vec!["nodejs".into(), "--eval".into(), "x".into()],
+            vec!["nodejs".into(), "-e".into(), "x".into(), "y".into()],
+            vec!["open".into(), "-e".into(), "x".into()],
+        ] {
+            assert!(nodejs_eval_argv(&argv, Some(root))
+                .expect("skip eval")
+                .is_none());
+        }
+        assert!(nodejs_eval_argv(&argv, None)
             .expect("skip missing root")
             .is_none());
     }
