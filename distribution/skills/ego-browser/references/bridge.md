@@ -14,6 +14,9 @@ Linux side automatically. Other argument forms, such as extra flags after
 `-e '<code>'`, do not get this: their screenshots stay on the Mac. Do not use
 arbitrary Mac paths for screenshots that Linux must read.
 
+`ego-browser nodejs -e` waits for stdin to close before it runs. When stdin may
+stay open, as in an agent tool shell, add `</dev/null`.
+
 ## Other files resolve on the Mac
 
 Paths passed to `page.setInputFiles()` and other file helpers are resolved on

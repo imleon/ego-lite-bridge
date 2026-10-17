@@ -52,6 +52,7 @@ class VendoredSkillTests(unittest.TestCase):
             "EGO_LITE_BRIDGE_TRANSFER_DIR",
             "as `ego-browser nodejs -e '<code>'`",
             "page.setInputFiles()",
+            "add `</dev/null`",
             "resolved on the Mac executor",
             "does not transfer Linux files",
         ):
