@@ -5278,6 +5278,26 @@ mod tests {
         }
     }
 
+    /// Poll until the capture buffer ends with a terminal frame (Exit or Error),
+    /// so assertions on the full sequence do not race the draining thread.
+    fn wait_for_terminal(output: &Arc<Mutex<Vec<u8>>>) -> Vec<EgoBridgeMessage> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let messages = decode_messages(output);
+            if matches!(
+                messages.last(),
+                Some(EgoBridgeMessage::Exit { .. } | EgoBridgeMessage::Error { .. })
+            ) {
+                return messages;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for terminal frame"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn inbound_scheduler_preserves_fifo_round_robin_control_and_terminal_order() {
         let scheduler = InboundScheduler::new(true);
@@ -7113,7 +7133,10 @@ mod tests {
             &ResourceBudget::default(),
         )
         .expect("execute child");
-        let messages = decode_messages(&output);
+        // execute_request returns once the child exits, but the capture thread
+        // may still be draining the pipe. Wait for the terminal Exit frame so
+        // the last() assertion below does not race the screenshot frames.
+        let messages = wait_for_terminal(&output);
         let expected_path = path_to_bytes(&root.0.join("shot.png"));
         assert!(messages.iter().any(
             |message| matches!(message, EgoBridgeMessage::Stdout { request_id: 72, data } if data == &expected_path)
