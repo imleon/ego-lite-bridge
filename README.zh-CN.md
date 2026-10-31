@@ -25,7 +25,7 @@ Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-brow
 
 前置条件：
 
-- macOS 的 `PATH` 中已有真正的 `ego-browser`。
+- macOS 的 `PATH` 中已有真正的 `ego-browser`。截图自动回传需要 ego lite 内置的 ego-browser SDK 为 v2.2.0-beta.2 或更新版本；SDK 更旧时，未指定路径的截图会留在 Mac 上。
 - Linux 主机可通过非交互 SSH 认证访问。
 - 两台机器的 `PATH` 中都包含 `~/.local/bin`。
 

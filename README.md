@@ -25,7 +25,7 @@ Version 0.1.5 provides prebuilt binaries for `linux-x86_64` and `macos-aarch64`;
 
 Prerequisites:
 
-- macOS with the real `ego-browser` available on `PATH`.
+- macOS with the real `ego-browser` available on `PATH`. Automatic screenshot return needs an ego lite build whose bundled ego-browser SDK is v2.2.0-beta.2 or newer; with an older SDK, default-path screenshots stay on the Mac.
 - A Linux host reachable with non-interactive SSH authentication.
 - `~/.local/bin` on `PATH` on both machines.
 

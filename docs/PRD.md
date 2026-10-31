@@ -41,7 +41,7 @@ ego-browser <args...>
 
 - argv，包括 Unix 非 UTF-8 参数；
 - binary-safe stdout、stderr；
-- stdin与stdin EOF；除精确`ego-browser nodejs`模式外stdin保持binary-transparent；该模式由Mac executor在可选UTF-8 BOM和首行shebang之后注入bridge-owned JavaScript prelude，将`TMPDIR`和`EGO_LITE_BRIDGE_TRANSFER_DIR`设为已验证的request transfer root；精确`ego-browser nodejs -e <code>`（恰好三个argv）由Mac executor把同一prelude前置到`<code>`，其他argv形态原样转发；
+- stdin与stdin EOF；除精确`ego-browser nodejs`模式外stdin保持binary-transparent；该模式由Mac executor在可选UTF-8 BOM和首行shebang之后注入bridge-owned JavaScript prelude，将per-run的`globalThis.EGO_BROWSER_OUTPUT_DIR`设为已验证的request transfer root（ego lite在一个常驻Node进程中运行所有脚本，`process.env`共享而`globalThis`每次运行独立；该hook需要ego lite内置ego-browser SDK ≥ v2.2.0-beta.2，更早的SDK会忽略它，默认截图不会回传）；精确`ego-browser nodejs -e <code>`（恰好三个argv）由Mac executor把同一prelude前置到`<code>`，其他argv形态原样转发；
 - request-scoped PNG screenshot files created under the bridge transfer directory；
 - exit code，以及 Mac child 因 signal 终止时的 canonical signal name；
 - spawn、协议和连接错误；
@@ -334,7 +334,6 @@ existing broker通过当前SSH channel发送随机nonce probe；只有匹配ack�
 - 每个remote最多8个active requests；
 - daemon全局最多8个active `ego-browser` processes；
 - 满载立即返回capacity error，不无限排队；
-- 会注入transfer-root prelude的`ego-browser nodejs`请求（stdin模式与精确`nodejs -e <code>`）在daemon内跨remote逐个执行：ego lite在一个常驻Node进程中运行所有脚本，`process.env`共享，并发prelude会读到彼此的transfer root。等待中的请求仍可被Cancel或断线取消；其他argv不受影响。ego lite提供per-run输出目录后（citrolabs/ego-lite#484）移除此限制；
 - 0.1不提供动态配置或复杂公平调度。
 
 ### 8.2 消息与内存边界

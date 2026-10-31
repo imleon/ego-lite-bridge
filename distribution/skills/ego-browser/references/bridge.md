@@ -9,17 +9,14 @@ bridge-only rules.
 
 When the script reaches `ego-browser nodejs` on stdin (heredoc or redirect) or
 as `ego-browser nodejs -e '<code>'`, PNG screenshots saved without an explicit
-path, or under `process.env.EGO_LITE_BRIDGE_TRANSFER_DIR`, are returned to the
-Linux side automatically. Other argument forms, such as extra flags after
+path, or under `globalThis.EGO_BROWSER_OUTPUT_DIR`, are returned to the Linux
+side automatically. Other argument forms, such as extra flags after
 `-e '<code>'`, do not get this: their screenshots stay on the Mac. Do not use
-arbitrary Mac paths for screenshots that Linux must read.
+arbitrary Mac paths for screenshots that Linux must read, and do not change
+`globalThis.EGO_BROWSER_OUTPUT_DIR`.
 
 `ego-browser nodejs -e` waits for stdin to close before it runs. When stdin may
 stay open, as in an agent tool shell, add `</dev/null`.
-
-`ego-browser nodejs` scripts from all Linux sessions run one at a time on the
-Mac. A script that waits, for example for the user to take over a page, delays
-every other session's script until it finishes.
 
 ## Other files resolve on the Mac
 
