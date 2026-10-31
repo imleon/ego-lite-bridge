@@ -19,13 +19,13 @@ Linux ego-browser shim -> Linux broker -> SSH 通道 -> Mac executor -> ego-brow
 
 ## 发布状态
 
-版本 0.1.5 为 `linux-x86_64` 和 `macos-aarch64` 提供预编译二进制，用户无需安装 Rust 或从源码构建。Linux 发行版是静态 `x86_64-unknown-linux-musl` binary，macOS 发行版是原生 `aarch64-apple-darwin` binary。
+版本 0.1.6 为 `linux-x86_64` 和 `macos-aarch64` 提供预编译二进制，用户无需安装 Rust 或从源码构建。Linux 发行版是静态 `x86_64-unknown-linux-musl` binary，macOS 发行版是原生 `aarch64-apple-darwin` binary。
 
 ## 快速开始
 
 前置条件：
 
-- macOS 的 `PATH` 中已有真正的 `ego-browser`。
+- macOS 的 `PATH` 中已有真正的 `ego-browser`。截图自动回传需要 ego lite 内置的 ego-browser SDK 为 v2.2.0-beta.2 或更新版本；SDK 更旧时，未指定路径的截图会留在 Mac 上。
 - Linux 主机可通过非交互 SSH 认证访问。
 - 两台机器的 `PATH` 中都包含 `~/.local/bin`。
 
@@ -59,7 +59,7 @@ ego-lite-bridge skill install
 ```bash
 (
   set -eu
-  VERSION=0.1.5
+  VERSION=0.1.6
   : "${AGENT_ID:?请将 AGENT_ID 设置为一个明确的 skills CLI Agent ID}"
   WORK_DIR="$(mktemp -d)"
   trap 'rm -rf "$WORK_DIR"' EXIT

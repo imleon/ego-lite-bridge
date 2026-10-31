@@ -19,13 +19,13 @@ Linux ego-browser shim -> Linux broker -> SSH channel -> Mac executor -> ego-bro
 
 ## Release status
 
-Version 0.1.5 provides prebuilt binaries for `linux-x86_64` and `macos-aarch64`; users do not need Rust or a source build. The Linux release is a static `x86_64-unknown-linux-musl` binary, and the macOS release is a native `aarch64-apple-darwin` binary.
+Version 0.1.6 provides prebuilt binaries for `linux-x86_64` and `macos-aarch64`; users do not need Rust or a source build. The Linux release is a static `x86_64-unknown-linux-musl` binary, and the macOS release is a native `aarch64-apple-darwin` binary.
 
 ## Quick start
 
 Prerequisites:
 
-- macOS with the real `ego-browser` available on `PATH`.
+- macOS with the real `ego-browser` available on `PATH`. Automatic screenshot return needs an ego lite build whose bundled ego-browser SDK is v2.2.0-beta.2 or newer; with an older SDK, default-path screenshots stay on the Mac.
 - A Linux host reachable with non-interactive SSH authentication.
 - `~/.local/bin` on `PATH` on both machines.
 
@@ -59,7 +59,7 @@ For the existing fixed-release manual alternative, set `VERSION` to the exact in
 ```bash
 (
   set -eu
-  VERSION=0.1.5
+  VERSION=0.1.6
   : "${AGENT_ID:?set AGENT_ID to one explicit skills CLI Agent ID}"
   WORK_DIR="$(mktemp -d)"
   trap 'rm -rf "$WORK_DIR"' EXIT

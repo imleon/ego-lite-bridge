@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.6] - 2026-10-31
+
+### Changed
+
+- The transfer-root prelude now sets only the per-run `globalThis.EGO_BROWSER_OUTPUT_DIR` hook added in ego-browser SDK v2.2.0-beta.2 (citrolabs/ego-lite#492). It no longer writes the shared `process.env.TMPDIR` or `EGO_LITE_BRIDGE_TRANSFER_DIR`.
+- `ego-browser nodejs` scripts run concurrently again. Each run keeps its own output directory, so the one-at-a-time limit from 0.1.5 is removed.
+
+### Requirements
+
+- Automatic screenshot return needs an ego lite build bundling ego-browser SDK v2.2.0-beta.2 or newer. With an older SDK the hook is ignored and default-path screenshots stay on the Mac.
+
 ## [0.1.5] - 2026-10-18
 
 ### Fixed

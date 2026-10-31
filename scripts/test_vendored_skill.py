@@ -49,17 +49,18 @@ class VendoredSkillTests(unittest.TestCase):
     def test_bridge_reference(self) -> None:
         bridge = _flat(SKILL / "references" / "bridge.md")
         for text in (
-            "EGO_LITE_BRIDGE_TRANSFER_DIR",
+            "globalThis.EGO_BROWSER_OUTPUT_DIR",
             "as `ego-browser nodejs -e '<code>'`",
             "page.setInputFiles()",
             "add `</dev/null`",
-            "run one at a time on the Mac",
             "resolved on the Mac executor",
             "does not transfer Linux files",
         ):
             with self.subTest(text=text):
                 self.assertIn(text, bridge)
-        self.assertIsNone(re.search(r"screencast|ffmpeg|uploadFile", bridge))
+        self.assertIsNone(
+            re.search(r"screencast|ffmpeg|uploadFile|EGO_LITE_BRIDGE_TRANSFER_DIR|one at a time", bridge)
+        )
 
     def test_skill_md_bridge_insertions(self) -> None:
         content = _flat(SKILL / "SKILL.md")
