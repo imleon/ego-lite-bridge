@@ -1,15 +1,15 @@
 {
   "product": "ego-lite-bridge",
   "available": true,
-  "version": "0.1.5",
-  "skill_url": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.5/ego-browser-skill.tgz",
-  "skill_sha256": "67c2994ec40d4bdca65ce3e75ff5ba866561cc32a9ad9e0d9ecbdc178ce4d1c1",
+  "version": "0.1.6",
+  "skill_url": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.6/ego-browser-skill.tgz",
+  "skill_sha256": "4c8fb15487cb54f99446763c07635293512370fea98838c1537045443786b4f1",
   "assets": {
-    "linux-x86_64": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.5/ego-lite-bridge-linux-x86_64",
-    "macos-aarch64": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.5/ego-lite-bridge-macos-aarch64"
+    "linux-x86_64": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.6/ego-lite-bridge-linux-x86_64",
+    "macos-aarch64": "https://github.com/imleon/ego-lite-bridge/releases/download/v0.1.6/ego-lite-bridge-macos-aarch64"
   },
   "sha256": {
-    "linux-x86_64": "6b9a8561a8caf935dfbaf9ed3d411f0cd5cea27bcfbf3fdff0af0c4e1665b74e",
-    "macos-aarch64": "b4888c50fd06c428c6c737da47a96d68cfe4eb5763b600a0501b7d527f1811ca"
+    "linux-x86_64": "65bb29e9ad13a317e2d1d586192c227eef6ff588f7c970388aefc1bf3c1f9aa9",
+    "macos-aarch64": "c9d4ce24f4da0ccb3df046c750327aa2dba3fecb75c6075e2e9fc3e5d988825d"
   }
 }
